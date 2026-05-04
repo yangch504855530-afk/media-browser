@@ -654,6 +654,7 @@ class AnalysisTaskManager:
                     "preview_count": len(t["preview"]),
                     "executed_count": len(t["executed"]),
                     "mapping_file": t.get("mapping_file", ""),
+                    "eval": t.get("eval", {}),
                 })
             rows.sort(key=lambda x: x["created_at"], reverse=True)
             return rows
@@ -2169,7 +2170,12 @@ async function loadTaskList() {
             evalSel.innerHTML = '<option value="">选择任务后再保存评分</option>' + (data.tasks || []).map(t =>
                 `<option value="${t.id}">${escapeHtml(t.name)} (${t.id})</option>`
             ).join('');
-            if (oldVal && (data.tasks || []).some(t => t.id === oldVal)) evalSel.value = oldVal;
+            if (oldVal && (data.tasks || []).some(t => t.id === oldVal)) {
+                evalSel.value = oldVal;
+            } else if ((data.tasks || []).length > 0) {
+                // 用户确认：默认选中最新任务
+                evalSel.value = data.tasks[0].id;
+            }
         }
         if (!data.tasks || data.tasks.length === 0) {
             rows.innerHTML = '<tr><td colspan="5" style="color:#777;">暂无任务</td></tr>';
@@ -2178,7 +2184,7 @@ async function loadTaskList() {
         rows.innerHTML = data.tasks.map(t => {
             const map = t.mapping_file ? `<a href="#" onclick="event.preventDefault(); copyText(${JSON.stringify(t.mapping_file)});">复制路径</a>` : '-';
             const e = t.eval || {};
-            const evalText = `人工通过率 ${Number(e.human_pass_rate || 0).toFixed(2)}% / Top-K ${Number(e.topk_hit_rate || 0).toFixed(2)}%`;
+            const evalText = `人工通过率 ${Math.round(Number(e.human_pass_rate || 0))}% / Top-K ${Math.round(Number(e.topk_hit_rate || 0))}%`;
             return `<tr>
                 <td>${escapeHtml(t.name)}<div style="color:#666;font-size:11px;">${t.id}</div></td>
                 <td>${escapeHtml(t.status)}</td>
