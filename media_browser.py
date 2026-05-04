@@ -32,6 +32,8 @@ import mimetypes
 import re
 import html as html_mod
 import shutil
+import uuid
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse, unquote
@@ -603,6 +605,194 @@ scanner = MediaScanner()
 _http_server = None
 
 
+def _safe_name_token(text: str, fallback: str = "untitled") -> str:
+    s = (text or "").strip()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-_]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-_")
+    return s or fallback
+
+
+def _guess_scene_tags(path: str) -> list:
+    parts = [p for p in os.path.normpath(path).split(os.sep) if p]
+    src = " ".join(parts[-3:]).lower()
+    tags = []
+    for k in ("japan", "iceland", "tokyo", "osaka", "kyoto", "beijing", "shanghai", "trip", "travel"):
+        if k in src:
+            tags.append(k)
+    return tags[:2] if tags else ["travel"]
+
+
+def _build_candidate_filename(path: str, seq: int) -> str:
+    base = os.path.basename(path)
+    stem, ext = os.path.splitext(base)
+    try:
+        dt = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d")
+    except Exception:
+        dt = datetime.now().strftime("%Y%m%d")
+    parent = _safe_name_token(os.path.basename(os.path.dirname(path)), "folder")
+    tags = _safe_name_token("-".join(_guess_scene_tags(path)), "travel")
+    # 用户决策：文件名末尾追加序号，降低同名冲突风险
+    return f"{dt}_{parent}_{tags}_{seq:03d}{ext.lower()}"
+
+
+class AnalysisTaskManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks = {}
+
+    def list_tasks(self):
+        with self._lock:
+            rows = []
+            for t in self._tasks.values():
+                rows.append({
+                    "id": t["id"],
+                    "name": t["name"],
+                    "status": t["status"],
+                    "created_at": t["created_at"],
+                    "file_count": len(t["source_files"]),
+                    "preview_count": len(t["preview"]),
+                    "executed_count": len(t["executed"]),
+                    "mapping_file": t.get("mapping_file", ""),
+                })
+            rows.sort(key=lambda x: x["created_at"], reverse=True)
+            return rows
+
+    def create_task(self, name: str, work_ids: list):
+        selected = []
+        idset = set(work_ids or [])
+        works = scanner.get_progress(0).get("works", [])
+        for w in works:
+            if idset and w["id"] not in idset:
+                continue
+            for it in w.get("items", []):
+                if it.get("type") == "video":
+                    p = it.get("path", "")
+                    if os.path.isfile(p) and is_path_under_root(p):
+                        selected.append(os.path.abspath(p))
+        selected = sorted(set(selected))
+        tid = uuid.uuid4().hex[:12]
+        now = datetime.now().isoformat(timespec="seconds")
+        task = {
+            "id": tid,
+            "name": (name or "").strip() or f"分析任务-{tid}",
+            "status": "draft",
+            "created_at": now,
+            "source_files": selected,
+            "preview": [],
+            "executed": [],
+            "mapping_file": "",
+        }
+        with self._lock:
+            self._tasks[tid] = task
+        return task
+
+    def get_task(self, tid: str):
+        with self._lock:
+            return self._tasks.get(tid)
+
+    def build_preview(self, tid: str):
+        with self._lock:
+            task = self._tasks.get(tid)
+            if not task:
+                return None
+            by_dir = {}
+            for p in task["source_files"]:
+                by_dir.setdefault(os.path.dirname(p), []).append(p)
+            preview = []
+            for d, files in by_dir.items():
+                files = sorted(files)
+                seq = 1
+                used = set(os.listdir(d))
+                for src in files:
+                    while True:
+                        name = _build_candidate_filename(src, seq)
+                        seq += 1
+                        if name not in used:
+                            used.add(name)
+                            break
+                    dst = os.path.join(d, name)
+                    preview.append({
+                        "src": src,
+                        "dst": dst,
+                        "dst_name": name,
+                        "same_dir": os.path.dirname(src) == os.path.dirname(dst),
+                    })
+            task["preview"] = preview
+            task["status"] = "previewed"
+            return {"id": task["id"], "preview": preview, "file_count": len(task["source_files"])}
+
+    def execute(self, tid: str):
+        with self._lock:
+            task = self._tasks.get(tid)
+            if not task:
+                return None
+            if not task["preview"]:
+                return {"ok": False, "error": "preview not ready"}
+            mapping = []
+            errors = []
+            for row in task["preview"]:
+                src = row["src"]
+                dst = row["dst"]
+                if os.path.dirname(src) != os.path.dirname(dst):
+                    errors.append({"src": src, "error": "cross-directory rename is forbidden"})
+                    continue
+                if not is_path_under_root(src) or not is_path_under_root(os.path.dirname(dst)):
+                    errors.append({"src": src, "error": "forbidden"})
+                    continue
+                if not os.path.exists(src):
+                    errors.append({"src": src, "error": "source missing"})
+                    continue
+                if os.path.exists(dst):
+                    errors.append({"src": src, "error": "target exists"})
+                    continue
+                try:
+                    os.rename(src, dst)
+                    mapping.append({"old": src, "new": dst})
+                except Exception as e:
+                    errors.append({"src": src, "error": str(e)})
+            map_path = os.path.join(CACHE_DIR, f"rename_map_{tid}.json")
+            with open(map_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "task_id": tid,
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "mapping": mapping,
+                        "errors": errors,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            task["mapping_file"] = map_path
+            task["executed"] = mapping
+            task["status"] = "done" if not errors else "partial"
+            return {"ok": True, "renamed": len(mapping), "errors": errors, "mapping_file": map_path}
+
+    def rollback(self, tid: str):
+        with self._lock:
+            task = self._tasks.get(tid)
+            if not task:
+                return None
+            reverted = 0
+            errors = []
+            for row in reversed(task["executed"]):
+                oldp = row["old"]
+                newp = row["new"]
+                try:
+                    if os.path.exists(newp) and not os.path.exists(oldp):
+                        os.rename(newp, oldp)
+                        reverted += 1
+                except Exception as e:
+                    errors.append({"new": newp, "error": str(e)})
+            if reverted > 0 and not errors:
+                task["status"] = "rolled_back"
+            return {"ok": True, "reverted": reverted, "errors": errors}
+
+
+analysis_tasks = AnalysisTaskManager()
+
+
 def trigger_exit():
     """结束 HTTP 服务与扫描线程池（在后台线程调用 shutdown，避免死锁）。"""
 
@@ -759,6 +949,8 @@ class Handler(BaseHTTPRequestHandler):
             since = int(qs.get("since", ["0"])[0])
             prog = scanner.get_progress(since)
             self._send_json(prog)
+        elif path == "/api/tasks":
+            self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()})
 
         elif path.startswith("/thumb/"):
             parts = path.split("/")
@@ -817,6 +1009,47 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/shutdown":
             self._send_json({"ok": True})
             trigger_exit()
+            return
+        if parsed.path == "/api/tasks":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            task = analysis_tasks.create_task(data.get("name", ""), data.get("work_ids", []))
+            self._send_json({"ok": True, "task": {"id": task["id"], "name": task["name"], "file_count": len(task["source_files"])}})
+            return
+        m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/preview", parsed.path or "")
+        if m:
+            ret = analysis_tasks.build_preview(m.group(1))
+            if not ret:
+                self._send_json({"ok": False, "error": "task not found"}, 404)
+                return
+            self._send_json({"ok": True, **ret})
+            return
+        m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/execute", parsed.path or "")
+        if m:
+            ret = analysis_tasks.execute(m.group(1))
+            if not ret:
+                self._send_json({"ok": False, "error": "task not found"}, 404)
+                return
+            if not ret.get("ok"):
+                self._send_json(ret, 400)
+                return
+            self._send_json(ret)
+            return
+        m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/rollback", parsed.path or "")
+        if m:
+            ret = analysis_tasks.rollback(m.group(1))
+            if not ret:
+                self._send_json({"ok": False, "error": "task not found"}, 404)
+                return
+            self._send_json(ret)
             return
         if parsed.path == "/api/set-scan-root":
             try:
@@ -902,6 +1135,25 @@ header {
     flex-wrap: wrap;
     gap: 10px;
     align-items: center;
+}
+.app-tabs {
+    display: inline-flex;
+    gap: 6px;
+    margin-right: 6px;
+}
+.app-tab {
+    background: #1b1b1b;
+    border: 1px solid #3a3a3a;
+    color: #aaa;
+    padding: 7px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+}
+.app-tab.active {
+    color: #fff;
+    border-color: #0a84ff;
+    background: rgba(10,132,255,0.18);
 }
 header .brand { display: flex; flex-direction: column; gap: 4px; margin-right: auto; min-width: 0; max-width: min(560px, 58vw); }
 header h1 { font-size: 18px; color: #fff; letter-spacing: 0.5px; }
@@ -1073,6 +1325,62 @@ header select:focus { outline: none; border-color: #0a84ff; }
     cursor: pointer;
 }
 .empty-hint button.secondary { background: #2a2a2a; color: #ddd; }
+.analysis-panel {
+    display: none;
+    max-width: 1120px;
+    margin: 18px auto 0;
+    padding: 0 24px;
+}
+.analysis-panel.active { display: block; }
+.analysis-card {
+    background: #141414;
+    border: 1px solid #262626;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 12px;
+}
+.analysis-card h3 { font-size: 16px; margin-bottom: 10px; }
+.analysis-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+.analysis-row input[type="text"] {
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    color: #eee;
+    padding: 8px 10px;
+    border-radius: 6px;
+    width: min(420px, 90vw);
+}
+.analysis-row button {
+    background: #1e1e1e;
+    border: 1px solid #444;
+    color: #ccc;
+    padding: 7px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.analysis-row button.primary {
+    background: #0a84ff;
+    border-color: #0a84ff;
+    color: #fff;
+}
+.analysis-note { color: #888; font-size: 12px; line-height: 1.5; }
+.analysis-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+.analysis-table th, .analysis-table td {
+    border-bottom: 1px solid #2a2a2a;
+    padding: 8px 6px;
+    text-align: left;
+    vertical-align: top;
+}
+.analysis-table .ops button { margin-right: 6px; margin-bottom: 4px; }
 .work-card {
     width: 100%;
     max-width: 100%;
@@ -1551,6 +1859,10 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button type="button" id="applyScanRoot">应用并扫描</button>
         </div>
     </div>
+    <div class="app-tabs" aria-label="一级菜单">
+        <button type="button" id="tabReview" class="app-tab active">视频审阅</button>
+        <button type="button" id="tabAnalysis" class="app-tab">视频分析任务</button>
+    </div>
     <input type="text" id="search" placeholder="搜索作品或文件名..." autocomplete="off">
     <select id="sortSelect">
         <option value="name">按名称</option>
@@ -1568,6 +1880,34 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
 </header>
+
+<section id="analysisPanel" class="analysis-panel" aria-live="polite">
+    <div class="analysis-card">
+        <h3>视频分析任务</h3>
+        <div class="analysis-row">
+            <input type="text" id="taskNameInput" placeholder="任务名称（例如：2024冰岛批次）" autocomplete="off">
+            <button type="button" class="primary" id="createTaskBtn">用当前勾选创建任务</button>
+            <button type="button" id="refreshTasksBtn">刷新任务列表</button>
+        </div>
+        <div class="analysis-note">
+            范围规则：仅同目录改名，禁止跨目录移动；执行前先预览并生成映射备份；命名末尾自动追加序号，降低冲突风险。
+        </div>
+    </div>
+    <div class="analysis-card">
+        <table class="analysis-table">
+            <thead>
+                <tr><th>任务</th><th>状态</th><th>文件数</th><th>映射</th><th>操作</th></tr>
+            </thead>
+            <tbody id="analysisTaskRows">
+                <tr><td colspan="5" style="color:#777;">暂无任务</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="analysis-card">
+        <h3>预览（最近一次）</h3>
+        <div id="analysisPreview" class="analysis-note">尚未生成预览。</div>
+    </div>
+</section>
 
 <div id="container"></div>
 <div id="emptyHint" class="empty-hint" style="display:none;" aria-live="polite"></div>
@@ -1630,6 +1970,7 @@ let sidebarLimit = 40;
 let lastEnumError = null;
 let scanPollDone = false;
 let pollGen = 0;
+let activeTab = 'review';
 
 function fmtSize(bytes) {
     if (!bytes) return '0 B';
@@ -1708,6 +2049,114 @@ function buildThumbUrl(cachePath) {
 }
 function buildFileUrl(path) {
     return '/file?path=' + encodeURIComponent(path);
+}
+
+function switchTab(tab) {
+    activeTab = tab === 'analysis' ? 'analysis' : 'review';
+    const reviewVisible = activeTab === 'review';
+    const reviewDisplay = reviewVisible ? '' : 'none';
+    container.style.display = reviewDisplay;
+    document.getElementById('emptyHint').style.display = reviewVisible ? '' : 'none';
+    statusEl.style.display = reviewVisible ? '' : 'none';
+    backToTopBtn.style.display = reviewVisible ? '' : 'none';
+    batchBar.style.display = reviewVisible ? '' : 'none';
+    document.getElementById('analysisPanel').classList.toggle('active', !reviewVisible);
+    document.getElementById('tabReview').classList.toggle('active', reviewVisible);
+    document.getElementById('tabAnalysis').classList.toggle('active', !reviewVisible);
+    if (!reviewVisible) loadTaskList();
+}
+
+async function loadTaskList() {
+    const rows = document.getElementById('analysisTaskRows');
+    try {
+        const r = await fetch('/api/tasks');
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || '加载任务失败');
+        if (!data.tasks || data.tasks.length === 0) {
+            rows.innerHTML = '<tr><td colspan="5" style="color:#777;">暂无任务</td></tr>';
+            return;
+        }
+        rows.innerHTML = data.tasks.map(t => {
+            const map = t.mapping_file ? `<a href="#" onclick="event.preventDefault(); copyText(${JSON.stringify(t.mapping_file)});">复制路径</a>` : '-';
+            return `<tr>
+                <td>${escapeHtml(t.name)}<div style="color:#666;font-size:11px;">${t.id}</div></td>
+                <td>${escapeHtml(t.status)}</td>
+                <td>${t.file_count}</td>
+                <td>${map}</td>
+                <td>
+                    <button onclick="previewAnalysisTask('${t.id}')">预览</button>
+                    <button onclick="executeAnalysisTask('${t.id}')">执行</button>
+                    <button onclick="rollbackAnalysisTask('${t.id}')">回滚</button>
+                </td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        rows.innerHTML = `<tr><td colspan="5" style="color:#ff8a8a;">${escapeHtml(e.message || String(e))}</td></tr>`;
+    }
+}
+
+function copyText(s) {
+    if (!s) return;
+    navigator.clipboard?.writeText(s);
+}
+
+async function createAnalysisTask() {
+    const workIds = Array.from(selectedIds);
+    const name = (document.getElementById('taskNameInput').value || '').trim();
+    try {
+        const res = await fetch('/api/tasks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ name, work_ids: workIds }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '创建失败');
+        alert(`任务已创建：${data.task.name}（视频 ${data.task.file_count} 个）`);
+        await loadTaskList();
+    } catch (e) {
+        alert('创建任务失败：' + (e.message || String(e)));
+    }
+}
+
+async function previewAnalysisTask(id) {
+    try {
+        const res = await fetch('/api/tasks/' + encodeURIComponent(id) + '/preview', { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '预览失败');
+        const top = (data.preview || []).slice(0, 25);
+        const text = top.map((x, i) => `${String(i + 1).padStart(3, '0')}. ${x.src} -> ${x.dst_name}`).join('\n');
+        document.getElementById('analysisPreview').textContent =
+            `任务 ${id} 预览 ${data.preview.length} 条（展示前 25 条）\n` + text;
+        await loadTaskList();
+    } catch (e) {
+        alert('预览失败：' + (e.message || String(e)));
+    }
+}
+
+async function executeAnalysisTask(id) {
+    if (!confirm('确认执行批量重命名？\n规则：仅同目录改名，禁止跨目录移动。')) return;
+    try {
+        const res = await fetch('/api/tasks/' + encodeURIComponent(id) + '/execute', { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '执行失败');
+        alert(`执行完成：成功 ${data.renamed}，失败 ${data.errors.length}\n映射文件：${data.mapping_file}`);
+        await loadTaskList();
+    } catch (e) {
+        alert('执行失败：' + (e.message || String(e)));
+    }
+}
+
+async function rollbackAnalysisTask(id) {
+    if (!confirm('确认回滚该任务已执行的重命名？')) return;
+    try {
+        const res = await fetch('/api/tasks/' + encodeURIComponent(id) + '/rollback', { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '回滚失败');
+        alert(`回滚完成：恢复 ${data.reverted}，失败 ${data.errors.length}`);
+        await loadTaskList();
+    } catch (e) {
+        alert('回滚失败：' + (e.message || String(e)));
+    }
 }
 
 // 搜索防抖
@@ -2351,6 +2800,19 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
             }
         });
     }
+    const tabReview = document.getElementById('tabReview');
+    const tabAnalysis = document.getElementById('tabAnalysis');
+    const createTaskBtn = document.getElementById('createTaskBtn');
+    const refreshTasksBtn = document.getElementById('refreshTasksBtn');
+    if (tabReview) tabReview.addEventListener('click', () => switchTab('review'));
+    if (tabAnalysis) tabAnalysis.addEventListener('click', () => switchTab('analysis'));
+    if (createTaskBtn) createTaskBtn.addEventListener('click', createAnalysisTask);
+    if (refreshTasksBtn) refreshTasksBtn.addEventListener('click', loadTaskList);
+    // 任务表按钮使用内联 onclick，需要挂到全局
+    window.previewAnalysisTask = previewAnalysisTask;
+    window.executeAnalysisTask = executeAnalysisTask;
+    window.rollbackAnalysisTask = rollbackAnalysisTask;
+    switchTab('review');
 })();
 
 poll();
