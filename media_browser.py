@@ -1987,16 +1987,16 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <div id="analysisPreview" class="analysis-note">尚未生成预览。</div>
     </div>
     <div class="analysis-card">
-        <h3>评测入口（基准集人工通过率 + Top-K 命中率）</h3>
+        <h3>效果打分（人工认可率 + Top-K 命中率）</h3>
         <div class="analysis-row">
-            <input type="text" id="evalTaskIdInput" placeholder="任务ID（从上表复制）" autocomplete="off">
+            <select id="evalTaskSelect" title="请选择任务"></select>
             <input type="number" id="evalReviewedInput" min="0" placeholder="人工复核总数">
             <input type="number" id="evalApprovedInput" min="0" placeholder="人工认可数">
             <input type="number" id="evalTopkTotalInput" min="0" placeholder="Top-K 总样本">
             <input type="number" id="evalTopkHitInput" min="0" placeholder="Top-K 命中数">
             <button type="button" class="primary" id="saveEvalBtn">保存评测</button>
         </div>
-        <div id="evalResult" class="analysis-note">尚未录入评测数据。</div>
+        <div id="evalResult" class="analysis-note">还没有保存打分。</div>
     </div>
 </section>
 
@@ -2159,10 +2159,18 @@ function switchTab(tab) {
 
 async function loadTaskList() {
     const rows = document.getElementById('analysisTaskRows');
+    const evalSel = document.getElementById('evalTaskSelect');
     try {
         const r = await fetch('/api/tasks');
         const data = await r.json();
         if (!data.ok) throw new Error(data.error || '加载任务失败');
+        if (evalSel) {
+            const oldVal = evalSel.value || '';
+            evalSel.innerHTML = '<option value="">选择任务后再保存评分</option>' + (data.tasks || []).map(t =>
+                `<option value="${t.id}">${escapeHtml(t.name)} (${t.id})</option>`
+            ).join('');
+            if (oldVal && (data.tasks || []).some(t => t.id === oldVal)) evalSel.value = oldVal;
+        }
         if (!data.tasks || data.tasks.length === 0) {
             rows.innerHTML = '<tr><td colspan="5" style="color:#777;">暂无任务</td></tr>';
             return;
@@ -2255,8 +2263,8 @@ async function rollbackAnalysisTask(id) {
 }
 
 async function saveTaskEvaluation() {
-    const taskId = (document.getElementById('evalTaskIdInput').value || '').trim();
-    if (!taskId) { alert('请输入任务 ID'); return; }
+    const taskId = (document.getElementById('evalTaskSelect').value || '').trim();
+    if (!taskId) { alert('请先选择任务'); return; }
     const approved = Number(document.getElementById('evalApprovedInput').value || 0);
     const reviewed = Number(document.getElementById('evalReviewedInput').value || 0);
     const topkHit = Number(document.getElementById('evalTopkHitInput').value || 0);
@@ -2283,6 +2291,13 @@ async function saveTaskEvaluation() {
     } catch (err) {
         alert('保存评测失败：' + (err.message || String(err)));
     }
+}
+
+function useTaskForEval(taskId) {
+    const sel = document.getElementById('evalTaskSelect');
+    if (!sel) return;
+    sel.value = taskId;
+    sel.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 // 搜索防抖
@@ -2940,6 +2955,7 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
     window.previewAnalysisTask = previewAnalysisTask;
     window.executeAnalysisTask = executeAnalysisTask;
     window.rollbackAnalysisTask = rollbackAnalysisTask;
+    window.useTaskForEval = useTaskForEval;
     switchTab('review');
 })();
 
