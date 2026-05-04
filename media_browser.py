@@ -682,6 +682,15 @@ class AnalysisTaskManager:
             "preview": [],
             "executed": [],
             "mapping_file": "",
+            "eval": {
+                "approved": 0,
+                "reviewed": 0,
+                "topk_hit": 0,
+                "topk_total": 0,
+                "human_pass_rate": 0.0,
+                "topk_hit_rate": 0.0,
+                "updated_at": "",
+            },
         }
         with self._lock:
             self._tasks[tid] = task
@@ -690,6 +699,32 @@ class AnalysisTaskManager:
     def get_task(self, tid: str):
         with self._lock:
             return self._tasks.get(tid)
+
+    def update_eval(self, tid: str, approved: int, reviewed: int, topk_hit: int, topk_total: int):
+        with self._lock:
+            task = self._tasks.get(tid)
+            if not task:
+                return None
+            approved = max(0, int(approved))
+            reviewed = max(0, int(reviewed))
+            topk_hit = max(0, int(topk_hit))
+            topk_total = max(0, int(topk_total))
+            if approved > reviewed:
+                approved = reviewed
+            if topk_hit > topk_total:
+                topk_hit = topk_total
+            human_pass_rate = (approved / reviewed * 100.0) if reviewed > 0 else 0.0
+            topk_hit_rate = (topk_hit / topk_total * 100.0) if topk_total > 0 else 0.0
+            task["eval"] = {
+                "approved": approved,
+                "reviewed": reviewed,
+                "topk_hit": topk_hit,
+                "topk_total": topk_total,
+                "human_pass_rate": round(human_pass_rate, 2),
+                "topk_hit_rate": round(topk_hit_rate, 2),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            return {"id": tid, "eval": task["eval"]}
 
     def build_preview(self, tid: str):
         with self._lock:
@@ -1051,6 +1086,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(ret)
             return
+        m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/evaluation", parsed.path or "")
+        if m:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            ret = analysis_tasks.update_eval(
+                m.group(1),
+                data.get("approved", 0),
+                data.get("reviewed", 0),
+                data.get("topk_hit", 0),
+                data.get("topk_total", 0),
+            )
+            if not ret:
+                self._send_json({"ok": False, "error": "task not found"}, 404)
+                return
+            self._send_json({"ok": True, "evaluation": ret})
+            return
         if parsed.path == "/api/set-scan-root":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1381,6 +1440,26 @@ header select:focus { outline: none; border-color: #0a84ff; }
     vertical-align: top;
 }
 .analysis-table .ops button { margin-right: 6px; margin-bottom: 4px; }
+.analysis-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(260px, 1fr));
+    gap: 10px 14px;
+}
+.analysis-metrics label {
+    font-size: 12px;
+    color: #999;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.analysis-metrics input {
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    color: #eee;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+.analysis-metrics .full { grid-column: 1 / -1; }
 .work-card {
     width: 100%;
     max-width: 100%;
@@ -1907,6 +1986,18 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <h3>预览（最近一次）</h3>
         <div id="analysisPreview" class="analysis-note">尚未生成预览。</div>
     </div>
+    <div class="analysis-card">
+        <h3>评测入口（基准集人工通过率 + Top-K 命中率）</h3>
+        <div class="analysis-row">
+            <input type="text" id="evalTaskIdInput" placeholder="任务ID（从上表复制）" autocomplete="off">
+            <input type="number" id="evalReviewedInput" min="0" placeholder="人工复核总数">
+            <input type="number" id="evalApprovedInput" min="0" placeholder="人工认可数">
+            <input type="number" id="evalTopkTotalInput" min="0" placeholder="Top-K 总样本">
+            <input type="number" id="evalTopkHitInput" min="0" placeholder="Top-K 命中数">
+            <button type="button" class="primary" id="saveEvalBtn">保存评测</button>
+        </div>
+        <div id="evalResult" class="analysis-note">尚未录入评测数据。</div>
+    </div>
 </section>
 
 <div id="container"></div>
@@ -2078,6 +2169,8 @@ async function loadTaskList() {
         }
         rows.innerHTML = data.tasks.map(t => {
             const map = t.mapping_file ? `<a href="#" onclick="event.preventDefault(); copyText(${JSON.stringify(t.mapping_file)});">复制路径</a>` : '-';
+            const e = t.eval || {};
+            const evalText = `人工通过率 ${Number(e.human_pass_rate || 0).toFixed(2)}% / Top-K ${Number(e.topk_hit_rate || 0).toFixed(2)}%`;
             return `<tr>
                 <td>${escapeHtml(t.name)}<div style="color:#666;font-size:11px;">${t.id}</div></td>
                 <td>${escapeHtml(t.status)}</td>
@@ -2087,6 +2180,8 @@ async function loadTaskList() {
                     <button onclick="previewAnalysisTask('${t.id}')">预览</button>
                     <button onclick="executeAnalysisTask('${t.id}')">执行</button>
                     <button onclick="rollbackAnalysisTask('${t.id}')">回滚</button>
+                    <button onclick="useTaskForEval('${t.id}')">评测</button>
+                    <div class="analysis-note" style="margin-top:4px;">${evalText}</div>
                 </td>
             </tr>`;
         }).join('');
@@ -2156,6 +2251,37 @@ async function rollbackAnalysisTask(id) {
         await loadTaskList();
     } catch (e) {
         alert('回滚失败：' + (e.message || String(e)));
+    }
+}
+
+async function saveTaskEvaluation() {
+    const taskId = (document.getElementById('evalTaskIdInput').value || '').trim();
+    if (!taskId) { alert('请输入任务 ID'); return; }
+    const approved = Number(document.getElementById('evalApprovedInput').value || 0);
+    const reviewed = Number(document.getElementById('evalReviewedInput').value || 0);
+    const topkHit = Number(document.getElementById('evalTopkHitInput').value || 0);
+    const topkTotal = Number(document.getElementById('evalTopkTotalInput').value || 0);
+    try {
+        const res = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/evaluation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({
+                approved: approved,
+                reviewed: reviewed,
+                topk_hit: topkHit,
+                topk_total: topkTotal,
+            }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '保存评测失败');
+        const e = data.eval || {};
+        const text = `任务 ${taskId} 评测已保存\n` +
+            `人工通过率: ${e.human_pass_rate || 0}% (${e.approved || 0}/${e.reviewed || 0})\n` +
+            `Top-K 命中率: ${e.topk_hit_rate || 0}% (${e.topk_hit || 0}/${e.topk_total || 0})`;
+        document.getElementById('evalResult').textContent = text;
+        await loadTaskList();
+    } catch (err) {
+        alert('保存评测失败：' + (err.message || String(err)));
     }
 }
 
@@ -2804,10 +2930,12 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
     const tabAnalysis = document.getElementById('tabAnalysis');
     const createTaskBtn = document.getElementById('createTaskBtn');
     const refreshTasksBtn = document.getElementById('refreshTasksBtn');
+    const saveEvalBtn = document.getElementById('saveEvalBtn');
     if (tabReview) tabReview.addEventListener('click', () => switchTab('review'));
     if (tabAnalysis) tabAnalysis.addEventListener('click', () => switchTab('analysis'));
     if (createTaskBtn) createTaskBtn.addEventListener('click', createAnalysisTask);
     if (refreshTasksBtn) refreshTasksBtn.addEventListener('click', loadTaskList);
+    if (saveEvalBtn) saveEvalBtn.addEventListener('click', saveTaskEvaluation);
     // 任务表按钮使用内联 onclick，需要挂到全局
     window.previewAnalysisTask = previewAnalysisTask;
     window.executeAnalysisTask = executeAnalysisTask;
