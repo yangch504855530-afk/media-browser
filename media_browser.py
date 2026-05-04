@@ -1989,6 +1989,12 @@ body.batch-open #backToTop.show { bottom: 118px; }
     </div>
     <div class="analysis-card">
         <h3>效果打分（人工认可率 + Top-K 命中率）</h3>
+        <div class="analysis-note" style="margin-bottom:8px;">
+            怎么打分（简单版）：<br>
+            1) 先在下拉里选一个任务；<br>
+            2) 人工复核总数 = 你实际检查了多少条，人工认可数 = 其中你认可的条数；<br>
+            3) Top-K 总样本/命中数按同一批样本填写，点“保存评测”即可。
+        </div>
         <div class="analysis-row">
             <select id="evalTaskSelect" title="请选择任务"></select>
             <input type="number" id="evalReviewedInput" min="0" placeholder="人工复核总数">
