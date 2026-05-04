@@ -85,6 +85,9 @@ THUMB_WIDTH = 400
 
 # 并发默认 2（原 4）：多任务并行会对 NAS/机械盘产生大量随机寻道；SSD 可用 MB_SCAN_WORKERS=4
 DISK_PROFILE = os.environ.get("MB_DISK_PROFILE", "").strip().lower()
+_DISK_PROFILE_ENV_SET = bool(DISK_PROFILE)
+_SCAN_WORKERS_ENV_SET = os.environ.get("MB_SCAN_WORKERS") not in (None, "")
+_THUMB_COUNT_ENV_SET = os.environ.get("MB_THUMB_COUNT") not in (None, "")
 _MAX_DEFAULT = 2
 _THUMB_DEFAULT = 5
 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
@@ -96,6 +99,55 @@ THUMB_COUNT = _int_env("MB_THUMB_COUNT", _THUMB_DEFAULT, 1, 30)
 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
     MAX_WORKERS = min(MAX_WORKERS, 2)
     THUMB_COUNT = min(THUMB_COUNT, 3)
+
+
+def _path_disk_profile(path: str) -> str:
+    """按扫描路径推断磁盘类型；仅在未显式设置 MB_DISK_PROFILE 时使用。"""
+    p = os.path.realpath(os.path.abspath(os.path.expanduser(path or ""))).lower()
+    # 常见网络挂载提示：smb/nfs/afp/webdav 等
+    network_hints = ("/net/", "/network/", "smb://", "afp://", "nfs://", "webdav://")
+    if any(h in p for h in network_hints):
+        return "nas"
+    # macOS 上进一步用 mount 输出判断文件系统类型（远程挂载一般是 smbfs/nfs/afpfs/webdav）
+    try:
+        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=2)
+        if out.returncode == 0:
+            for line in (out.stdout or "").splitlines():
+                if " on " not in line:
+                    continue
+                parts = line.split(" on ", 1)[1].split(" (", 1)
+                if not parts:
+                    continue
+                mp = parts[0].strip()
+                if not mp:
+                    continue
+                if p.startswith(mp.lower() + os.sep) or p == mp.lower():
+                    fs = (parts[1].lower() if len(parts) > 1 else "")
+                    if any(x in fs for x in ("smbfs", "nfs", "afpfs", "webdav")):
+                        return "nas"
+                    break
+    except Exception:
+        pass
+    return "fast"
+
+
+def _apply_perf_profile_for_scan_root(scan_root: str) -> str:
+    """按扫描根目录自动设置并发/缩略图。显式环境变量优先。"""
+    global DISK_PROFILE, MAX_WORKERS, THUMB_COUNT
+    profile = DISK_PROFILE if _DISK_PROFILE_ENV_SET else _path_disk_profile(scan_root)
+    DISK_PROFILE = profile
+    if _SCAN_WORKERS_ENV_SET:
+        MAX_WORKERS = _int_env("MB_SCAN_WORKERS", MAX_WORKERS, 1, 16)
+    else:
+        MAX_WORKERS = 1 if profile in ("slow", "nas", "hdd", "mechanical") else 6
+    if _THUMB_COUNT_ENV_SET:
+        THUMB_COUNT = _int_env("MB_THUMB_COUNT", THUMB_COUNT, 1, 30)
+    else:
+        THUMB_COUNT = 2 if profile in ("slow", "nas", "hdd", "mechanical") else 4
+    if profile in ("slow", "nas", "hdd", "mechanical"):
+        MAX_WORKERS = min(MAX_WORKERS, 2)
+        THUMB_COUNT = min(THUMB_COUNT, 3)
+    return profile
 
 FFMPEG_BIN = _tool_path("ffmpeg")
 FFPROBE_BIN = _tool_path("ffprobe")
@@ -589,6 +641,11 @@ def replace_scan_root(new_root: str) -> bool:
     except OSError:
         return False
     _scan_root = p
+    prof = _apply_perf_profile_for_scan_root(_scan_root)
+    print(
+        f"[Media Browser] 扫描目录切换为: {_scan_root}\n"
+        f"[Media Browser] 自动性能档位: {prof}，扫描并发={MAX_WORKERS}，每视频条带缩略图={THUMB_COUNT}"
+    )
     old = scanner
     scanner = MediaScanner()
     scanner.start()
@@ -2982,6 +3039,7 @@ poll();
 
 def main():
     global _http_server
+    _apply_perf_profile_for_scan_root(get_scan_root())
     auto_open = os.environ.get(
         "MB_AUTO_OPEN",
         "1" if getattr(sys, "frozen", False) else "0",
