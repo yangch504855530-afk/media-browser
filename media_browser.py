@@ -47,7 +47,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -2857,7 +2857,8 @@ function resetAllReviewTags() {
 }
 function buildThumbUrl(cachePath) {
     if (!cachePath) return '';
-    const parts = cachePath.split('/');
+    const parts = String(cachePath).split(/[\\/]+/).filter(Boolean);
+    if (parts.length < 2) return '';
     const hash = parts[parts.length-2];
     const name = parts[parts.length-1];
     return `/thumb/${hash}/${name}`;
@@ -3156,7 +3157,7 @@ function renderInsightRows(t) {
         const phraseVal = (ins.confirmed_phrase || ins.phrase || '');
         const dis = (st !== 'done') ? 'disabled' : '';
         const checked = ins.user_confirmed ? 'checked' : '';
-        const shortName = p.split('/').pop() || p;
+        const shortName = String(p).split(/[\\/]+/).pop() || p;
         const playUrl = buildVideoPlayUrl(p);
         const thumbSrc = '/api/preview-thumb?path=' + encodeURIComponent(p);
         html += `<tr data-path="${encodeURIComponent(p)}">
