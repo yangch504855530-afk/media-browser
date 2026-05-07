@@ -47,7 +47,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.10"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -81,7 +81,12 @@ if getattr(sys, "frozen", False):
     ROOT_DIR = os.environ.get("MB_ROOT_DIR") or _dr
     CACHE_DIR = os.environ.get("MB_CACHE_DIR") or _dc
 else:
-    ROOT_DIR = os.environ.get("MB_ROOT_DIR", "/Volumes/Untitled/pri")
+    if sys.platform == "darwin":
+        _default_root = "/Volumes/Untitled/pri"
+    else:
+        # Windows / Linux 默认使用用户目录下的 MediaBrowser 文件夹，避免指向不存在的卷
+        _default_root = os.path.expanduser("~/MediaBrowser")
+    ROOT_DIR = os.environ.get("MB_ROOT_DIR", _default_root)
     CACHE_DIR = os.environ.get(
         "MB_CACHE_DIR", os.path.expanduser("~/.cache/media-browser/thumbs")
     )
@@ -248,6 +253,21 @@ def ensure_placeholder(dst: str):
             pass
 
 
+def open_in_file_manager(path: str) -> bool:
+    """Cross-platform 'reveal in file manager' helper."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", path], timeout=10, capture_output=True)
+        elif os.name == "nt":
+            # explorer can open both files and folders
+            subprocess.run(["explorer", path], timeout=10)
+        else:
+            subprocess.run(["xdg-open", path], timeout=10)
+        return True
+    except Exception:
+        return False
+
+
 def remove_media_thumb_cache(media_path: str) -> None:
     """删除该媒体在缓存目录下对应的缩略图文件夹（与 generate_* 使用的 sha256(abspath) 一致）。"""
     try:
@@ -281,6 +301,74 @@ def get_video_info(path: str) -> dict:
     except Exception:
         pass
     return info
+
+
+def _parse_ffprobe_datetime(raw: str) -> datetime | None:
+    """Parse common ffprobe datetime tag formats into naive local datetime."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    # Common: 2020-01-02T03:04:05.000000Z or 2020-01-02 03:04:05
+    s = s.replace(" ", "T")
+    s = re.sub(r"\.\d+", "", s)  # drop fractional seconds
+    s = s.replace("Z", "")
+    # QuickTime sometimes: 2020-01-02T03:04:05+08:00
+    s = re.sub(r"([+-]\d{2}:\d{2})$", "", s)
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def get_video_datetime_local(path: str) -> datetime | None:
+    """Best-effort capture time from metadata; fallback to mtime."""
+    _probe_timeout = 90 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical") else 45
+    try:
+        out = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=creation_time:format_tags=com.apple.quicktime.creationdate",
+                "-show_entries",
+                "stream_tags=creation_time",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_probe_timeout,
+        )
+        data = json.loads(out.stdout or "{}")
+        tags = (data.get("format") or {}).get("tags") or {}
+        for k in ("creation_time", "com.apple.quicktime.creationdate"):
+            dt = _parse_ffprobe_datetime(tags.get(k))
+            if dt:
+                return dt
+        for st in (data.get("streams") or []):
+            stags = (st or {}).get("tags") or {}
+            dt = _parse_ffprobe_datetime(stags.get("creation_time"))
+            if dt:
+                return dt
+    except Exception:
+        pass
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def fmt_datetime_ymdhms(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
 
 
 def fmt_duration(sec: float) -> str:
@@ -775,6 +863,18 @@ def _b64_file(path: str) -> str:
         return base64.b64encode(f.read()).decode("ascii")
 
 
+def _ollama_health_check(host: str, timeout: float = 5.0) -> tuple:
+    """启动分析前探测 Ollama 是否可达（/api/tags）。"""
+    url = f"{host.rstrip('/')}/api/tags"
+    try:
+        req = Request(url, method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            resp.read()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def _http_post_json(url: str, payload: dict, timeout: int = 300) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = Request(url, data=data, method="POST")
@@ -814,26 +914,50 @@ def _normalize_llm_insight(raw: dict) -> dict:
         tags = [t.strip() for t in re.split(r"[,，;；|/]", tags) if t.strip()]
     elif not isinstance(tags, list):
         tags = []
-    tags = [str(x).strip() for x in tags if str(x).strip()][:12]
+    # 严格过滤：仅保留不含英文字母的标签
+    clean_tags: list[str] = []
+    for x in tags:
+        s = str(x).strip()
+        if not s:
+            continue
+        if re.search(r"[A-Za-z]", s):
+            continue
+        clean_tags.append(s)
+        if len(clean_tags) >= 12:
+            break
     phrase = str(raw.get("phrase") or raw.get("短语") or raw.get("summary") or "").strip()
-    if not phrase and tags:
-        phrase = "·".join(tags[:5])
+    # 若短语包含英文字符，则置空，让用户在前端手动用中文填写
+    if re.search(r"[A-Za-z]", phrase):
+        phrase = ""
+    if not phrase and clean_tags:
+        phrase = "·".join(clean_tags[:5])
     return {
         "time_guess": str(raw.get("time") or raw.get("时间") or "").strip(),
         "place_guess": str(raw.get("place") or raw.get("地点") or "").strip(),
         "event_guess": str(raw.get("event") or raw.get("事件") or "").strip(),
-        "tags": tags,
+        "tags": clean_tags,
         "phrase": phrase,
     }
 
 
 def _vision_analyze_video(
-    path: str, ollama_host: str, model: str, frame_count: int, frames_dir: str, request_timeout: int
+    path: str,
+    ollama_host: str,
+    model: str,
+    frame_count: int,
+    frames_dir: str,
+    request_timeout: int,
+    after_frames_hook=None,
 ) -> dict:
     shutil.rmtree(frames_dir, ignore_errors=True)
     frames = _extract_llm_frames(path, frames_dir, frame_count)
     if not frames:
         raise RuntimeError("无法从视频抽取帧（请检查 ffmpeg 与视频文件）")
+    if callable(after_frames_hook):
+        try:
+            after_frames_hook()
+        except Exception:
+            pass
     b64_list = []
     for fp in frames:
         try:
@@ -845,22 +969,33 @@ def _vision_analyze_video(
     bn = os.path.basename(path)
     info = get_video_info(path)
     dur = fmt_duration(info.get("duration") or 0)
+    meta_dt = get_video_datetime_local(path)
+    meta_time = fmt_datetime_ymdhms(meta_dt) or ""
     instructions = (
-        "你是影像归档助手。用户会提供同一视频的若干代表帧（按时间顺序）。请根据画面内容（不要编造具体日期）推断：\n"
-        "time：时间段或季节线索（如「夏季白天」「傍晚」「未知」）；\n"
-        "place：国家/城市/景点级地点（短词组）；\n"
-        "event：正在发生的事（短词组）；\n"
-        "tags：3～8 个中文关键词；\n"
-        "phrase：把标签连成一句极短中文描述（约 8～20 字），适合用作文件名主题，不要空格与\\/:*?\"<>|。\n"
+        "你是面向中文用户的影像归档助手。用户会提供同一视频的若干代表帧（按时间顺序）。请根据画面内容推断（不要编造具体日期）。\n"
+        "【语言硬性要求】除极少数全球通用专名（如「iPhone」「NASA」）外，time、place、event、tags 中每一项、以及 phrase 全文，"
+        "必须使用「简体中文」表达；禁止使用英文单词、英文短语或中英混杂作为标签凑数。画面里若有英文招牌/路牌，请用中文概括含义，不要照抄英文。\n"
+        "字段说明：\n"
+        "time：拍摄时间，优先使用我提供的元数据时间；格式必须为「YYYY-MM-DD」或「YYYY-MM-DD HH:MM:SS」（24小时制）。"
+        "如果确实无法确定日期，请输出空字符串 \"\"（不要输出「未知/大概/上午」这种）。\n"
+        "place：地点用中文短词组（国家/城市/场景类型，如「城市街道」「海边」「室内展厅」）；\n"
+        "event：正在发生的事，用中文短词组；\n"
+        "tags：3～8 条，每条为 2～8 个汉字为主的短关键词，语义具体；\n"
+        "phrase：用中文把上述要点连成一句极短描述（约 8～24 字），适合作文件名主题，不要空格与\\/:*?\"<>|。\n"
         "只输出一个 JSON 对象，键名必须为 time, place, event, tags, phrase。不要输出其它文字或 Markdown。"
     )
-    user_block = f"文件名：{bn}\n视频时长：{dur}\n共 {len(b64_list)} 张代表帧。请分析并返回 JSON。"
+    user_block = (
+        f"文件名：{bn}\n"
+        f"视频时长：{dur}\n"
+        f"拍摄时间（元数据/文件时间推断）：{meta_time or '(空)'}\n"
+        f"共 {len(b64_list)} 张代表帧。请分析并返回 JSON。"
+    )
     # Ollama：同一 user 消息里附带 images 数组（每项为原始 base64，无 data: 前缀）
     url = f"{ollama_host}/api/chat"
     payload = {
         "model": model,
         "stream": False,
-        "options": {"temperature": 0.3},
+        "options": {"temperature": 0.2},
         "messages": [
             {
                 "role": "user",
@@ -876,6 +1011,10 @@ def _vision_analyze_video(
     if not raw:
         raise RuntimeError(f"模型未返回有效 JSON：{content_out[:200]}")
     norm = _normalize_llm_insight(raw)
+    # 若模型没给出可用日期，则回填本地元数据时间（到秒）
+    if not (norm.get("time_guess") or "").strip():
+        if meta_time:
+            norm["time_guess"] = meta_time
     return {
         "time_guess": norm["time_guess"],
         "place_guess": norm["place_guess"],
@@ -934,12 +1073,18 @@ class AnalysisTaskManager:
             if not task:
                 return None
             insights = task.get("insights") or {}
+            insight_rows = []
+            for p in task["source_files"]:
+                row = dict(insights.get(p) or _empty_insight())
+                row["path"] = p
+                insight_rows.append(row)
             return {
                 "id": task["id"],
                 "name": task["name"],
                 "status": task["status"],
                 "created_at": task["created_at"],
                 "source_files": list(task["source_files"]),
+                "insight_rows": insight_rows,
                 "insights": {k: dict(v) for k, v in insights.items()},
                 "analyze_job": dict(task.get("analyze_job") or {}),
                 "preview_count": len(task["preview"]),
@@ -999,6 +1144,15 @@ class AnalysisTaskManager:
 
     def start_analyze(self, tid: str):
         host, model, frames, req_timeout = _ollama_config()
+        ok, oerr = _ollama_health_check(host)
+        if not ok:
+            return {
+                "ok": False,
+                "error": (
+                    f"无法连接本地 Ollama（{host}）：{oerr}。"
+                    "请先在本机终端运行 `ollama serve`，并确保已 `ollama pull` 视觉模型。"
+                ),
+            }
         with self._lock:
             task = self._tasks.get(tid)
             if not task:
@@ -1012,6 +1166,10 @@ class AnalysisTaskManager:
                 "total": n,
                 "current_path": "",
                 "error": "",
+                "phase": "starting",
+                "phase_detail": "已连接 Ollama，准备分析…",
+                "ollama_host": host,
+                "model": model,
             }
         threading.Thread(
             target=self._analyze_worker,
@@ -1037,11 +1195,29 @@ class AnalysisTaskManager:
                         return
                     t["analyze_job"]["done"] = i
                     t["analyze_job"]["current_path"] = path
+                    t["analyze_job"]["phase"] = "extract_frames"
+                    t["analyze_job"]["phase_detail"] = "正在从视频抽取帧（ffmpeg）…"
                     ins = t["insights"].setdefault(path, _empty_insight())
                     ins["llm_status"] = "running"
                     ins["error"] = ""
+
+                def _after_frames():
+                    with self._lock:
+                        t2 = self._tasks.get(tid)
+                        if t2 and t2.get("analyze_job", {}).get("state") == "running":
+                            t2["analyze_job"]["phase"] = "ollama"
+                            t2["analyze_job"]["phase_detail"] = (
+                                f"正在请求 Ollama 模型「{model}」…（单条约 {request_timeout}s 超时）"
+                            )
+
                 result = _vision_analyze_video(
-                    path, ollama_host, model, frame_count, frames_dir, request_timeout
+                    path,
+                    ollama_host,
+                    model,
+                    frame_count,
+                    frames_dir,
+                    request_timeout,
+                    after_frames_hook=_after_frames,
                 )
                 with self._lock:
                     t = self._tasks.get(tid)
@@ -1068,6 +1244,8 @@ class AnalysisTaskManager:
                 t["analyze_job"]["state"] = "done"
                 t["analyze_job"]["done"] = len(paths)
                 t["analyze_job"]["current_path"] = ""
+                t["analyze_job"]["phase"] = "idle"
+                t["analyze_job"]["phase_detail"] = "本批视频已全部处理"
 
     def confirm_insights(self, tid: str, confirms: list):
         with self._lock:
@@ -1080,6 +1258,10 @@ class AnalysisTaskManager:
                 if not path or path not in insights:
                     continue
                 ins = insights[path]
+                # 可选覆盖时间（允许用户修正）
+                tstr = it.get("time")
+                if isinstance(tstr, str) and tstr.strip():
+                    ins["confirmed_time"] = tstr.strip()
                 if not it.get("confirmed"):
                     ins["user_confirmed"] = False
                     continue
@@ -1091,11 +1273,23 @@ class AnalysisTaskManager:
                     ins["confirmed_phrase"] = (ins.get("confirmed_phrase") or ins.get("phrase") or "").strip()
                 raw_tags = it.get("tags")
                 if isinstance(raw_tags, list):
-                    ins["confirmed_tags"] = [str(x).strip() for x in raw_tags if str(x).strip()]
+                    clean = []
+                    for x in raw_tags:
+                        s = str(x).strip()
+                        if not s:
+                            continue
+                        if re.search(r"[A-Za-z]", s):
+                            continue
+                        clean.append(s)
+                    ins["confirmed_tags"] = clean
                 elif isinstance(raw_tags, str):
-                    ins["confirmed_tags"] = [
-                        t.strip() for t in re.split(r"[,，;；|/]", raw_tags) if t.strip()
-                    ]
+                    clean = []
+                    for t in re.split(r"[,，;；|/]", raw_tags):
+                        s = t.strip()
+                        if not s or re.search(r"[A-Za-z]", s):
+                            continue
+                        clean.append(s)
+                    ins["confirmed_tags"] = clean
                 else:
                     ins["confirmed_tags"] = list(ins.get("tags") or [])
             return {"ok": True, "id": tid}
@@ -1323,10 +1517,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _send_json(self, data, code=200):
+    def _send_json(self, data, code=200, no_store=False):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if no_store:
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
 
@@ -1409,7 +1606,7 @@ class Handler(BaseHTTPRequestHandler):
             prog = scanner.get_progress(since)
             self._send_json(prog)
         elif path == "/api/tasks":
-            self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()})
+            self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
 
         elif path.startswith("/api/tasks/"):
             rest = path[len("/api/tasks/") :]
@@ -1418,9 +1615,36 @@ class Handler(BaseHTTPRequestHandler):
                 return
             det = analysis_tasks.get_task_detail(rest)
             if not det:
-                self._send_json({"ok": False, "error": "task not found"}, 404)
+                self._send_json({"ok": False, "error": "task not found"}, 404, no_store=True)
                 return
-            self._send_json({"ok": True, "task": det})
+            self._send_json({"ok": True, "task": det}, no_store=True)
+
+        elif path == "/api/preview-thumb":
+            fpath = qs.get("path", [""])[0]
+            fpath = unquote(fpath)
+            if not fpath or not os.path.isfile(fpath):
+                self.send_error(404)
+                return
+            try:
+                rp = os.path.realpath(os.path.abspath(fpath))
+            except OSError:
+                self.send_error(404)
+                return
+            if not is_path_under_root(rp):
+                self.send_error(403)
+                return
+            if os.path.splitext(rp)[1].lower() not in VIDEO_EXTS:
+                self.send_error(400)
+                return
+            try:
+                tp = generate_video_thumb_single(rp)
+            except Exception:
+                self.send_error(500)
+                return
+            if not tp or not os.path.isfile(tp):
+                self.send_error(404)
+                return
+            self._send_file(tp, "image/jpeg")
 
         elif path.startswith("/thumb/"):
             parts = path.split("/")
@@ -1464,8 +1688,11 @@ class Handler(BaseHTTPRequestHandler):
                     if not is_path_under_root(target):
                         self._send_json({"ok": False, "error": "forbidden"}, 403)
                     else:
-                        subprocess.run(["open", target], timeout=10, capture_output=True)
-                        self._send_json({"ok": True})
+                        ok = open_in_file_manager(target)
+                        if ok:
+                            self._send_json({"ok": True})
+                        else:
+                            self._send_json({"ok": False, "error": "open failed"}, 500)
                 except Exception as e:
                     self._send_json({"ok": False, "error": str(e)}, 500)
             else:
@@ -2459,6 +2686,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button type="button" class="primary" id="saveConfirmBtn">保存确认</button>
         </div>
         <div id="analyzeProgress" class="analysis-note" style="display:none;margin-top:6px;"></div>
+        <div class="analysis-note" style="margin-top:4px;color:#888;font-size:12px;">提示：点「AI分析」会自动切到本页；左侧列为<strong>视频缩略图</strong>（点击在新标签页播放），请对照画面核对标签与短语。若启动失败，请先在本机运行 <code>ollama serve</code>。</div>
         <div id="insightTableWrap" style="overflow:auto;max-height:460px;margin-top:8px;"></div>
     </div>
     <div class="analysis-card">
@@ -2576,6 +2804,15 @@ function buildVideoPlayUrl(filePath) {
     }
     return '/file?path=' + encodeURIComponent(filePath);
 }
+window.insightRowThumbError = function(ev) {
+    const img = ev && ev.target;
+    if (!img || img.tagName !== 'IMG') return;
+    img.onerror = null;
+    img.src = 'data:image/svg+xml,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90"><rect fill="#2a2a2a" width="100%" height="100%"/>' +
+        '<text x="50%" y="50%" fill="#888" font-size="10" text-anchor="middle" dy=".35em">无缩略图</text></svg>'
+    );
+};
 function getWorkReviewTag(workId) {
     try {
         const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
@@ -2648,7 +2885,7 @@ async function loadTaskList() {
     const rows = document.getElementById('analysisTaskRows');
     const evalSel = document.getElementById('evalTaskSelect');
     try {
-        const r = await fetch('/api/tasks');
+        const r = await fetch('/api/tasks', { cache: 'no-store' });
         const data = await r.json();
         if (!data.ok) throw new Error(data.error || '加载任务失败');
         if (evalSel) {
@@ -2810,20 +3047,25 @@ function stopInsightPoll() {
     }
 }
 
-function openInsightPanel(id) {
+async function openInsightPanel(id) {
+    switchTab('analysis');
     stopInsightPoll();
     insightTaskId = id;
     const el = document.getElementById('insightTaskLabel');
     if (el) el.textContent = '当前任务：' + id;
-    loadTaskDetail(false);
+    await loadTaskDetail(false);
 }
 
 async function startAiAnalyze(id) {
+    switchTab('analysis');
     try {
-        const res = await fetch('/api/tasks/' + encodeURIComponent(id) + '/analyze', { method: 'POST' });
+        const res = await fetch('/api/tasks/' + encodeURIComponent(id) + '/analyze', {
+            method: 'POST',
+            cache: 'no-store',
+        });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error || '启动失败');
-        openInsightPanel(id);
+        await openInsightPanel(id);
         await loadTaskList();
     } catch (e) {
         alert('AI 分析：' + (e.message || String(e)));
@@ -2837,7 +3079,7 @@ async function loadTaskDetail(silentPoll) {
         return null;
     }
     try {
-        const r = await fetch('/api/tasks/' + encodeURIComponent(insightTaskId));
+        const r = await fetch('/api/tasks/' + encodeURIComponent(insightTaskId), { cache: 'no-store' });
         const data = await r.json();
         if (!data.ok) throw new Error(data.error || '加载失败');
         const t = data.task;
@@ -2846,16 +3088,28 @@ async function loadTaskDetail(silentPoll) {
             if (aj.state === 'running') {
                 progressEl.style.display = '';
                 const cur = aj.current_path ? escapeHtml(aj.current_path) : '';
-                progressEl.innerHTML = `分析中 <b>${Number(aj.done || 0)}/${Number(aj.total || 0)}</b> · <span style="font-size:11px;word-break:break-all;">${cur}</span>`;
+                const phase = escapeHtml(aj.phase_detail || aj.phase || '');
+                const om = aj.model ? escapeHtml(String(aj.model)) : '';
+                const oh = aj.ollama_host ? escapeHtml(String(aj.ollama_host)) : '';
+                progressEl.innerHTML =
+                    `<div><b>进度 ${Number(aj.done || 0)}/${Number(aj.total || 0)}</b> · ${phase}</div>` +
+                    (oh || om ? `<div style="font-size:11px;color:#9cf;margin-top:4px;">Ollama ${oh}${om ? ' · 模型 ' + om : ''}</div>` : '') +
+                    (cur ? `<div style="font-size:11px;word-break:break-all;margin-top:4px;color:#ccc;">当前：${cur}</div>` : '');
             } else {
-                progressEl.style.display = (aj.total > 0) ? '' : 'none';
-                progressEl.textContent = (aj.state === 'done' && aj.total) ? `分析阶段结束（共 ${aj.total} 个视频）` : '';
+                progressEl.style.display = (aj.total > 0 || aj.phase_detail) ? '' : 'none';
+                if (aj.state === 'done' && aj.total) {
+                    progressEl.textContent = `分析阶段结束（共 ${aj.total} 个视频）`;
+                } else if (aj.error) {
+                    progressEl.innerHTML = `<span style="color:#f88;">${escapeHtml(String(aj.error))}</span>`;
+                } else {
+                    progressEl.textContent = '';
+                }
             }
         }
         renderInsightRows(t);
         if (!silentPoll && aj.state === 'running') {
             stopInsightPoll();
-            insightPollTimer = setInterval(() => { loadTaskDetail(true); }, 2000);
+            insightPollTimer = setInterval(() => { loadTaskDetail(true); }, 1000);
         }
         if (silentPoll && aj.state !== 'running') {
             stopInsightPoll();
@@ -2863,6 +3117,10 @@ async function loadTaskDetail(silentPoll) {
         }
         return aj.state;
     } catch (e) {
+        if (progressEl && !silentPoll) {
+            progressEl.style.display = '';
+            progressEl.innerHTML = `<span style="color:#f88;">加载任务详情失败：${escapeHtml(e.message || String(e))}</span>`;
+        }
         if (!silentPoll) alert(e.message || String(e));
         return null;
     }
@@ -2871,30 +3129,45 @@ async function loadTaskDetail(silentPoll) {
 function renderInsightRows(t) {
     const wrap = document.getElementById('insightTableWrap');
     if (!wrap) return;
-    const insights = t.insights || {};
-    const paths = (t.source_files || []).slice().sort((a, b) => a.localeCompare(b));
-    if (paths.length === 0) {
+    const aj = t.analyze_job || {};
+    const jobRunning = aj.state === 'running';
+    const rows = (t.insight_rows && t.insight_rows.length)
+        ? t.insight_rows.slice()
+        : (t.source_files || []).map((p) => Object.assign({ path: p }, (t.insights || {})[p] || {}));
+    if (rows.length === 0) {
         wrap.innerHTML = '<div class="analysis-note">该任务没有视频文件。</div>';
         return;
     }
-    let html = '<table class="analysis-table"><thead><tr><th>文件</th><th>时间</th><th>地点</th><th>事件</th><th>标签（可改）</th><th>短语（可改）</th><th>状态</th><th>准确</th></tr></thead><tbody>';
-    paths.forEach((p) => {
-        const ins = insights[p] || {};
+    let html = '<table class="analysis-table"><thead><tr><th>画面预览</th><th>文件</th><th>时间（可改）</th><th>地点</th><th>事件</th><th>标签（可改）</th><th>短语（可改）</th><th>状态</th><th>准确</th></tr></thead><tbody>';
+    rows.forEach((ins) => {
+        const p = ins.path || '';
         const st = ins.llm_status || 'idle';
         let statusText = '未分析';
         if (st === 'done') statusText = '已分析';
-        else if (st === 'running') statusText = '分析中…';
-        else if (st === 'error') statusText = '失败';
-        const errLine = (st === 'error' && ins.error) ? `<div style="color:#f88;font-size:10px;">${escapeHtml(String(ins.error).slice(0, 120))}</div>` : '';
+        else if (st === 'running') {
+            if (aj.phase === 'ollama') statusText = '分析中（Ollama）…';
+            else if (aj.phase === 'extract_frames') statusText = '分析中（抽帧）…';
+            else statusText = '分析中…';
+        } else if (st === 'error') statusText = '失败';
+        else if (jobRunning && st === 'idle') statusText = '排队中';
+        const errLine = (st === 'error' && ins.error) ? `<div style="color:#f88;font-size:10px;">${escapeHtml(String(ins.error).slice(0, 220))}</div>` : '';
         const tagsDisp = (ins.confirmed_tags && ins.confirmed_tags.length) ? ins.confirmed_tags : (ins.tags || []);
         const tagsStr = tagsDisp.join('、');
         const phraseVal = (ins.confirmed_phrase || ins.phrase || '');
         const dis = (st !== 'done') ? 'disabled' : '';
         const checked = ins.user_confirmed ? 'checked' : '';
         const shortName = p.split('/').pop() || p;
+        const playUrl = buildVideoPlayUrl(p);
+        const thumbSrc = '/api/preview-thumb?path=' + encodeURIComponent(p);
         html += `<tr data-path="${encodeURIComponent(p)}">
+            <td style="width:168px;vertical-align:top;padding:6px;">
+                <a href="${playUrl}" target="_blank" rel="noopener noreferrer" title="新标签页播放原片" style="display:inline-block;line-height:0;border-radius:6px;overflow:hidden;border:1px solid #333;">
+                    <img src="${thumbSrc}" alt="" width="160" height="90" loading="lazy" style="object-fit:cover;display:block;background:#1a1a1a;" onerror="window.insightRowThumbError(event)">
+                </a>
+                <div style="margin-top:4px;font-size:10px;"><a href="${playUrl}" target="_blank" rel="noopener noreferrer">▶ 播放核对</a></div>
+            </td>
             <td style="max-width:140px;font-size:11px;word-break:break-all;" title="${escapeHtml(p)}">${escapeHtml(shortName)}</td>
-            <td style="font-size:11px;">${escapeHtml(ins.time_guess || '')}</td>
+            <td><input type="text" class="insight-time-inp" value="${escapeHtml(ins.confirmed_time || ins.time_guess || '')}" style="width:130px;font-size:11px;" ${st === 'done' || st === 'error' ? '' : 'disabled'} placeholder="YYYY-MM-DD HH:MM:SS"></td>
             <td style="font-size:11px;">${escapeHtml(ins.place_guess || '')}</td>
             <td style="font-size:11px;">${escapeHtml(ins.event_guess || '')}</td>
             <td><input type="text" class="insight-tags-inp" value="${escapeHtml(tagsStr)}" style="width:120px;font-size:11px;" ${dis}></td>
@@ -2919,9 +3192,11 @@ async function saveInsightConfirms() {
         const ph = ta ? ta.value : '';
         const tin = tr.querySelector('.insight-tags-inp');
         const tags = tin ? parseTagsInput(tin.value) : [];
+        const timeInp = tr.querySelector('.insight-time-inp');
+        const tstr = timeInp ? timeInp.value : '';
         const cb = tr.querySelector('.insight-confirm-cb');
         const confirmed = cb && cb.checked;
-        confirms.push({ path: path, phrase: ph, tags: tags, confirmed: confirmed });
+        confirms.push({ path: path, phrase: ph, tags: tags, time: tstr, confirmed: confirmed });
     });
     try {
         const res = await fetch('/api/tasks/' + encodeURIComponent(insightTaskId) + '/confirm', {
