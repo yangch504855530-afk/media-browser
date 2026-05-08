@@ -1,0 +1,95 @@
+{
+  "task_id": "3c253a302d04",
+  "created_at": "2026-05-06T16:20:53",
+  "mapping": [
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409081554_0001_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000409_手机-键盘-鼠标-控制器-桌_001.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409081640_0002_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000409_猫探索着宠物笼子-人摸它的头_002.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409082418_0003_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000409_黑色猫在卧床上-看向镜头_003.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409082442_0004_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000409_人在洗碟-水流在厨房_004.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409082524_0005_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000409_猫在床上-吸引人的注意力_005.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20000409173713_0006_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20000410_猫在门前-猫在门前_006.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250815165347_0007_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250815_一张桌上的美食-人们在南昌享用中国菜品_007.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250815173556_0008_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250815_美食时光-美味的南昌美食_008.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816153114_0010_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_在南昌-一位女性在手机上看着镜头-与男性在背景_009.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816192544_0012_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_人们在南昌的公共场所-夜景下-灯光照亮着_010.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816193325_0013_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_夜晚南昌的娱乐场所-人群聚集在一起-周边灯光照亮_011.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816193442_0014_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_南昌夜晚的游览地带-人群在中国城市-灯光照亮着建筑和宴会场所-夜景美丽_012.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816194025_0015_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_中国南昌风格建筑在夜晚-灯光洒落下_013.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816194043_0016_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_南昌夜晚的城市景观-亮着红灯光-美丽的桥_014.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816194102_0017_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_南昌夜晚的宴会在繁华的城市-红色柱子下-寒明桥前方_015.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816194819_0018_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_在夜晚-一对人在南昌城市街道上走过-享受着娱乐时光_016.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816195244_0019_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_中国城市南昌的宴会在夜晚-以宴会为主题-在中国塔前的灯光下-周围建筑亮着_017.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250816195949_0020_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250816_夜晚的南昌宴会在中国城市-明灯照亮着建筑-人群聚在一起-夜景美丽_018.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250817134641_0022_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250817_人们在南昌餐厅里享用美食-包括中式饭-烤面肉和辣椒炒菜_019.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250823115555_0028_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250823_南昌美食时光_020.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250823115602_0029_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250823_南昌美食-美味的面条和饭-美味的中餐_021.mp4"
+    },
+    {
+      "old": "/Users/chenghao/Desktop/250815南昌/DJI_20250823115719_0031_D.MP4",
+      "new": "/Users/chenghao/Desktop/250815南昌/20250823_人在南昌餐厅用手杯吃中式粤菜-手机在桌上_022.mp4"
+    }
+  ],
+  "errors": []
+}
