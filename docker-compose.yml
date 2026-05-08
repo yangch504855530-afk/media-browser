@@ -1,0 +1,34 @@
+# 项目目录（本机路径）：/vol1/1000/handle-pri/media-browser
+# 内含：media_browser.py、Dockerfile、docker-compose.yml；缩略图缓存在同级的 cache/ 子目录。
+# 在此目录执行：docker compose up -d --build
+#
+# 扫描根在容器内固定为 /scan：下面两个挂载会成为「一级子目录」tmp、torrent。
+#
+# 首次建议执行：
+#   mkdir -p "/vol1/1000/handle-pri/media-browser/cache"
+#   mkdir -p "/vol3/1000/handle-3T-cun3/torrent/auto-down"
+
+services:
+  media-browser:
+    build: .
+    image: media-browser:local
+    container_name: media-browser
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      MB_ROOT_DIR: /scan
+      # 缩略图缓存：宿主机 …/media-browser/cache → 容器 /cache
+      MB_CACHE_DIR: /cache
+      MB_HOST: "0.0.0.0"
+      MB_PORT: "8765"
+      # 机械盘 / 大库：保守并发与条带帧数（可按观察再调大）
+      MB_DISK_PROFILE: nas
+      MB_SCAN_WORKERS: "1"
+      MB_THUMB_COUNT: "2"
+      # 可选：MB_AUTO_OPEN=0（容器内无浏览器）
+      TZ: Asia/Shanghai
+    volumes:
+      - /vol1/1000/handle-pri/media-browser/cache:/cache
+      - /vol3/1000/handle-3T-cun3/tmp:/scan/tmp
+      - /vol3/1000/handle-3T-cun3/torrent/auto-down:/scan/torrent

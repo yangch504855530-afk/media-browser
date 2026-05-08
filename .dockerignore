@@ -1,0 +1,4 @@
+.git
+packaging
+*.md
+__pycache__
