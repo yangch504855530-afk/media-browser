@@ -9,14 +9,15 @@
 ## 目录
 
 1. [快速开始](#快速开始)  
-2. [环境变量](#环境变量)  
-3. [功能说明](#功能说明)  
-4. [性能与硬盘友好](#性能与硬盘友好)  
-5. [HTTP 接口](#http-接口)  
-6. [本地数据（localStorage）](#本地数据localstorage)  
-7. [macOS 打包与 DMG](#macos-打包与-dmg)  
-8. [路线图与待办](#路线图与待办)  
-9. [注意事项](#注意事项)  
+2. [Docker 部署](#docker-部署)  
+3. [环境变量](#环境变量)  
+4. [功能说明](#功能说明)  
+5. [性能与硬盘友好](#性能与硬盘友好)  
+6. [HTTP 接口](#http-接口)  
+7. [本地数据（localStorage）](#本地数据localstorage)  
+8. [macOS 打包与 DMG](#macos-打包与-dmg)  
+9. [路线图与待办](#路线图与待办)  
+10. [注意事项](#注意事项)  
 
 ---
 
@@ -30,12 +31,28 @@ python3 media_browser.py
 
 ---
 
+## Docker 部署
+
+适合 NAS 或远程服务器运行：
+
+```bash
+docker compose up -d --build
+```
+
+容器默认以 `uid=1000` 运行。若宿主机 UID 不同，请修改 `docker-compose.yml` 中的 `user` 行（见文件内注释）。
+
+---
+
 ## 环境变量
 
 | 变量 | 含义 | 默认（脚本） | 默认（打包 .app） |
 |------|------|----------------|-------------------|
-| `MB_ROOT_DIR` | 启动时的扫描根目录；运行中可在**页眉**改路径并「应用并扫描」 | `/Volumes/Untitled/pri` | `~/Documents/MediaBrowser` |
+| `MB_ROOT_DIR` | 启动时的扫描根目录；运行中可在**页眉**改路径并「应用并扫描」 | macOS: `/Volumes/Untitled/pri`<br>Win/Linux: `~/MediaBrowser` | `~/Documents/MediaBrowser` |
 | `MB_CACHE_DIR` | 缩略图缓存目录 | `~/.cache/media-browser/thumbs` | `~/Library/Application Support/Media Browser/thumbs` |
+| `MB_OLLAMA_HOST` | 本地 Ollama 地址（AI 视频分析） | `http://127.0.0.1:11434` | 同上 |
+| `MB_OLLAMA_MODEL` | 视觉模型名（如 `llava`、`moondream`） | `llava` | 同上 |
+| `MB_OLLAMA_TIMEOUT` | Ollama 单次请求超时（秒） | `300` | 同上 |
+| `MB_ANALYZE_FRAME_COUNT` | AI 分析时每视频抽帧数（2–12） | `5` | 同上 |
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
 | `MB_HOST` | 监听地址 | `0.0.0.0` | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |
@@ -67,7 +84,8 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
 - **删除**：`POST /delete`，路径须在扫描根下；删除**源文件成功后**，会按 `sha256(abspath)` 删除 `MB_CACHE_DIR` 下对应缩略图目录，避免孤儿缓存。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
-- **批量**：复选 + 批量保留/待审，或在 Finder 中打开所在文件夹（macOS）。
+- **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
+- **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
 - **难播格式**：走 **`/play`** 实时转码；界面有转码提示。
 - **退出**：页眉「**退出应用**」→ `POST /api/shutdown`，停止服务并退出进程。
 - **安全**：`/file`、`/open`、`/delete` 校验路径在当前扫描根下。
@@ -110,7 +128,13 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/thumb/...` | GET | 缩略图 |
 | `/file?path=` | GET | 原文件 |
 | `/play?path=` | GET | 实时转码 MP4 |
-| `/open?path=` | GET | Finder 打开目录（macOS） |
+| `/open?path=` | GET | 在文件管理器中打开目录（跨平台） |
+| `/api/tasks` | POST | 创建 AI 分析任务 |
+| `/api/tasks/{id}/analyze` | POST | 开始 AI 分析 |
+| `/api/tasks/{id}/confirm` | POST | 确认分析结果标签 |
+| `/api/tasks/{id}/preview` | POST | 预览批量重命名映射 |
+| `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
+| `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
 | `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存 |
 
 需跨域时服务器会响应 **`OPTIONS`**。
@@ -190,9 +214,5 @@ chmod +x packaging/build_dmg.sh
 ## 注意事项
 
 - 画廊内删除**无浏览器二次确认**，请谨慎或先备份。  
-- 转码占 CPU；`/play` 拖拽进度可能受限。  
-- 「在 Finder 中打开」仅 macOS。  
-
----
-
-*历史文件名 `MEDIA_BROWSER.md`、`PACKAGING.md`、`TODO_ROADMAP.md` 已指向本 README，避免多处重复维护。*
+- 转码占 CPU。  
+- 「在文件管理器中打开」已支持 macOS / Windows / Linux。  
