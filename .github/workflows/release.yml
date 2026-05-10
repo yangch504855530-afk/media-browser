@@ -9,37 +9,6 @@ permissions:
   contents: write
 
 jobs:
-  build-macos-intel:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install ffmpeg
-        run: brew install ffmpeg
-
-      - name: Install PyInstaller
-        run: pip install pyinstaller>=6.0
-
-      - name: Build .app & DMG
-        env:
-          CI: true
-          PYTHON_CMD: python3
-        run: |
-          chmod +x packaging/build_dmg.sh
-          ./packaging/build_dmg.sh
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-intel
-          path: |
-            dist/Media Browser.app
-            dist/Media Browser v*.dmg
-
   build-macos-arm:
     runs-on: macos-14
     steps:
@@ -134,7 +103,7 @@ jobs:
         shell: pwsh
 
   release:
-    needs: [build-macos-intel, build-macos-arm, build-windows]
+    needs: [build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -149,7 +118,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/macos-intel/**/*.dmg
             artifacts/macos-arm/**/*.dmg
             artifacts/windows/**/*.zip
           generate_release_notes: true

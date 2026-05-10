@@ -180,6 +180,8 @@ chmod +x packaging/build_dmg.sh
 | 自动开浏览器 | 默认关，`MB_AUTO_OPEN=1` 可开 | 默认开，`MB_AUTO_OPEN=0` 可关 |
 | 控制台 | 当前终端 | 双击常为控制台窗口（可在 spec 改 `console=False`） |
 
+> **注意：** macOS 版本为 **Apple Silicon (M1/M2/M3/M4)** 专用。Intel Mac 用户请使用脚本直接运行。
+
 正式分发需自行 **codesign / notarize**（此处不展开）。
 
 ---
