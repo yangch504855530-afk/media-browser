@@ -7,7 +7,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-VERSION="1.0.12"
+VERSION="1.0.13"
 VENV="$ROOT/.venv-build"
 
 # 减少在非 APFS 卷上写出资源分支文件（._xxx）

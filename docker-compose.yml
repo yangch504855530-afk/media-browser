@@ -7,6 +7,12 @@
 # 首次建议执行：
 #   mkdir -p "/vol1/1000/handle-pri/media-browser/cache"
 #   mkdir -p "/vol3/1000/handle-3T-cun3/torrent/auto-down"
+#
+# 权限说明：
+#   容器默认以 uid=1000 运行。如果宿主机你的用户 UID 不是 1000，
+#   请取消下面 user 行的注释，并替换为你的 UID/GID：
+#     id -u   # 查看 UID
+#     id -g   # 查看 GID
 
 services:
   media-browser:
@@ -14,6 +20,8 @@ services:
     image: media-browser:local
     container_name: media-browser
     restart: unless-stopped
+    # 如宿主机 UID/GID 不是 1000:1000，请取消下行注释并修改
+    # user: "1000:1000"
     ports:
       - "8765:8765"
     environment:

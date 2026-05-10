@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.0.12**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.0.13**，发版前请与打包配置核对）。
 
 ---
 

@@ -33,6 +33,7 @@ import threading
 import subprocess
 import time
 import mimetypes
+import signal
 import re
 import html as html_mod
 import shutil
@@ -47,7 +48,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -707,19 +708,23 @@ class MediaScanner:
                         continue
                     ext = os.path.splitext(f)[1].lower()
                     fpath = os.path.join(root, f)
+                    try:
+                        fsize = os.path.getsize(fpath)
+                    except OSError:
+                        continue
                     if ext in VIDEO_EXTS:
                         items.append({
                             "type": "video",
                             "path": fpath,
                             "name": f,
-                            "size": os.path.getsize(fpath),
+                            "size": fsize,
                         })
                     elif ext in IMAGE_EXTS:
                         items.append({
                             "type": "image",
                             "path": fpath,
                             "name": f,
-                            "size": os.path.getsize(fpath),
+                            "size": fsize,
                         })
             return self._build_work_from_items(items, work_path, None)
         except Exception as e:
@@ -4174,6 +4179,15 @@ def main():
     scanner.start()
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     _http_server = server
+
+    def _sigterm_handler(signum, frame):
+        print("\n[收到终止信号，退出中...]")
+        trigger_exit()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _sigterm_handler)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
