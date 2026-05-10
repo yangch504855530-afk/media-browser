@@ -72,8 +72,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Media Browser",
         "CFBundleDisplayName": "Media Browser",
-        "CFBundleVersion": "1.0.3",
-        "CFBundleShortVersionString": "1.0.3",
+        "CFBundleVersion": "1.0.12",
+        "CFBundleShortVersionString": "1.0.12",
         "NSHighResolutionCapable": True,
     },
 )
