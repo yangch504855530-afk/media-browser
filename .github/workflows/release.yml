@@ -1,0 +1,118 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller>=6.0
+
+      - name: Build .app & DMG
+        run: |
+          chmod +x packaging/build_dmg.sh
+          ./packaging/build_dmg.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel
+          path: |
+            dist/Media Browser.app
+            dist/Media Browser v*.dmg
+
+  build-macos-arm:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller>=6.0
+
+      - name: Build .app & DMG
+        run: |
+          chmod +x packaging/build_dmg.sh
+          ./packaging/build_dmg.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm
+          path: |
+            dist/Media Browser.app
+            dist/Media Browser v*.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download ffmpeg (static)
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath .\ffmpeg_temp -Force
+          $bin = Get-ChildItem -Path .\ffmpeg_temp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          $probe = Get-ChildItem -Path .\ffmpeg_temp -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+          Copy-Item $bin.FullName -Destination .\ffmpeg.exe
+          Copy-Item $probe.FullName -Destination .\ffprobe.exe
+          $env:PATH = "$PWD;$env:PATH"
+          echo "$PWD" | Out-File -FilePath $env:GITHUB_PATH -Append
+        shell: pwsh
+
+      - name: Verify ffmpeg
+        run: ffmpeg -version
+
+      - name: Build Windows ZIP
+        run: |
+          powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  release:
+    needs: [build-macos-intel, build-macos-arm, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/macos-intel/**/*.dmg
+            artifacts/macos-arm/**/*.dmg
+            artifacts/windows/**/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -184,6 +184,46 @@ chmod +x packaging/build_dmg.sh
 
 ---
 
+## Windows 打包
+
+### 前置条件
+
+- **Windows 10/11**、**Python 3.12+**
+- `ffmpeg.exe` 和 `ffprobe.exe` 在 PATH 中（可从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 下载静态构建）
+- PowerShell
+
+### 一键构建
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+```
+
+**典型产出**：`dist/MediaBrowser-v<VERSION>-windows.zip`
+
+解压后运行 `MediaBrowser.exe` 即可。
+
+---
+
+## GitHub Releases 自动发布
+
+项目已配置 GitHub Actions，推送 `v*` 标签时自动构建并发布：
+
+```bash
+git tag v1.0.13
+git push origin v1.0.13
+```
+
+Actions 会并行构建：
+- **macOS Intel** (`macos-13`) → `.dmg`
+- **macOS Apple Silicon** (`macos-14`) → `.dmg`
+- **Windows** (`windows-latest`) → `.zip`
+
+产物自动上传到该版本的 [GitHub Releases](https://github.com/yangch504855530-afk/media-browser/releases) 页面。
+
+> ⚠️ 首次使用 Actions 前，请确认仓库 Settings → Actions → General → Workflow permissions 已设为 "Read and write permissions"。
+
+---
+
 ## 路线图与待办
 
 ### 已在近期版本落地的能力（备忘）

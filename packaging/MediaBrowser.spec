@@ -1,7 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec：在项目根目录执行
-#   pip install pyinstaller && pyinstaller packaging/MediaBrowser.spec
+#   pip install pyinstaller>=6.0
+#   pyinstaller packaging/MediaBrowser.spec
 
+import sys
 import os
 import shutil
 
@@ -35,6 +37,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Windows 无控制台窗口；macOS/Linux 保留控制台便于调试
+console = sys.platform != "win32"
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -45,7 +50,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=console,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -64,16 +69,18 @@ coll = COLLECT(
     name="Media Browser",
 )
 
-app = BUNDLE(
-    coll,
-    name="Media Browser.app",
-    icon=None,
-    bundle_identifier="com.mediabrowser.app",
-    info_plist={
-        "CFBundleName": "Media Browser",
-        "CFBundleDisplayName": "Media Browser",
-        "CFBundleVersion": "1.0.13",
-        "CFBundleShortVersionString": "1.0.13",
-        "NSHighResolutionCapable": True,
-    },
-)
+# BUNDLE 仅在 macOS 上执行
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Media Browser.app",
+        icon=None,
+        bundle_identifier="com.mediabrowser.app",
+        info_plist={
+            "CFBundleName": "Media Browser",
+            "CFBundleDisplayName": "Media Browser",
+            "CFBundleVersion": "1.0.13",
+            "CFBundleShortVersionString": "1.0.13",
+            "NSHighResolutionCapable": True,
+        },
+    )
