@@ -47,7 +47,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.0.11"
+APP_VERSION = "1.0.12"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -280,24 +280,36 @@ def remove_media_thumb_cache(media_path: str) -> None:
 
 
 def get_video_info(path: str) -> dict:
-    info = {"duration": 0.0, "width": 0, "height": 0}
+    info = {"duration": 0.0, "width": 0, "height": 0, "codec": "", "bitrate": 0, "fps": 0.0}
     _probe_timeout = 90 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical") else 45
     try:
         out = subprocess.run(
             [FFPROBE_BIN, "-v", "error",
-             "-show_entries", "format=duration",
-             "-show_entries", "stream=width,height",
+             "-show_entries", "format=duration,bit_rate",
+             "-show_entries", "stream=width,height,codec_name,r_frame_rate",
              "-select_streams", "v:0",
              "-of", "json", path],
             capture_output=True, text=True, timeout=_probe_timeout
         )
         data = json.loads(out.stdout)
-        if "format" in data and "duration" in data["format"]:
-            info["duration"] = float(data["format"]["duration"])
+        if "format" in data:
+            fmt = data["format"]
+            if "duration" in fmt:
+                info["duration"] = float(fmt["duration"])
+            if "bit_rate" in fmt:
+                info["bitrate"] = int(fmt["bit_rate"])
         if "streams" in data and len(data["streams"]) > 0:
             s = data["streams"][0]
             info["width"] = s.get("width", 0)
             info["height"] = s.get("height", 0)
+            info["codec"] = s.get("codec_name", "")
+            rf = s.get("r_frame_rate", "")
+            if isinstance(rf, str) and "/" in rf:
+                try:
+                    num, den = rf.split("/")
+                    info["fps"] = round(float(num) / float(den), 2)
+                except Exception:
+                    pass
     except Exception:
         pass
     return info
@@ -613,6 +625,9 @@ class MediaScanner:
                 it["duration"] = info["duration"]
                 it["width"] = info["width"]
                 it["height"] = info["height"]
+                it["codec"] = info.get("codec", "")
+                it["bitrate"] = info.get("bitrate", 0)
+                it["fps"] = info.get("fps", 0.0)
                 # 只 ffprobe 一次；此前每条视频会 probe 最多 3 次，NAS/机械盘上极慢且重复读头
                 it["thumb"] = generate_video_thumb_single(it["path"], info)
                 it["thumbs"] = generate_video_thumbs(
@@ -2024,6 +2039,19 @@ header select:focus { outline: none; border-color: #0a84ff; }
     cursor: pointer;
 }
 .review-to-pending:hover { border-color: #888; color: #fff; }
+.gallery-review-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid #555;
+    background: #1a1a1a;
+    color: #ccc;
+    cursor: pointer;
+    margin-left: 10px;
+}
+.gallery-review-btn:hover { border-color: #888; color: #fff; }
+.gallery-review-btn.kept { background: #1e3d2a; border-color: #2f5e42; color: #8fd9a8; }
+.gallery-review-btn.pending { background: #333; border-color: #555; color: #aaa; }
 .progress-bar {
     width: 100%;
     height: 3px;
@@ -2611,6 +2639,40 @@ body.batch-open #backToTop.show { bottom: 118px; }
     transition: all 0.2s;
 }
 .modal-close:hover { color: #fff; background: rgba(255,255,255,0.1); }
+.modal-fs {
+    position: absolute;
+    top: 12px;
+    right: 328px;
+    font-size: 20px;
+    color: rgba(255,255,255,0.5);
+    cursor: pointer;
+    z-index: 20;
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: all 0.2s;
+    user-select: none;
+}
+.modal-fs:hover { color: #fff; background: rgba(255,255,255,0.1); }
+@media (max-width: 900px) {
+    .modal-fs { right: 60px; }
+}
+.img-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    width: 85vw;
+    height: 72vh;
+}
+.img-wrap img {
+    transition: transform 0.1s ease-out;
+    transform-origin: center center;
+    user-select: none;
+}
 
 @media (max-width: 900px) {
     .modal-sidebar { display: none; }
@@ -2735,6 +2797,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <div class="modal-body">
         <div class="modal-main" id="modalMain">
             <div class="modal-close" onclick="closeModal()">&times;</div>
+            <div class="modal-fs" onclick="toggleGalleryFullscreen()" title="全屏">⛶</div>
             <div class="modal-nav prev" onclick="navigate(-1)">&#10094;</div>
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
@@ -2821,34 +2884,44 @@ function getWorkReviewTag(workId) {
 }
 function buildReviewStripHtml(workId) {
     const kept = getWorkReviewTag(workId) === 'kept';
-    const btn = kept ? '<button type="button" class="review-to-pending" onclick="event.stopPropagation(); setWorkReviewPending(' + JSON.stringify(workId) + ')">标为待审</button>' : '';
+    const btn = kept ? '<button type="button" class="review-to-pending" data-work-id="' + escapeHtml(workId) + '">标为待审</button>' : '';
     const cls = kept ? 'kept' : 'pending';
     const txt = kept ? '保留' : '待审';
     return '<div class="review-strip"><span class="review-tag ' + cls + '">' + txt + '</span>' + btn + '</div>';
 }
-function setWorkReviewPending(workId) {
+function setWorkReviewTag(workId, tag) {
     try {
         const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
-        o[workId] = 'pending';
+        o[workId] = tag;
         localStorage.setItem('mb_review_tags', JSON.stringify(o));
     } catch (e) {}
-    const card = document.querySelector('.work-card[data-id="' + workId + '"]');
+    const card = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
     if (card) {
         const strip = card.querySelector('.review-strip');
         if (strip) strip.outerHTML = buildReviewStripHtml(workId);
+    }
+    // 如果画廊正打开该作品，同步更新画廊按钮
+    if (galleryState.workId === workId) {
+        updateGalleryReviewBtn(workId);
     }
 }
+function setWorkReviewPending(workId) {
+    setWorkReviewTag(workId, 'pending');
+}
 function markWorkOpenedKept(workId) {
-    try {
-        const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
-        o[workId] = 'kept';
-        localStorage.setItem('mb_review_tags', JSON.stringify(o));
-    } catch (e) {}
-    const card = document.querySelector('.work-card[data-id="' + workId + '"]');
-    if (card) {
-        const strip = card.querySelector('.review-strip');
-        if (strip) strip.outerHTML = buildReviewStripHtml(workId);
-    }
+    setWorkReviewTag(workId, 'kept');
+}
+function toggleWorkReview(workId) {
+    const current = getWorkReviewTag(workId);
+    setWorkReviewTag(workId, current === 'kept' ? 'pending' : 'kept');
+}
+function updateGalleryReviewBtn(workId) {
+    const btn = document.getElementById('galleryReviewBtn');
+    if (!btn) return;
+    const kept = getWorkReviewTag(workId) === 'kept';
+    btn.textContent = kept ? '保留' : '待审';
+    btn.className = 'gallery-review-btn ' + (kept ? 'kept' : 'pending');
+    btn.title = kept ? '点击标为待审' : '点击标为保留';
 }
 function resetAllReviewTags() {
     if (!confirm('将所有作品的标记恢复为「待审」？')) return;
@@ -3610,14 +3683,27 @@ function renderGallery() {
             v.focus();
         }
     } else {
-        mediaDiv.innerHTML = `<img src="${url}" style="max-width:85vw;max-height:72vh;" />`;
+        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" style="max-width:85vw;max-height:72vh;cursor:zoom-in;" /></div>`;
+        setupImageZoom();
     }
 
     const dur = item.duration ? `⏱ ${fmtDuration(item.duration)} · ` : '';
+    const res = (item.width && item.height) ? `${item.width}×${item.height} · ` : '';
+    const codec = item.codec ? `${item.codec.toUpperCase()} · ` : '';
+    const bitrate = item.bitrate ? `${(item.bitrate / 1000000).toFixed(1)}Mbps · ` : '';
+    const fps = item.fps ? `${item.fps}fps · ` : '';
     const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除：⌘I 或 Ctrl+I">🗑 删除</span>`;
-    infoDiv.innerHTML = `${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}`;
+    const reviewBtn = `<button type="button" id="galleryReviewBtn" class="gallery-review-btn" data-work-id="${escapeHtml(work.id)}">标记</button>`;
+    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}${reviewBtn}`;
+    updateGalleryReviewBtn(work.id);
     const sh = document.getElementById('shortcutHint');
-    if (sh) sh.textContent = '← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I / Ctrl+I 删除';
+    if (sh) {
+        if (item.type === 'video') {
+            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻页 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删除';
+        } else {
+            sh.textContent = '← → 翻页 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删除';
+        }
+    }
     sidebarTitle.textContent = work.name;
 
     renderSidebar(fileList, work, item);
@@ -3760,19 +3846,178 @@ function closeModal() {
     galleryState = { workId: null, itemIdx: 0 };
 }
 
+function setupImageZoom() {
+    const wrap = document.getElementById('imgWrap');
+    const img = document.getElementById('galleryImage');
+    if (!wrap || !img) return;
+    let scale = 1;
+    let panning = false;
+    let pointX = 0;
+    let pointY = 0;
+    let startX = 0;
+    let startY = 0;
+
+    function setTransform() {
+        img.style.transform = `translate(${pointX}px, ${pointY}px) scale(${scale})`;
+        img.style.cursor = scale > 1 ? 'grab' : 'zoom-in';
+    }
+
+    img.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? -0.15 : 0.15;
+        const newScale = Math.min(5, Math.max(1, scale + delta));
+        if (newScale !== scale) {
+            scale = newScale;
+            if (scale === 1) { pointX = 0; pointY = 0; }
+            setTransform();
+        }
+    }, { passive: false });
+
+    img.addEventListener('mousedown', (e) => {
+        if (scale <= 1) return;
+        e.preventDefault();
+        panning = true;
+        startX = e.clientX - pointX;
+        startY = e.clientY - pointY;
+        img.style.cursor = 'grabbing';
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!panning) return;
+        pointX = e.clientX - startX;
+        pointY = e.clientY - startY;
+        setTransform();
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (panning) {
+            panning = false;
+            img.style.cursor = scale > 1 ? 'grab' : 'zoom-in';
+        }
+    });
+
+    img.addEventListener('dblclick', () => {
+        scale = 1;
+        pointX = 0;
+        pointY = 0;
+        setTransform();
+    });
+}
+
+function toggleGalleryFullscreen() {
+    if (document.fullscreenElement) {
+        document.exitFullscreen();
+    } else {
+        document.getElementById('modal').requestFullscreen();
+    }
+}
+
+// 事件委托：卡片列表中的"标为待审"按钮
+document.addEventListener('click', (e) => {
+    const pendingBtn = e.target.closest('.review-to-pending');
+    if (pendingBtn) {
+        e.stopPropagation();
+        const workId = pendingBtn.dataset.workId;
+        if (workId) setWorkReviewPending(workId);
+        return;
+    }
+    // 画廊中的审阅切换按钮
+    const reviewBtn = e.target.closest('#galleryReviewBtn');
+    if (reviewBtn) {
+        e.stopPropagation();
+        const workId = reviewBtn.dataset.workId;
+        if (workId) toggleWorkReview(workId);
+        return;
+    }
+});
+
 document.addEventListener('keydown', (e) => {
     const modal = document.getElementById('modal');
     if (!modal.classList.contains('active')) return;
-    if (e.key === 'Escape') closeModal();
-    if (e.key === 'ArrowLeft') navigate(-1);
-    if (e.key === 'ArrowRight') navigate(1);
-    if (e.key === ' ') {
-        const v = document.getElementById('galleryVideo');
-        if (v) { e.preventDefault(); v.paused ? v.play() : v.pause(); }
-    }
+    const v = document.getElementById('galleryVideo');
+    const img = document.getElementById('galleryImage');
+
+    // 全局
+    if (e.key === 'Escape') { closeModal(); return; }
     if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         deleteCurrentItem();
+        return;
+    }
+
+    // 视频播放控制
+    if (v) {
+        if (e.key === ' ' || e.key === 'k' || e.key === 'K') {
+            e.preventDefault();
+            v.paused ? v.play() : v.pause();
+            return;
+        }
+        if (e.key === 'f' || e.key === 'F') {
+            e.preventDefault();
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                v.requestFullscreen();
+            }
+            return;
+        }
+        if (e.key === 'm' || e.key === 'M') {
+            e.preventDefault();
+            v.muted = !v.muted;
+            return;
+        }
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            v.volume = Math.min(1, v.volume + 0.1);
+            return;
+        }
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            v.volume = Math.max(0, v.volume - 0.1);
+            return;
+        }
+        // Shift + 左右 = 翻页；纯左右 = 快进/快退
+        if (e.key === 'ArrowLeft') {
+            if (e.shiftKey) { navigate(-1); }
+            else { e.preventDefault(); v.currentTime = Math.max(0, v.currentTime - 5); }
+            return;
+        }
+        if (e.key === 'ArrowRight') {
+            if (e.shiftKey) { navigate(1); }
+            else { e.preventDefault(); v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 5); }
+            return;
+        }
+        if (e.key === 'j' || e.key === 'J') {
+            e.preventDefault();
+            v.currentTime = Math.max(0, v.currentTime - 10);
+            return;
+        }
+        if (e.key === 'l' || e.key === 'L') {
+            e.preventDefault();
+            v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 10);
+            return;
+        }
+        // 逐帧（暂停时）
+        if (e.key === ',' || e.key === '<') {
+            e.preventDefault();
+            if (v.paused && v.readyState >= 2) {
+                v.currentTime = Math.max(0, v.currentTime - (1 / (v.fps || 30)));
+            }
+            return;
+        }
+        if (e.key === '.' || e.key === '>') {
+            e.preventDefault();
+            if (v.paused && v.readyState >= 2) {
+                v.currentTime = Math.min(v.duration || Infinity, v.currentTime + (1 / (v.fps || 30)));
+            }
+            return;
+        }
+    }
+
+    // 图片键盘控制（左右翻页）
+    if (img) {
+        if (e.key === 'ArrowLeft') { navigate(-1); return; }
+        if (e.key === 'ArrowRight') { navigate(1); return; }
     }
 });
 
