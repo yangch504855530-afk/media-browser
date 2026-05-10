@@ -97,9 +97,20 @@ jobs:
       - name: Verify ffmpeg
         run: ffmpeg -version
 
-      - name: Build Windows ZIP
+      - name: Install PyInstaller
+        run: pip install "pyinstaller>=6.0"
+
+      - name: Build with PyInstaller
         run: |
-          powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+          python -m PyInstaller packaging\MediaBrowser.spec --clean -y
+        shell: cmd
+
+      - name: Create ZIP
+        run: |
+          $dist = "dist\Media Browser"
+          $zip = "dist\MediaBrowser-v1.0.13-windows.zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -Force
+          if (-not (Test-Path $zip)) { exit 1 }
         shell: pwsh
 
       - name: Upload artifacts
@@ -107,14 +118,6 @@ jobs:
         with:
           name: windows
           path: dist/*.zip
-
-      - name: Print PyInstaller log on failure
-        if: failure()
-        run: |
-          if (Test-Path build\MediaBrowser\warn-MediaBrowser.txt) {
-            Get-Content build\MediaBrowser\warn-MediaBrowser.txt
-          }
-        shell: pwsh
 
   release:
     needs: [build-macos-intel, build-macos-arm, build-windows]
