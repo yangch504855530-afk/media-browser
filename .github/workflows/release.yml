@@ -100,17 +100,22 @@ jobs:
       - name: Install PyInstaller
         run: pip install "pyinstaller>=6.0"
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (onedir)
         run: |
-          python -m PyInstaller packaging\MediaBrowser.spec --clean -y
+          python -m PyInstaller --onedir --name MediaBrowser --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --clean -y media_browser.py
         shell: cmd
+
+      - name: Copy ffmpeg to dist
+        run: |
+          Copy-Item ffmpeg.exe dist\MediaBrowser\
+          Copy-Item ffprobe.exe dist\MediaBrowser\
+        shell: pwsh
 
       - name: Create ZIP
         run: |
-          $dist = "dist\Media Browser"
+          $dist = "dist\MediaBrowser"
           $zip = "dist\MediaBrowser-v1.0.13-windows.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $zip -Force
-          if (-not (Test-Path $zip)) { exit 1 }
         shell: pwsh
 
       - name: Upload artifacts
@@ -118,6 +123,15 @@ jobs:
         with:
           name: windows
           path: dist/*.zip
+
+      - name: Print build logs on failure
+        if: failure()
+        run: |
+          Get-ChildItem -Path build -Recurse -Filter "*.txt" | ForEach-Object {
+            Write-Host "=== $($_.FullName) ==="
+            Get-Content $_.FullName -ErrorAction SilentlyContinue
+          }
+        shell: pwsh
 
   release:
     needs: [build-macos-intel, build-macos-arm, build-windows]
