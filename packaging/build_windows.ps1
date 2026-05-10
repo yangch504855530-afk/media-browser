@@ -13,19 +13,32 @@ if (-not $ffmpeg -or -not $ffprobe) {
     Write-Error "ffmpeg and/or ffprobe not found in PATH. Please install ffmpeg first."
     exit 1
 }
+Write-Host "Found ffmpeg: $($ffmpeg.Source)"
+Write-Host "Found ffprobe: $($ffprobe.Source)"
 
-Write-Host "==> Install PyInstaller"
+Write-Host "==> Install/upgrade PyInstaller"
 python -m pip install --upgrade pip
 python -m pip install "pyinstaller>=6.0"
 
 Write-Host "==> Build with PyInstaller"
 Push-Location $ROOT
-python -m PyInstaller packaging\MediaBrowser.spec --clean -y
+
+try {
+    python -m PyInstaller packaging\MediaBrowser.spec --clean -y
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller build failed with exit code $LASTEXITCODE"
+    }
+} catch {
+    Write-Error "PyInstaller build failed: $_"
+    Pop-Location
+    exit 1
+}
+
 Pop-Location
 
 $DIST = Join-Path $ROOT "dist" "Media Browser"
 if (-not (Test-Path $DIST)) {
-    Write-Error "Build failed: $DIST not found"
+    Write-Error "Build failed: dist directory not found at $DIST"
     exit 1
 }
 
@@ -40,6 +53,11 @@ if (Get-Command Compress-Archive -ErrorAction SilentlyContinue) {
     # Fallback for older PowerShell
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory($DIST, $ZIP_OUT, "Optimal", $false)
+}
+
+if (-not (Test-Path $ZIP_OUT)) {
+    Write-Error "ZIP creation failed"
+    exit 1
 }
 
 Write-Host "Done:"

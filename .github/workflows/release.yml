@@ -14,6 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install ffmpeg
         run: brew install ffmpeg
 
@@ -21,6 +25,9 @@ jobs:
         run: pip install pyinstaller>=6.0
 
       - name: Build .app & DMG
+        env:
+          CI: true
+          PYTHON_CMD: python3
         run: |
           chmod +x packaging/build_dmg.sh
           ./packaging/build_dmg.sh
@@ -38,6 +45,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install ffmpeg
         run: brew install ffmpeg
 
@@ -45,6 +56,9 @@ jobs:
         run: pip install pyinstaller>=6.0
 
       - name: Build .app & DMG
+        env:
+          CI: true
+          PYTHON_CMD: python3
         run: |
           chmod +x packaging/build_dmg.sh
           ./packaging/build_dmg.sh
@@ -93,6 +107,14 @@ jobs:
         with:
           name: windows
           path: dist/*.zip
+
+      - name: Print PyInstaller log on failure
+        if: failure()
+        run: |
+          if (Test-Path build\MediaBrowser\warn-MediaBrowser.txt) {
+            Get-Content build\MediaBrowser\warn-MediaBrowser.txt
+          }
+        shell: pwsh
 
   release:
     needs: [build-macos-intel, build-macos-arm, build-windows]
