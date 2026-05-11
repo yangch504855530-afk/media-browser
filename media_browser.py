@@ -950,7 +950,7 @@ def _normalize_llm_insight(raw: dict) -> dict:
     if re.search(r"[A-Za-z]", phrase):
         phrase = ""
     if not phrase and clean_tags:
-        phrase = "·".join(clean_tags[:5])
+        phrase = _tags_to_chinese_sentence(clean_tags)
     return {
         "time_guess": str(raw.get("time") or raw.get("时间") or "").strip(),
         "place_guess": str(raw.get("place") or raw.get("地点") or "").strip(),
@@ -958,6 +958,17 @@ def _normalize_llm_insight(raw: dict) -> dict:
         "tags": clean_tags,
         "phrase": phrase,
     }
+
+
+def _tags_to_chinese_sentence(tags: list[str]) -> str:
+    """将标签用顿号连成一句可读中文，供缺省短语或前端展示。"""
+    parts = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    if not parts:
+        return ""
+    parts = parts[:12]
+    if len(parts) == 1:
+        return parts[0] + "。"
+    return "、".join(parts) + "。"
 
 
 def _vision_analyze_video(
@@ -2004,6 +2015,24 @@ header select:focus { outline: none; border-color: #0a84ff; }
 }
 .filters button:hover { border-color: #555; color: #ccc; }
 .filters button.active { background: #2a2a2a; color: #fff; border-color: #555; }
+.folder-nav-hint {
+    display: inline-block;
+    font-size: 11px;
+    color: #777;
+    margin-left: 8px;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+.folder-nav-hint kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #1a1a1a;
+    color: #bbb;
+    font-size: 10px;
+    font-family: ui-monospace, monospace;
+}
 .review-reset-all {
     display: inline-block;
     font-size: 12px;
@@ -2314,12 +2343,17 @@ header select:focus { outline: none; border-color: #0a84ff; }
     overflow: hidden;
     padding: 4px;
 }
+.image-row {
+    cursor: pointer;
+}
 .image-row img {
     height: 120px;
     width: auto;
     object-fit: cover;
     border-radius: 4px;
     cursor: pointer;
+    -webkit-user-drag: none;
+    user-select: none;
 }
 .video-thumbs-panel {
     padding: 8px;
@@ -2717,6 +2751,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button data-filter="image">有图片</button>
         <button data-filter="pending">仅待审</button>
     </div>
+    <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
 </header>
@@ -2807,7 +2842,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
             <div class="file-info" id="modalFileInfo"></div>
-            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I / Ctrl+I 删除</div>
+            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I / Ctrl+I 删除 · ⌘← / ⌘→ 上/下一作品（列表与画廊）</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
             <h3 id="sidebarTitle">作品文件</h3>
@@ -3119,6 +3154,14 @@ function parseTagsInput(s) {
     return String(s).split(/[,，、;；|]+/).map(x => x.trim()).filter(Boolean);
 }
 
+function composeTagsToSentence(tags) {
+    if (!tags || !tags.length) return '';
+    const parts = tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 12);
+    if (parts.length === 0) return '';
+    if (parts.length === 1) return parts[0] + '。';
+    return parts.join('、') + '。';
+}
+
 function stopInsightPoll() {
     if (insightPollTimer) {
         clearInterval(insightPollTimer);
@@ -3217,7 +3260,7 @@ function renderInsightRows(t) {
         wrap.innerHTML = '<div class="analysis-note">该任务没有视频文件。</div>';
         return;
     }
-    let html = '<table class="analysis-table"><thead><tr><th>画面预览</th><th>文件</th><th>时间（可改）</th><th>地点</th><th>事件</th><th>标签（可改）</th><th>短语（可改）</th><th>状态</th><th>准确</th></tr></thead><tbody>';
+    let html = '<table class="analysis-table"><thead><tr><th>画面预览</th><th>文件</th><th>时间（可改）</th><th>地点</th><th>事件</th><th>标签（可改，供核对）</th><th>短语（可改）</th><th>状态</th><th>准确</th></tr></thead><tbody>';
     rows.forEach((ins) => {
         const p = ins.path || '';
         const st = ins.llm_status || 'idle';
@@ -3233,6 +3276,7 @@ function renderInsightRows(t) {
         const tagsDisp = (ins.confirmed_tags && ins.confirmed_tags.length) ? ins.confirmed_tags : (ins.tags || []);
         const tagsStr = tagsDisp.join('、');
         const phraseVal = (ins.confirmed_phrase || ins.phrase || '');
+        const autoFromTags = composeTagsToSentence(tagsDisp);
         const dis = (st !== 'done') ? 'disabled' : '';
         const checked = ins.user_confirmed ? 'checked' : '';
         const shortName = String(p).split(/[\\/]+/).pop() || p;
@@ -3250,13 +3294,28 @@ function renderInsightRows(t) {
             <td style="font-size:11px;">${escapeHtml(ins.place_guess || '')}</td>
             <td style="font-size:11px;">${escapeHtml(ins.event_guess || '')}</td>
             <td><input type="text" class="insight-tags-inp" value="${escapeHtml(tagsStr)}" style="width:120px;font-size:11px;" ${dis}></td>
-            <td><textarea class="insight-phrase-ta" rows="2" style="width:160px;font-size:11px;" ${dis}>${escapeHtml(phraseVal)}</textarea></td>
+            <td><textarea class="insight-phrase-ta" rows="2" style="width:160px;font-size:11px;" ${dis}>${escapeHtml(phraseVal)}</textarea>
+                <div class="insight-auto-from-tags" style="font-size:10px;color:#8ab4f8;margin-top:4px;line-height:1.35;">由标签连成句：<span class="insight-auto-phrase-text">${escapeHtml(autoFromTags)}</span></div></td>
             <td style="font-size:11px;">${statusText}${errLine}</td>
             <td style="text-align:center;"><input type="checkbox" class="insight-confirm-cb" ${checked} ${dis} title="确认标签与短语无误"></td>
         </tr>`;
     });
     html += '</tbody></table>';
     wrap.innerHTML = html;
+    bindInsightTableLiveAutoPhrase();
+}
+
+function bindInsightTableLiveAutoPhrase() {
+    const wrap = document.getElementById('insightTableWrap');
+    if (!wrap || wrap._insightAutoPhraseBound) return;
+    wrap._insightAutoPhraseBound = true;
+    wrap.addEventListener('input', (e) => {
+        const inp = e.target && e.target.closest && e.target.closest('.insight-tags-inp');
+        if (!inp || !wrap.contains(inp)) return;
+        const tr = inp.closest('tr');
+        const span = tr && tr.querySelector('.insight-auto-phrase-text');
+        if (span) span.textContent = composeTagsToSentence(parseTagsInput(inp.value));
+    });
 }
 
 async function saveInsightConfirms() {
@@ -3422,9 +3481,8 @@ function createWorkCard(work) {
             for (let j = 0; j < tlist.length; j++) {
                 const url = buildThumbUrl(tlist[j]);
                 const isPh = url === '';
-                const onclick = `event.stopPropagation(); openGallery(${JSON.stringify(work.id)}, ${i}, ${j})`;
-                contentHtml += `<div class="thumb" onclick="${onclick.replace(/"/g,'&quot;')}">
-                    <img src="${url}" loading="lazy" alt="" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
+                contentHtml += `<div class="thumb" data-item-idx="${i}" data-thumb-idx="${j}">
+                    <img src="${url}" loading="lazy" alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
                     <div class="loader"></div>
                     ${isPh ? '<div class="ph-icon">❓</div>' : ''}
                 </div>`;
@@ -3432,8 +3490,8 @@ function createWorkCard(work) {
             contentHtml += `</div></div>`;
         } else {
             const url = buildThumbUrl(it.thumb);
-            contentHtml += `<div class="image-row" onclick="event.stopPropagation(); openGallery(${JSON.stringify(work.id)}, ${i}, 0)">
-                <img src="${url}" loading="lazy" alt="" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
+            contentHtml += `<div class="image-row" data-item-idx="${i}">
+                <img src="${url}" loading="lazy" alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
             </div>`;
         }
     }
@@ -3455,6 +3513,24 @@ function createWorkCard(work) {
     wrap.innerHTML = contentHtml;
     while (wrap.firstChild) div.appendChild(wrap.firstChild);
     div.appendChild(info);
+
+    div.querySelectorAll('.thumb-strip .thumb').forEach((el) => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const ii = parseInt(el.getAttribute('data-item-idx'), 10);
+            const jj = parseInt(el.getAttribute('data-thumb-idx'), 10);
+            if (Number.isNaN(ii) || Number.isNaN(jj)) return;
+            openGallery(work.id, ii, jj);
+        });
+    });
+    div.querySelectorAll('.image-row').forEach((el) => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const ii = parseInt(el.getAttribute('data-item-idx'), 10);
+            if (Number.isNaN(ii)) return;
+            openGallery(work.id, ii, -1);
+        });
+    });
 
     div.addEventListener('click', (e) => {
         if (e.target.closest('.chk') || e.target.closest('.title') || e.target.closest('.thumb') || e.target.closest('.image-row') || e.target.closest('.review-strip')) return;
@@ -3549,6 +3625,70 @@ function renderMoreWorks(list) {
         container.appendChild(createWorkCard(w));
     }
     renderOffset += slice.length;
+}
+
+/** 视口内作品卡片索引范围（与 sticky 页眉大致对齐的 topBar） */
+function getVisibleWorkCardRange() {
+    const cards = Array.from(container.querySelectorAll('.work-card'));
+    if (!cards.length) return { cards, first: -1, last: -1, vh: window.innerHeight, topBar: 88 };
+    const vh = window.innerHeight;
+    const topBar = 88;
+    let first = -1;
+    let last = -1;
+    for (let i = 0; i < cards.length; i++) {
+        const r = cards[i].getBoundingClientRect();
+        if (r.bottom > topBar && r.top < vh) {
+            if (first < 0) first = i;
+            last = i;
+        }
+    }
+    return { cards, first, last, vh, topBar };
+}
+
+/**
+ * 审阅列表：滚到「下一个作品（文件夹）」卡片。
+ * 以视口内最后一个可见卡片为锚，滚到下一张；必要时懒加载。
+ */
+function goToNextWorkFolder() {
+    const list = getFilteredSortedWorks();
+    let { cards, first, last, vh } = getVisibleWorkCardRange();
+    if (!cards.length) return;
+    let nextIdx = last + 1;
+    if (nextIdx >= cards.length && renderOffset < list.length) {
+        renderMoreWorks(list);
+        const r2 = getVisibleWorkCardRange();
+        cards = r2.cards;
+        last = r2.last;
+        nextIdx = last + 1;
+    }
+    if (nextIdx >= 0 && nextIdx < cards.length && cards[nextIdx]) {
+        cards[nextIdx].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+    }
+    window.scrollBy({ top: Math.max(160, vh * 0.85), behavior: 'smooth' });
+}
+
+/** 审阅列表：滚到「上一个作品」卡片（以视口内首张可见卡片为锚）。 */
+function goToPrevWorkFolder() {
+    const { cards, first, vh } = getVisibleWorkCardRange();
+    if (!cards.length) return;
+    const prevIdx = first - 1;
+    if (prevIdx >= 0 && cards[prevIdx]) {
+        cards[prevIdx].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+    }
+    window.scrollBy({ top: -Math.max(160, vh * 0.85), behavior: 'smooth' });
+}
+
+/** 审阅页且未打开画廊：⌘/Ctrl + ← → 切换作品文件夹（与画廊内左右键区分） */
+function handleReviewListFolderNavKeys(e) {
+    if (!(e.metaKey || e.ctrlKey)) return false;
+    if (e.shiftKey || e.altKey) return false;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return false;
+    e.preventDefault();
+    if (e.key === 'ArrowRight') goToNextWorkFolder();
+    else goToPrevWorkFolder();
+    return true;
 }
 
 let scrollTimer = null;
@@ -3688,7 +3828,7 @@ function renderGallery() {
             v.focus();
         }
     } else {
-        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" style="max-width:85vw;max-height:72vh;cursor:zoom-in;" /></div>`;
+        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" draggable="false" style="max-width:85vw;max-height:72vh;cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
         setupImageZoom();
     }
 
@@ -3697,16 +3837,16 @@ function renderGallery() {
     const codec = item.codec ? `${item.codec.toUpperCase()} · ` : '';
     const bitrate = item.bitrate ? `${(item.bitrate / 1000000).toFixed(1)}Mbps · ` : '';
     const fps = item.fps ? `${item.fps}fps · ` : '';
-    const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除：⌘I 或 Ctrl+I">🗑 删除</span>`;
+    const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除：⌘I 或 Ctrl+I；⌘← / ⌘→ 切换作品（列表与画廊）">🗑 删除</span>`;
     const reviewBtn = `<button type="button" id="galleryReviewBtn" class="gallery-review-btn" data-work-id="${escapeHtml(work.id)}">标记</button>`;
     infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}${reviewBtn}`;
     updateGalleryReviewBtn(work.id);
     const sh = document.getElementById('shortcutHint');
     if (sh) {
         if (item.type === 'video') {
-            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻页 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删除';
+            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻文件（末档再→ 进下一作品）· ⌘←⌘→ 切作品 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删除';
         } else {
-            sh.textContent = '← → 翻页 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删除';
+            sh.textContent = '← → 翻图片（末张再→ 进下一作品首张）· ⌘←⌘→ 切作品 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删除';
         }
     }
     sidebarTitle.textContent = work.name;
@@ -3785,6 +3925,52 @@ function jumpToItem(idx) {
     renderGallery();
 }
 
+/**
+ * 当前画廊在「全部作品」中的顺序（与审阅列表一致）；若当前作品被筛掉则退回全库排序。
+ */
+function galleryWorkNavListAndIndex() {
+    const filtered = getFilteredSortedWorks();
+    let wi = filtered.findIndex((w) => w.id === galleryState.workId);
+    if (wi >= 0) return { list: filtered, wi };
+    const sortedAll = sortWorks([...allWorks]);
+    wi = sortedAll.findIndex((w) => w.id === galleryState.workId);
+    return { list: sortedAll, wi };
+}
+
+/** 画廊内：切换到上一/下一作品；dir=+1 打开下一作品首个文件，dir=-1 打开上一作品最后一个文件 */
+function openAdjacentWorkFromGallery(dir) {
+    const { list, wi } = galleryWorkNavListAndIndex();
+    if (!list.length || wi < 0) return;
+    const target = list[wi + dir];
+    if (!target || !target.items.length) return;
+    if (dir > 0) {
+        openGallery(target.id, 0, -1);
+    } else {
+        openGallery(target.id, target.items.length - 1, -1);
+    }
+    ensureWorkCardInDomAndScroll(target.id);
+}
+
+/** 懒加载列表卡片直到目标作品出现在 DOM，再滚到可见 */
+function ensureWorkCardInDomAndScroll(workId) {
+    const list = getFilteredSortedWorks();
+    const idx = list.findIndex((w) => w.id === workId);
+    if (idx < 0) {
+        const card0 = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
+        if (card0) card0.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        return;
+    }
+    for (let n = 0; n < 200; n++) {
+        const card = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
+        if (card) {
+            card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            return;
+        }
+        if (renderOffset >= list.length) return;
+        renderMoreWorks(list);
+    }
+}
+
 function navigate(dir) {
     const work = allWorks.find(w => w.id === galleryState.workId);
     if (!work) return;
@@ -3793,6 +3979,15 @@ function navigate(dir) {
         galleryState.itemIdx = newIdx;
         galleryState.thumbIdx = -1;
         renderGallery();
+        return;
+    }
+    if (newIdx >= work.items.length && dir > 0) {
+        openAdjacentWorkFromGallery(1);
+        return;
+    }
+    if (newIdx < 0 && dir < 0) {
+        openAdjacentWorkFromGallery(-1);
+        return;
     }
 }
 
@@ -3938,7 +4133,15 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
     const modal = document.getElementById('modal');
-    if (!modal.classList.contains('active')) return;
+    if (!modal || !modal.classList.contains('active')) {
+        if (typeof activeTab !== 'undefined' && activeTab === 'review') {
+            const el = e.target;
+            if (el && el.closest && !el.closest('input, textarea, select, [contenteditable="true"]')) {
+                handleReviewListFolderNavKeys(e);
+            }
+        }
+        return;
+    }
     const v = document.getElementById('galleryVideo');
     const img = document.getElementById('galleryImage');
 
@@ -3947,6 +4150,13 @@ document.addEventListener('keydown', (e) => {
     if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         deleteCurrentItem();
+        return;
+    }
+    // ⌘/Ctrl + 左右：切换作品（不进视频快进/图片翻张）
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        if (e.key === 'ArrowRight') openAdjacentWorkFromGallery(1);
+        else openAdjacentWorkFromGallery(-1);
         return;
     }
 
