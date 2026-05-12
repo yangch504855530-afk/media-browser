@@ -21,6 +21,8 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_OLLAMA_MODEL 视觉模型名，默认 llava（须 ollama pull 过；也可用 moondream、llava-phi3 等）
   MB_OLLAMA_TIMEOUT  单次请求超时秒数，默认 300
   MB_ANALYZE_FRAME_COUNT  每个视频抽帧送模型，默认 5，范围 2～12
+  MB_LOG_LEVEL   日志级别：DEBUG / INFO / WARNING / ERROR（默认 INFO）
+  MB_LOG_FORMAT  日志格式：text（默认，TTY 下彩色）或 json（单行 JSON，便于采集）
 
 完整说明（功能、环境变量、打包、路线图）见项目根目录 README.md。
 """
@@ -29,6 +31,7 @@ import os
 import sys
 import json
 import hashlib
+import logging
 import threading
 import subprocess
 import time
@@ -48,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.1.0"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -193,6 +196,77 @@ if getattr(sys, "frozen", False):
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 _scan_root = os.path.realpath(os.path.abspath(os.path.expanduser(ROOT_DIR)))
+
+# 进程启动时刻（用于 /health.uptime_seconds）
+_APP_BOOT_MONOTONIC = time.monotonic()
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """单行 JSON，便于生产环境采集（Loki / CloudWatch 等）。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+class _ColorTextFormatter(logging.Formatter):
+    """开发用：终端彩色整行前缀。"""
+
+    _RESET = "\x1b[0m"
+    _COLORS = {
+        logging.DEBUG: "\x1b[36m",
+        logging.INFO: "\x1b[32m",
+        logging.WARNING: "\x1b[33m",
+        logging.ERROR: "\x1b[31m",
+        logging.CRITICAL: "\x1b[35m",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        if not getattr(sys.stderr, "isatty", lambda: False)():
+            return line
+        c = self._COLORS.get(record.levelno, "")
+        return f"{c}{line}{self._RESET}" if c else line
+
+
+def setup_logging() -> logging.Logger:
+    """
+    MB_LOG_LEVEL: DEBUG / INFO / WARNING / ERROR（默认 INFO）
+    MB_LOG_FORMAT: text | json（默认 text；json 为单行结构化）
+    """
+    lg = logging.getLogger("media_browser")
+    if lg.handlers:
+        return lg
+    level_name = (os.environ.get("MB_LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    fmt = (os.environ.get("MB_LOG_FORMAT") or "text").strip().lower()
+    h = logging.StreamHandler(sys.stderr)
+    if fmt == "json":
+        h.setFormatter(_JsonLogFormatter())
+    else:
+        use_color = sys.stderr.isatty()
+        if use_color:
+            h.setFormatter(
+                _ColorTextFormatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+            )
+        else:
+            h.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+            )
+    lg.setLevel(level)
+    lg.addHandler(h)
+    lg.propagate = False
+    return lg
+
+
+logger = setup_logging()
 
 
 def get_scan_root() -> str:
@@ -456,9 +530,9 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
             result = subprocess.run(cmd, capture_output=True, timeout=60)
             if result.returncode != 0:
                 err = result.stderr.decode()[:200] if result.stderr else "unknown"
-                print(f"[ffmpeg thumb error] {video_path} @ {ss:.1f}s: {err}")
+                logger.warning("ffmpeg thumb error %s @ %.1fs: %s", video_path, ss, err)
         except Exception as e:
-            print(f"[ffmpeg thumb exception] {video_path} @ {ss:.1f}s: {e}")
+            logger.warning("ffmpeg thumb exception %s @ %.1fs: %s", video_path, ss, e)
 
         if not os.path.exists(dst) or os.path.getsize(dst) < 100:
             prev = expected[i - 1] if i > 0 else None
@@ -536,7 +610,7 @@ class MediaScanner:
                 if os.path.isdir(wp) and wp not in candidates:
                     candidates.append(wp)
         except Exception as e:
-            print(f"[深层兜底枚举错误] {e}")
+            logger.warning("深层兜底枚举错误: %s", e)
             if not self.enum_error:
                 self.enum_error = str(e)
 
@@ -568,13 +642,15 @@ class MediaScanner:
                 if has_media:
                     candidates.append(entry.path)
         except Exception as e:
-            print(f"[枚举错误] {e}")
+            logger.warning("枚举错误: %s", e)
             self.enum_error = str(e)
         if not candidates and not root_flat:
             self._enumerate_deep_fallback(candidates, root_flat)
             if candidates or root_flat:
-                print(
-                    f"[深层兜底] 子文件夹 {len(candidates)} 个，根目录媒体文件 {len(root_flat)} 个"
+                logger.info(
+                    "深层兜底: 子文件夹 %s 个，根目录媒体文件 %s 个",
+                    len(candidates),
+                    len(root_flat),
                 )
         self._pending_root_files = sorted(root_flat)
         self.pending_works = sorted(candidates)
@@ -583,7 +659,7 @@ class MediaScanner:
         msg = f"[枚举完成] 子文件夹作品 {len(candidates)} 个"
         if root_flat:
             msg += f"，根目录平铺媒体 {len(root_flat)} 个（将单独显示为一个作品）"
-        print(msg)
+        logger.info(msg)
 
     def _run(self):
         futures = {}
@@ -603,11 +679,11 @@ class MediaScanner:
                         self.works.append(work)
                 self.scanned_dirs += 1
             except Exception as e:
-                print(f"[扫描错误] {label}: {e}")
+                logger.error("扫描错误 %s: %s", label, e)
                 self.scanned_dirs += 1
 
         self.done = True
-        print("[扫描完成]")
+        logger.info("扫描完成")
 
     def _build_work_from_items(self, items, work_path: str, display_name_override: str = None):
         if not items:
@@ -695,7 +771,7 @@ class MediaScanner:
                 "根目录内的媒体（未放入子文件夹）",
             )
         except Exception as e:
-            print(f"[process root_flat error]: {e}")
+            logger.warning("process root_flat error: %s", e)
             return None
 
     def _process_work(self, work_path: str):
@@ -728,7 +804,7 @@ class MediaScanner:
                         })
             return self._build_work_from_items(items, work_path, None)
         except Exception as e:
-            print(f"[process error] {work_path}: {e}")
+            logger.warning("process error %s: %s", work_path, e)
             return None
 
     def get_progress(self, since: int = 0):
@@ -769,9 +845,12 @@ def replace_scan_root(new_root: str) -> bool:
         return False
     _scan_root = p
     prof = _apply_perf_profile_for_scan_root(_scan_root)
-    print(
-        f"[Media Browser] 扫描目录切换为: {_scan_root}\n"
-        f"[Media Browser] 自动性能档位: {prof}，扫描并发={MAX_WORKERS}，每视频条带缩略图={THUMB_COUNT}"
+    logger.info(
+        "扫描目录切换为: %s | 自动性能档位: %s，扫描并发=%s，每视频条带缩略图=%s",
+        _scan_root,
+        prof,
+        MAX_WORKERS,
+        THUMB_COUNT,
     )
     old = scanner
     scanner = MediaScanner()
@@ -784,6 +863,119 @@ def replace_scan_root(new_root: str) -> bool:
 
 
 scanner = MediaScanner()
+
+
+def _tool_version_ok(bin_path: str) -> tuple[bool, str | None]:
+    try:
+        r = subprocess.run(
+            [bin_path, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            return True, None
+        msg = (r.stderr or r.stdout or "")[:400]
+        return False, msg or "nonzero exit"
+    except Exception as e:
+        return False, str(e)[:400]
+
+
+def _cache_dir_stats(cache_dir: str, max_files: int = 500_000) -> dict:
+    total_bytes = 0
+    n = 0
+    truncated = False
+    try:
+        for dp, _dns, fns in os.walk(cache_dir):
+            for fn in fns:
+                if n >= max_files:
+                    truncated = True
+                    break
+                fp = os.path.join(dp, fn)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    n += 1
+                except OSError:
+                    pass
+            if truncated:
+                break
+    except Exception as e:
+        return {"dir": cache_dir, "file_count": -1, "total_bytes": -1, "error": str(e)[:500]}
+    out = {"dir": cache_dir, "file_count": n, "total_bytes": total_bytes}
+    if truncated:
+        out["truncated"] = True
+    return out
+
+
+def build_health_payload() -> tuple[dict, int]:
+    """
+    返回 (JSON 可序列化字典, HTTP 状态码)。
+    503：ffmpeg/ffprobe 不可用、枚举/扫描根错误、磁盘使用率不可读或 ≥99%。
+    """
+    root = get_scan_root()
+    disk: dict = {"path": root}
+    try:
+        du = shutil.disk_usage(root)
+        pct = round(100.0 * du.used / du.total, 2) if du.total else None
+        disk["used_percent"] = pct
+        disk["free_bytes"] = du.free
+        disk["total_bytes"] = du.total
+    except Exception as e:
+        disk["used_percent"] = None
+        disk["error"] = str(e)[:500]
+
+    prog = scanner.get_progress(0)
+    if prog.get("enum_error"):
+        scan_state = "error"
+    elif not prog.get("done"):
+        scan_state = "scanning"
+    else:
+        scan_state = "idle"
+    scan = {
+        "state": scan_state,
+        "enum_error": prog.get("enum_error"),
+        "scanned": prog.get("scanned"),
+        "total": prog.get("total"),
+        "works_ready": len(scanner.works),
+    }
+
+    fa, fe = _tool_version_ok(FFMPEG_BIN)
+    pa, pe = _tool_version_ok(FFPROBE_BIN)
+    ffmpeg = {"available": fa, "binary": FFMPEG_BIN, "error": fe}
+    ffprobe = {"available": pa, "binary": FFPROBE_BIN, "error": pe}
+
+    oh, om, _ofr, _oto = _ollama_config()
+    oc_ok, oc_err = _ollama_health_check(oh, timeout=2.5)
+    ollama = {"host": oh, "model": om, "reachable": oc_ok, "error": oc_err or None}
+
+    cache = _cache_dir_stats(CACHE_DIR)
+    uptime = round(time.monotonic() - _APP_BOOT_MONOTONIC, 3)
+
+    body: dict = {
+        "ok": True,
+        "version": APP_VERSION,
+        "uptime_seconds": uptime,
+        "disk": disk,
+        "scan": scan,
+        "ffmpeg": ffmpeg,
+        "ffprobe": ffprobe,
+        "ollama": ollama,
+        "cache": cache,
+    }
+
+    pct = disk.get("used_percent")
+    bad_disk = pct is None or (isinstance(pct, (int, float)) and pct >= 99.0)
+    unhealthy = (
+        not fa
+        or not pa
+        or scan_state == "error"
+        or bad_disk
+    )
+    if unhealthy:
+        body["ok"] = False
+        return body, 503
+    return body, 200
+
 
 # 由 main() 赋值；用于从浏览器请求优雅退出
 _http_server = None
@@ -1632,12 +1824,52 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(page.encode("utf-8"))
 
+        elif path == "/health":
+            payload, code = build_health_payload()
+            self._send_json(payload, code=code, no_store=True)
+
         elif path == "/api/progress":
             since = int(qs.get("since", ["0"])[0])
             prog = scanner.get_progress(since)
             self._send_json(prog)
         elif path == "/api/tasks":
             self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
+
+        elif path == "/api/works":
+            with scanner.lock:
+                body = {
+                    "ok": True,
+                    "works": list(scanner.works),
+                    "done": scanner.done,
+                    "scanned": scanner.scanned_dirs,
+                    "total": scanner.total_dirs,
+                    "enum_error": scanner.enum_error,
+                    "scan_root": get_scan_root(),
+                }
+            self._send_json(body, no_store=True)
+
+        elif path == "/api/tags":
+            oh, om, _, _ = _ollama_config()
+            tags: list[str] = []
+            reachable = False
+            err = None
+            try:
+                o_url = f"{oh.rstrip('/')}/api/tags"
+                o_req = Request(o_url, method="GET")
+                with urlopen(o_req, timeout=3.5) as o_resp:
+                    raw = json.loads(o_resp.read().decode("utf-8"))
+                reachable = True
+                for m in raw.get("models") or []:
+                    if isinstance(m, dict):
+                        name = m.get("name")
+                        if name:
+                            tags.append(str(name))
+            except Exception as e:
+                err = str(e)[:400]
+            self._send_json(
+                {"ok": reachable, "tags": tags, "error": err, "host": oh, "model_default": om},
+                no_store=True,
+            )
 
         elif path.startswith("/api/tasks/"):
             rest = path[len("/api/tasks/") :]
@@ -1899,6 +2131,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Media Browser v__APP_VERSION__</title>
+<style id="mb-critical">html,body{min-height:100%}body{background:#0a0a0a;color:#e0e0e0;margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}</style>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -2720,11 +2953,65 @@ body.batch-open #backToTop.show { bottom: 118px; }
     header input[type="text"] { width: 100%; }
     header .brand { max-width: 100%; }
 }
+.mb-review-shell { width: 100%; }
+.mb-review-layout { display: flex; flex-direction: column; align-items: stretch; width: 100%; min-height: 0; }
+.mb-works-column { position: relative; min-width: 0; flex: 1; transition: width 0.22s ease, min-width 0.22s ease, opacity 0.18s ease; }
+.mb-works-col-toggle {
+    display: none; position: sticky; top: 72px; z-index: 90; float: right; margin: 4px 8px 0 0;
+    width: 36px; height: 36px; border-radius: 8px; border: 1px solid #3a3a3a; background: #1a1a1a; color: #ccc;
+    cursor: pointer; font-size: 16px; line-height: 1; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.mb-review-secondary {
+    display: none; border-left: 1px solid #222; padding: 16px 20px; color: #888; font-size: 13px; line-height: 1.55;
+    background: linear-gradient(180deg, #101010 0%, #0a0a0a 100%); min-height: 120px;
+}
+.mb-review-secondary-card { max-width: 420px; }
+.mb-hint-title { color: #bbb; font-weight: 600; margin-bottom: 8px; font-size: 14px; }
+.mb-v-spacer { width: 100%; pointer-events: none; flex-shrink: 0; }
+.mb-card-ctx {
+    position: fixed; z-index: 400; min-width: 200px; background: #1a1a1a; border: 1px solid #3a3a3a; border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55); padding: 6px 0; display: none;
+}
+.mb-card-ctx button {
+    display: block; width: 100%; text-align: left; padding: 10px 16px; border: none; background: transparent;
+    color: #e0e0e0; font-size: 14px; cursor: pointer;
+}
+.mb-card-ctx button:hover { background: #2a2a2a; }
+.mb-mobile-tabbar {
+    display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+    height: calc(52px + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: rgba(14,14,14,0.96); border-top: 1px solid #2a2a2a; backdrop-filter: blur(12px);
+    justify-content: space-around; align-items: center;
+}
+.mb-mobile-tabbar button {
+    flex: 1; border: none; background: transparent; color: #888; font-size: 12px; padding: 8px 4px; cursor: pointer;
+}
+.mb-mobile-tabbar button.active { color: #0a84ff; font-weight: 600; }
+@media (min-width: 768px) and (max-width: 1023px) {
+    .mb-review-layout { flex-direction: row; align-items: stretch; }
+    .mb-works-column { width: 42%; max-width: 440px; flex: 0 0 auto; border-right: 1px solid #222; }
+    .mb-works-column.mb-collapsed { width: 0 !important; min-width: 0 !important; max-width: 0 !important; opacity: 0; overflow: hidden; border: none; padding: 0; }
+    .mb-works-col-toggle { display: block; }
+    .mb-review-secondary { display: flex; flex: 1; align-items: flex-start; }
+}
+@media (min-width: 1024px) {
+    .mb-review-layout { flex-direction: row; align-items: flex-start; }
+    .mb-works-column { width: min(420px, 38vw); flex: 0 0 auto; border-right: 1px solid #222; }
+    .mb-review-secondary { display: flex; flex: 1; min-height: calc(100vh - 120px); align-items: flex-start; }
+    .mb-works-col-toggle { display: none; }
+}
+@media (max-width: 767px) {
+    body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+    body.mb-review-tab .mb-mobile-tabbar { display: flex; }
+    #backToTop { bottom: calc(64px + env(safe-area-inset-bottom, 0px)); }
+    .folder-nav-hint { display: none; }
+    .mb-review-secondary { display: none !important; }
+}
 </style>
 </head>
 <body>
 <div class="progress-bar"><div class="fill" id="progressFill"></div></div>
-<header>
+<header id="headerBar">
     <div class="brand">
         <h1>📁 Media Browser <span class="app-ver">v__APP_VERSION__</span></h1>
         <div class="scan-root-row" title="可填写本机任意目录；无需重启。启动默认仍可由 MB_ROOT_DIR 决定。">
@@ -2815,10 +3102,38 @@ body.batch-open #backToTop.show { bottom: 118px; }
     </div>
 </section>
 
+<div id="reviewShell" class="mb-review-shell">
+<div class="mb-review-layout" id="reviewLayout">
+<aside id="worksColumn" class="mb-works-column">
+<button type="button" id="worksColToggle" class="mb-works-col-toggle" aria-expanded="true" title="折叠/展开作品列表">⟨</button>
 <div id="container"></div>
 <div id="emptyHint" class="empty-hint" style="display:none;" aria-live="polite"></div>
-
 <div id="status">准备扫描...</div>
+</aside>
+<div id="reviewSecondary" class="mb-review-secondary" aria-hidden="true">
+<div class="mb-review-secondary-card">
+<div class="mb-hint-title">布局说明</div>
+<p>桌面：左侧作品列表与右侧提示栏分栏。平板：点 ⟨ 可折叠左侧列表。手机：底部「作品 / 画廊 / 设置」切换；画廊内横划切文件，长横划切作品；双指捏合缩放图片或视频画面。</p>
+</div>
+</div>
+</div>
+</div>
+
+<nav id="mobileTabbar" class="mb-mobile-tabbar" aria-label="底部导航">
+<button type="button" data-mtab="works" class="active">作品</button>
+<button type="button" data-mtab="gallery">画廊</button>
+<button type="button" data-mtab="settings">设置</button>
+</nav>
+
+<div id="cardCtxMenu" class="mb-card-ctx" role="menu" aria-hidden="true">
+<button type="button" role="menuitem" data-ctx-act="open">打开画廊</button>
+<button type="button" role="menuitem" data-ctx-act="finder">在 Finder 中打开</button>
+<button type="button" role="menuitem" data-ctx-act="rename">重命名说明</button>
+<button type="button" role="menuitem" data-ctx-act="rescan">重新扫描标签</button>
+<button type="button" role="menuitem" data-ctx-act="delete">删除作品内全部文件…</button>
+</div>
+
+<script type="text/plain" id="mbDeferredCss">.mb-review-secondary{content-visibility:auto}.analysis-panel .analysis-table{content-visibility:auto}</script>
 
 <button id="backToTop" onclick="scrollToTop()" title="返回顶部">↑</button>
 
@@ -2861,6 +3176,31 @@ const sortSelect = document.getElementById('sortSelect');
 const backToTopBtn = document.getElementById('backToTop');
 const batchBar = document.getElementById('batchBar');
 const batchCountEl = document.getElementById('batchCount');
+const reviewShell = document.getElementById('reviewShell');
+const worksColumn = document.getElementById('worksColumn');
+const mobileTabbar = document.getElementById('mobileTabbar');
+const cardCtxMenu = document.getElementById('cardCtxMenu');
+
+const MB_LAZY_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+const MB_V_THRESHOLD = 500;
+const MB_V_ROW = 280;
+let mbVirtual = { active: false, list: [], anchor: 0 };
+let mbLastGalleryWorkId = null;
+let mbThumbIO = null;
+let mbVirtScrollRaf = 0;
+let mbCtxWork = null;
+
+function mbRic(cb) {
+    if (window.requestIdleCallback) requestIdleCallback(cb, { timeout: 900 });
+    else setTimeout(cb, 40);
+}
+mbRic(function () {
+    var el = document.getElementById('mbDeferredCss');
+    if (!el || !el.textContent) return;
+    var s = document.createElement('style');
+    s.textContent = el.textContent;
+    document.head.appendChild(s);
+});
 
 let allWorks = [];
 let filterType = 'all';
@@ -2880,6 +3220,8 @@ let pollGen = 0;
 let activeTab = 'review';
 let insightTaskId = null;
 let insightPollTimer = null;
+
+document.body.classList.add('mb-review-tab');
 
 function fmtSize(bytes) {
     if (!bytes) return '0 B';
@@ -2989,6 +3331,8 @@ function switchTab(tab) {
     statusEl.style.display = reviewVisible ? '' : 'none';
     backToTopBtn.style.display = reviewVisible ? '' : 'none';
     batchBar.style.display = reviewVisible ? '' : 'none';
+    if (reviewShell) reviewShell.style.display = reviewDisplay;
+    document.body.classList.toggle('mb-review-tab', reviewVisible);
     document.getElementById('analysisPanel').classList.toggle('active', !reviewVisible);
     document.getElementById('tabReview').classList.toggle('active', reviewVisible);
     document.getElementById('tabAnalysis').classList.toggle('active', !reviewVisible);
@@ -3454,10 +3798,211 @@ function workMatchesSearch(w, q) {
     return w.items.some(it => it.name.toLowerCase().includes(lq));
 }
 
-function createWorkCard(work) {
+function mbEnsureThumbIO() {
+    if (mbThumbIO) return;
+    mbThumbIO = new IntersectionObserver(function (ents) {
+        for (let k = 0; k < ents.length; k++) {
+            const en = ents[k];
+            if (!en.isIntersecting) continue;
+            const im = en.target;
+            const ds = im.getAttribute('data-src');
+            if (ds) {
+                im.src = ds;
+                im.removeAttribute('data-src');
+            }
+            im.classList.remove('mb-lazy');
+            mbThumbIO.unobserve(im);
+        }
+    }, { root: null, rootMargin: '140px 0px 160px 0px', threshold: 0.01 });
+}
+function mbRefreshLazyThumbs(root) {
+    mbEnsureThumbIO();
+    if (!mbThumbIO || !root) return;
+    root.querySelectorAll('img.mb-lazy').forEach(function (im) {
+        mbThumbIO.observe(im);
+    });
+}
+
+function renderVirtualSlice(start) {
+    const list = mbVirtual.list;
+    if (!list.length) return;
+    const vh = window.innerHeight || 800;
+    const slice = Math.min(list.length, Math.ceil(vh / MB_V_ROW) + 16);
+    let s = Math.max(0, Math.min(start, Math.max(0, list.length - slice)));
+    const end = Math.min(list.length, s + slice);
+    mbVirtual.anchor = s;
+    container.innerHTML = '';
+    displayedIds.clear();
+    const top = document.createElement('div');
+    top.className = 'mb-v-spacer';
+    top.style.height = (s * MB_V_ROW) + 'px';
+    top.setAttribute('aria-hidden', 'true');
+    container.appendChild(top);
+    for (let i = s; i < end; i++) {
+        const w = list[i];
+        displayedIds.add(w.id);
+        container.appendChild(createWorkCard(w, i));
+    }
+    const bot = document.createElement('div');
+    bot.className = 'mb-v-spacer';
+    bot.style.height = ((list.length - end) * MB_V_ROW) + 'px';
+    bot.setAttribute('aria-hidden', 'true');
+    container.appendChild(bot);
+    mbRefreshLazyThumbs(container);
+}
+
+function mbScheduleVirtualSync() {
+    if (!mbVirtual.active) return;
+    if (mbVirtScrollRaf) cancelAnimationFrame(mbVirtScrollRaf);
+    mbVirtScrollRaf = requestAnimationFrame(function () {
+        mbVirtScrollRaf = 0;
+        const list = mbVirtual.list;
+        if (!list.length) return;
+        const y = window.scrollY;
+        const approx = Math.floor(Math.max(0, y - 120) / MB_V_ROW);
+        const target = Math.max(0, approx - 6);
+        if (Math.abs(target - mbVirtual.anchor) > 5) renderVirtualSlice(target);
+    });
+}
+
+function hideCardCtx() {
+    if (!cardCtxMenu) return;
+    cardCtxMenu.style.display = 'none';
+    cardCtxMenu.setAttribute('aria-hidden', 'true');
+    mbCtxWork = null;
+}
+function showCardCtx(clientX, clientY, work) {
+    if (!cardCtxMenu || !work) return;
+    mbCtxWork = work;
+    cardCtxMenu.style.display = 'block';
+    cardCtxMenu.setAttribute('aria-hidden', 'false');
+    const pad = 8;
+    const w = cardCtxMenu.offsetWidth || 200;
+    const h = cardCtxMenu.offsetHeight || 160;
+    let x = clientX;
+    let y = clientY;
+    if (x + w + pad > window.innerWidth) x = window.innerWidth - w - pad;
+    if (y + h + pad > window.innerHeight) y = window.innerHeight - h - pad;
+    cardCtxMenu.style.left = Math.max(pad, x) + 'px';
+    cardCtxMenu.style.top = Math.max(pad, y) + 'px';
+}
+
+function attachCardLongPress(div, work) {
+    let t = null;
+    let sx = 0;
+    let sy = 0;
+    function cancel() {
+        if (t) { clearTimeout(t); t = null; }
+    }
+    div.addEventListener('pointerdown', function (e) {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        if (e.target.closest('.chk') || e.target.closest('button') || e.target.closest('a')) return;
+        sx = e.clientX;
+        sy = e.clientY;
+        cancel();
+        t = setTimeout(function () {
+            t = null;
+            showCardCtx(sx, sy, work);
+        }, 520);
+    });
+    div.addEventListener('pointermove', function (e) {
+        if (!t) return;
+        if (Math.abs(e.clientX - sx) > 14 || Math.abs(e.clientY - sy) > 14) cancel();
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (ev) {
+        div.addEventListener(ev, cancel);
+    });
+}
+
+async function deleteWorkAllFiles(work) {
+    if (!work || !work.items.length) return;
+    if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件，不可恢复。确定？')) return;
+    for (let i = 0; i < work.items.length; i++) {
+        const it = work.items[i];
+        try {
+            const res = await fetch('/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                body: JSON.stringify({ path: it.path }),
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                alert('删除失败: ' + (data.error || '未知错误'));
+                return;
+            }
+        } catch (err) {
+            alert('删除失败: ' + (err.message || String(err)));
+            return;
+        }
+    }
+    const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
+    if (idx >= 0) allWorks.splice(idx, 1);
+    hideCardCtx();
+    closeModal();
+    sortAndRenderAll();
+}
+
+function preloadAdjacentWorks() {
+    const nav = galleryWorkNavListAndIndex();
+    const list = nav.list;
+    const wi = nav.wi;
+    if (!list.length || wi < 0) return;
+    function preloadOne(w) {
+        if (!w || !w.items || !w.items.length) return;
+        const it = w.items[0];
+        let u = '';
+        if (it.type === 'video') {
+            const tl = it.thumbs || [];
+            u = tl.length ? buildThumbUrl(tl[0]) : (it.thumb ? buildThumbUrl(it.thumb) : '');
+        } else {
+            u = it.thumb ? buildThumbUrl(it.thumb) : '';
+        }
+        if (!u) return;
+        const im = new Image();
+        im.src = u;
+    }
+    if (wi > 0) preloadOne(list[wi - 1]);
+    if (wi < list.length - 1) preloadOne(list[wi + 1]);
+}
+
+function setupGalleryVideoPinch() {
+    const wrap = document.getElementById('galleryVideoWrap');
+    const vid = document.getElementById('galleryVideo');
+    if (!wrap || !vid) return;
+    let scale = 1;
+    let startDist = 0;
+    function dist(a, b) {
+        const dx = a.clientX - b.clientX;
+        const dy = a.clientY - b.clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+    wrap.addEventListener('touchstart', function (e) {
+        if (e.touches.length === 2) startDist = dist(e.touches[0], e.touches[1]);
+    }, { passive: true });
+    wrap.addEventListener('touchmove', function (e) {
+        if (e.touches.length !== 2 || !startDist) return;
+        const d = dist(e.touches[0], e.touches[1]);
+        const ratio = d / startDist;
+        startDist = d;
+        scale = Math.min(4, Math.max(1, scale * ratio));
+        wrap.style.transform = 'scale(' + scale + ')';
+        wrap.style.transformOrigin = 'center center';
+        e.preventDefault();
+    }, { passive: false });
+    wrap.addEventListener('touchend', function (e) {
+        if (e.touches.length < 2) startDist = 0;
+        if (e.touches.length === 0 && scale <= 1.02) {
+            scale = 1;
+            wrap.style.transform = '';
+        }
+    }, { passive: true });
+}
+
+function createWorkCard(work, virtualIndex) {
     const div = document.createElement('div');
     div.className = 'work-card';
     div.dataset.id = work.id;
+    if (virtualIndex !== undefined && virtualIndex !== null) div.dataset.vi = String(virtualIndex);
 
     const chk = document.createElement('input');
     chk.type = 'checkbox';
@@ -3481,8 +4026,11 @@ function createWorkCard(work) {
             for (let j = 0; j < tlist.length; j++) {
                 const url = buildThumbUrl(tlist[j]);
                 const isPh = url === '';
+                const lazyAttr = url && !isPh
+                    ? ` class="mb-lazy" data-src="${url.replace(/"/g, '&quot;')}" src="${MB_LAZY_PLACEHOLDER}"`
+                    : ` src="${url}"`;
                 contentHtml += `<div class="thumb" data-item-idx="${i}" data-thumb-idx="${j}">
-                    <img src="${url}" loading="lazy" alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
+                    <img${lazyAttr} alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
                     <div class="loader"></div>
                     ${isPh ? '<div class="ph-icon">❓</div>' : ''}
                 </div>`;
@@ -3490,8 +4038,11 @@ function createWorkCard(work) {
             contentHtml += `</div></div>`;
         } else {
             const url = buildThumbUrl(it.thumb);
+            const lazyAttr = url
+                ? ` class="mb-lazy" data-src="${url.replace(/"/g, '&quot;')}" src="${MB_LAZY_PLACEHOLDER}"`
+                : ` src=""`;
             contentHtml += `<div class="image-row" data-item-idx="${i}">
-                <img src="${url}" loading="lazy" alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
+                <img${lazyAttr} alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
             </div>`;
         }
     }
@@ -3537,6 +4088,7 @@ function createWorkCard(work) {
         openGallery(work.id, 0, -1);
     });
 
+    attachCardLongPress(div, work);
     return div;
 }
 
@@ -3599,10 +4151,11 @@ function resetFilters() {
 }
 
 function sortAndRenderAll() {
+    const list = getFilteredSortedWorks();
     container.innerHTML = '';
     displayedIds.clear();
     renderOffset = 0;
-    const list = getFilteredSortedWorks();
+    mbVirtual.active = false;
     if (scanPollDone || allWorks.length > 0) {
         if (allWorks.length > 0) {
             const narrowed = list.length !== allWorks.length || searchInput.value.trim() !== '' || filterType !== 'all';
@@ -3614,10 +4167,18 @@ function sortAndRenderAll() {
         }
     }
     refreshEmptyHint(list.length);
-    renderMoreWorks(list);
+    if (list.length > MB_V_THRESHOLD) {
+        mbVirtual.active = true;
+        mbVirtual.list = list;
+        mbVirtual.anchor = 0;
+        renderVirtualSlice(0);
+    } else {
+        renderMoreWorks(list);
+    }
 }
 
 function renderMoreWorks(list) {
+    if (mbVirtual.active) return;
     const slice = list.slice(renderOffset, renderOffset + BATCH_STEP);
     for (const w of slice) {
         if (displayedIds.has(w.id)) continue;
@@ -3625,6 +4186,7 @@ function renderMoreWorks(list) {
         container.appendChild(createWorkCard(w));
     }
     renderOffset += slice.length;
+    mbRefreshLazyThumbs(container);
 }
 
 /** 视口内作品卡片索引范围（与 sticky 页眉大致对齐的 topBar） */
@@ -3651,6 +4213,29 @@ function getVisibleWorkCardRange() {
  */
 function goToNextWorkFolder() {
     const list = getFilteredSortedWorks();
+    if (mbVirtual.active) {
+        const cards = Array.from(container.querySelectorAll('.work-card'));
+        if (!cards.length) return;
+        const vh = window.innerHeight;
+        const topBar = 88;
+        let bestVi = -1;
+        for (let i = 0; i < cards.length; i++) {
+            const r = cards[i].getBoundingClientRect();
+            if (r.bottom <= topBar || r.top >= vh) continue;
+            const vi = parseInt(cards[i].dataset.vi, 10);
+            if (!Number.isNaN(vi)) bestVi = Math.max(bestVi, vi);
+        }
+        if (bestVi < 0) {
+            window.scrollBy({ top: Math.max(160, vh * 0.85), behavior: 'smooth' });
+            return;
+        }
+        const nextVi = bestVi + 1;
+        if (nextVi < list.length) {
+            window.scrollTo({ top: nextVi * MB_V_ROW - 80, behavior: 'smooth' });
+            setTimeout(mbScheduleVirtualSync, 350);
+        }
+        return;
+    }
     let { cards, first, last, vh } = getVisibleWorkCardRange();
     if (!cards.length) return;
     let nextIdx = last + 1;
@@ -3670,6 +4255,30 @@ function goToNextWorkFolder() {
 
 /** 审阅列表：滚到「上一个作品」卡片（以视口内首张可见卡片为锚）。 */
 function goToPrevWorkFolder() {
+    const list = getFilteredSortedWorks();
+    if (mbVirtual.active) {
+        const cards = Array.from(container.querySelectorAll('.work-card'));
+        if (!cards.length) return;
+        const vh = window.innerHeight;
+        const topBar = 88;
+        let minVi = 999999999;
+        for (let i = 0; i < cards.length; i++) {
+            const r = cards[i].getBoundingClientRect();
+            if (r.bottom <= topBar || r.top >= vh) continue;
+            const vi = parseInt(cards[i].dataset.vi, 10);
+            if (!Number.isNaN(vi)) minVi = Math.min(minVi, vi);
+        }
+        if (minVi === 999999999) {
+            window.scrollBy({ top: -Math.max(160, vh * 0.85), behavior: 'smooth' });
+            return;
+        }
+        const prevVi = minVi - 1;
+        if (prevVi >= 0) {
+            window.scrollTo({ top: prevVi * MB_V_ROW - 80, behavior: 'smooth' });
+            setTimeout(mbScheduleVirtualSync, 350);
+        }
+        return;
+    }
     const { cards, first, vh } = getVisibleWorkCardRange();
     if (!cards.length) return;
     const prevIdx = first - 1;
@@ -3695,8 +4304,10 @@ let scrollTimer = null;
 window.addEventListener('scroll', () => {
     if (window.scrollY > 400) backToTopBtn.classList.add('show');
     else backToTopBtn.classList.remove('show');
+    if (mbVirtual.active) mbScheduleVirtualSync();
     if (scrollTimer) clearTimeout(scrollTimer);
     scrollTimer = setTimeout(() => {
+        if (mbVirtual.active) return;
         if ((window.innerHeight + window.scrollY) >= document.body.offsetHeight - 800) {
             const list = getFilteredSortedWorks();
             if (renderOffset < list.length) renderMoreWorks(list);
@@ -3771,6 +4382,7 @@ async function poll() {
 function openGallery(workId, itemIdx, thumbIdx) {
     const work = allWorks.find(w => w.id === workId);
     if (!work || !work.items.length) return;
+    mbLastGalleryWorkId = workId;
     markWorkOpenedKept(workId);
     galleryState = {
         workId,
@@ -3799,7 +4411,7 @@ function renderGallery() {
     if (item.type === 'video') {
         const needsTc = url.indexOf('/play?') >= 0;
         const overlayHtml = needsTc ? '<div id="transcodeOverlay" class="transcode-overlay">正在转码，请稍候…</div>' : '';
-        mediaDiv.innerHTML = `<div class="video-wrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline style="max-width:85vw;max-height:72vh;"></video></div>`;
+        mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline style="max-width:85vw;max-height:72vh;"></video></div>`;
         const v = document.getElementById('galleryVideo');
         const ov = document.getElementById('transcodeOverlay');
         if (needsTc && v && ov) {
@@ -3827,6 +4439,7 @@ function renderGallery() {
             }, { once: true });
             v.focus();
         }
+        setupGalleryVideoPinch();
     } else {
         mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" draggable="false" style="max-width:85vw;max-height:72vh;cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
         setupImageZoom();
@@ -3855,6 +4468,7 @@ function renderGallery() {
 
     const activeEl = fileList.querySelector('.file-item.active');
     if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    preloadAdjacentWorks();
 }
 
 function renderSidebar(fileList, work, currentItem) {
@@ -3955,6 +4569,14 @@ function openAdjacentWorkFromGallery(dir) {
 function ensureWorkCardInDomAndScroll(workId) {
     const list = getFilteredSortedWorks();
     const idx = list.findIndex((w) => w.id === workId);
+    if (mbVirtual.active && idx >= 0) {
+        renderVirtualSlice(Math.max(0, idx - 8));
+        requestAnimationFrame(() => {
+            const card = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
+            if (card) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+        return;
+    }
     if (idx < 0) {
         const card0 = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
         if (card0) card0.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -4102,6 +4724,32 @@ function setupImageZoom() {
         pointY = 0;
         setTransform();
     });
+
+    let pinchStart = 0;
+    function td(a, b) {
+        const dx = a.clientX - b.clientX;
+        const dy = a.clientY - b.clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+    wrap.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 2) pinchStart = td(e.touches[0], e.touches[1]);
+    }, { passive: true });
+    wrap.addEventListener('touchmove', (e) => {
+        if (e.touches.length !== 2 || !pinchStart) return;
+        const d = td(e.touches[0], e.touches[1]);
+        const ratio = d / pinchStart;
+        pinchStart = d;
+        const newScale = Math.min(5, Math.max(1, scale * ratio));
+        if (newScale !== scale) {
+            scale = newScale;
+            if (scale === 1) { pointX = 0; pointY = 0; }
+            setTransform();
+        }
+        e.preventDefault();
+    }, { passive: false });
+    wrap.addEventListener('touchend', (e) => {
+        if (e.touches.length < 2) pinchStart = 0;
+    }, { passive: true });
 }
 
 function toggleGalleryFullscreen() {
@@ -4237,21 +4885,100 @@ document.addEventListener('keydown', (e) => {
 });
 
 let touchStartX = 0;
+let touchStartY = 0;
 let touchEndX = 0;
 document.getElementById('modalMain').addEventListener('touchstart', (e) => {
-    touchStartX = e.changedTouches[0].screenX;
+    if (!e.touches || e.touches.length !== 1) return;
+    touchStartX = e.touches[0].screenX;
+    touchStartY = e.touches[0].screenY;
 }, { passive: true });
 document.getElementById('modalMain').addEventListener('touchend', (e) => {
+    if (!e.changedTouches || e.changedTouches.length !== 1) return;
     touchEndX = e.changedTouches[0].screenX;
-    const diff = touchStartX - touchEndX;
-    if (Math.abs(diff) > 50) {
-        if (diff > 0) navigate(1); else navigate(-1);
+    const touchEndY = e.changedTouches[0].screenY;
+    const dx = touchStartX - touchEndX;
+    const dy = touchStartY - touchEndY;
+    if (Math.abs(dx) > 120 && Math.abs(dy) < 55) {
+        if (dx > 0) openAdjacentWorkFromGallery(1);
+        else openAdjacentWorkFromGallery(-1);
+    } else if (Math.abs(dx) > 50) {
+        if (dx > 0) navigate(1);
+        else navigate(-1);
     }
 }, { passive: true });
 
 document.getElementById('modalMain').addEventListener('click', (e) => {
     if (e.target.id === 'modalMain') closeModal();
 });
+
+(function mbInitShell() {
+    const tc = document.getElementById('worksColToggle');
+    const wc = document.getElementById('worksColumn');
+    if (tc && wc) {
+        tc.addEventListener('click', () => {
+            wc.classList.toggle('mb-collapsed');
+            tc.setAttribute('aria-expanded', wc.classList.contains('mb-collapsed') ? 'false' : 'true');
+        });
+    }
+    if (mobileTabbar) {
+        mobileTabbar.querySelectorAll('[data-mtab]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                mobileTabbar.querySelectorAll('[data-mtab]').forEach((b) => {
+                    b.classList.toggle('active', b === btn);
+                });
+                const t = btn.getAttribute('data-mtab');
+                if (t === 'works') {
+                    closeModal();
+                    if (reviewShell) reviewShell.scrollIntoView({ block: 'start' });
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                } else if (t === 'gallery') {
+                    const ok = mbLastGalleryWorkId && allWorks.some((x) => x.id === mbLastGalleryWorkId);
+                    if (ok) openGallery(mbLastGalleryWorkId, 0, -1);
+                    else {
+                        const fl = getFilteredSortedWorks();
+                        if (fl.length) openGallery(fl[0].id, 0, -1);
+                        else alert('暂无作品');
+                    }
+                } else if (t === 'settings') {
+                    const hb = document.getElementById('headerBar');
+                    if (hb) hb.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    const inp = document.getElementById('scanRootInput');
+                    if (inp) setTimeout(() => inp.focus(), 450);
+                }
+            });
+        });
+    }
+    if (cardCtxMenu) {
+        cardCtxMenu.addEventListener('click', (e) => {
+            const b = e.target.closest('[data-ctx-act]');
+            if (!b || !mbCtxWork) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const act = b.getAttribute('data-ctx-act');
+            const w = mbCtxWork;
+            if (act === 'open') openGallery(w.id, 0, -1);
+            else if (act === 'finder') fetch('/open?path=' + encodeURIComponent(w.path));
+            else if (act === 'rename') alert('请在访达 / 资源管理器中重命名该作品文件夹，回到页眉点击「应用并扫描」刷新媒体库。');
+            else if (act === 'rescan') {
+                selectedIds.clear();
+                selectedIds.add(w.id);
+                updateBatchBar();
+                switchTab('analysis');
+                sortAndRenderAll();
+                const ti = document.getElementById('taskNameInput');
+                if (ti) ti.focus();
+                alert('已勾选该作品并切换到「视频分析任务」：填写任务名后点「用当前勾选创建任务」，即可重新跑 AI 标签。');
+            } else if (act === 'delete') {
+                deleteWorkAllFiles(w);
+                return;
+            }
+            hideCardCtx();
+        });
+    }
+    document.addEventListener('click', (e) => {
+        if (cardCtxMenu && cardCtxMenu.style.display === 'block' && !e.target.closest('#cardCtxMenu')) hideCardCtx();
+    });
+})();
 
 (function restore() {
     const s = localStorage.getItem('mb_search');
@@ -4356,26 +5083,36 @@ def main():
         "MB_AUTO_OPEN",
         "1" if getattr(sys, "frozen", False) else "0",
     ).strip().lower() in ("1", "yes", "true", "on")
-    print(f"[Media Browser] v{APP_VERSION}")
-    print(f"[Media Browser] 扫描目录: {get_scan_root()}")
-    print(f"[Media Browser] 缩略图缓存: {CACHE_DIR}")
-    print(
-        f"[Media Browser] 扫描并发={MAX_WORKERS}，每视频条带缩略图={THUMB_COUNT} "
-        f"（可用 MB_SCAN_WORKERS / MB_THUMB_COUNT / MB_DISK_PROFILE 调整）"
+    logger.info("Media Browser v%s", APP_VERSION)
+    logger.info("扫描目录: %s", get_scan_root())
+    logger.info("缩略图缓存: %s", CACHE_DIR)
+    logger.info(
+        "扫描并发=%s，每视频条带缩略图=%s（可用 MB_SCAN_WORKERS / MB_THUMB_COUNT / MB_DISK_PROFILE 调整）",
+        MAX_WORKERS,
+        THUMB_COUNT,
     )
     if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
-        print(
-            f"[Media Browser] MB_DISK_PROFILE={DISK_PROFILE}：已限制并发与缩略图帧数以减轻硬盘负载"
+        logger.info(
+            "MB_DISK_PROFILE=%s：已限制并发与缩略图帧数以减轻硬盘负载",
+            DISK_PROFILE,
         )
-    print(f"[Media Browser] 监听 {HOST}:{PORT}（本机访问 http://localhost:{PORT}；仅本机请设 MB_HOST=127.0.0.1）")
-    print("[Media Browser] 浏览器页眉可点「退出应用」停止服务")
+    logger.info(
+        "监听 %s:%s（本机访问 http://localhost:%s；仅本机请设 MB_HOST=127.0.0.1）",
+        HOST,
+        PORT,
+        PORT,
+    )
+    logger.info("浏览器页眉可点「退出应用」停止服务")
     _oh, _om, _of, _ot = _ollama_config()
-    print(
-        f"[Media Browser] AI 视频分析：本地 Ollama {_oh} · 模型 {_om} "
-        f"（抽帧数 MB_ANALYZE_FRAME_COUNT={_of}，超时 MB_OLLAMA_TIMEOUT={_ot}s；请 ollama pull 视觉模型）"
+    logger.info(
+        "AI 视频分析：本地 Ollama %s · 模型 %s（抽帧数 MB_ANALYZE_FRAME_COUNT=%s，超时 MB_OLLAMA_TIMEOUT=%ss；请 ollama pull 视觉模型）",
+        _oh,
+        _om,
+        _of,
+        _ot,
     )
     if auto_open:
-        print("[Media Browser] 将自动打开浏览器（如需关闭请设 MB_AUTO_OPEN=0）")
+        logger.info("将自动打开浏览器（如需关闭请设 MB_AUTO_OPEN=0）")
 
         def _open_browser():
             import webbrowser
@@ -4385,13 +5122,13 @@ def main():
 
         threading.Thread(target=_open_browser, daemon=True).start()
 
-    print(f"[Media Browser] 按 Ctrl+C 停止")
+    logger.info("按 Ctrl+C 停止")
     scanner.start()
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     _http_server = server
 
     def _sigterm_handler(signum, frame):
-        print("\n[收到终止信号，退出中...]")
+        logger.info("收到终止信号，退出中…")
         trigger_exit()
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -4401,7 +5138,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[退出中...]")
+        logger.info("退出中…")
     finally:
         try:
             scanner._executor.shutdown(wait=False)

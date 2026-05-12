@@ -1,0 +1,2 @@
+# 开发与 CI 测试依赖（运行应用本身仍仅需 Python 3 + ffmpeg/ffprobe）
+pytest>=7.4,<9

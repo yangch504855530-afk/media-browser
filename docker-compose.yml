@@ -35,7 +35,18 @@ services:
       MB_SCAN_WORKERS: "1"
       MB_THUMB_COUNT: "2"
       # 可选：MB_AUTO_OPEN=0（容器内无浏览器）
+      # 可选：MB_LOG_FORMAT=json
       TZ: Asia/Shanghai
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request as u; r=u.urlopen('http://127.0.0.1:8765/health', timeout=5); import sys; sys.exit(0 if r.status==200 else 1)\"",
+        ]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 60s
     volumes:
       - /vol1/1000/handle-pri/media-browser/cache:/cache
       - /vol3/1000/handle-3T-cun3/tmp:/scan/tmp

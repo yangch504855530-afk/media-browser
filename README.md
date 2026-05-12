@@ -18,6 +18,9 @@
 8. [macOS 打包与 DMG](#macos-打包与-dmg)  
 9. [路线图与待办](#路线图与待办)  
 10. [注意事项](#注意事项)  
+11. [故障排查清单](docs/TROUBLESHOOTING.md)（打不开页面、扫描、缩略图、AI、Docker）  
+12. [架构评估（单文件 vs 拆分）](docs/ARCHITECTURE_REVIEW.md)  
+13. [产品需求文档 PRD（反向生成）](docs/PRD.md)
 
 ---
 
@@ -28,6 +31,16 @@ python3 media_browser.py
 ```
 
 浏览器打开：**http://localhost:8765/**（端口见下表 `MB_PORT`）。
+
+### 单元测试
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+标记为 `ffmpeg` 的用例依赖本机 **ffmpeg / ffprobe**（与运行应用一致）。
 
 ---
 
@@ -59,8 +72,10 @@ docker compose up -d --build
 | `MB_SCAN_WORKERS` | 同时处理「作品」任务的线程数；默认 **2**，减少对机械盘/NAS 并发随机读 | `2`（慢速盘 profile 下更保守） | 同上 |
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；越大越慢、读盘越多 | `5`（慢速盘 profile 下更保守） | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
+| `MB_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | 同上 |
+| `MB_LOG_FORMAT` | `text`（默认；终端下彩色）或 `json`（单行 JSON，便于采集） | `text` | 同上 |
 
-启动时终端会打印当前**扫描并发**与**每视频条带缩略图帧数**。NAS / 外置机械盘示例：
+启动时向 stderr 输出**结构化日志**（级别与格式见 `MB_LOG_LEVEL` / `MB_LOG_FORMAT`）。NAS / 外置机械盘示例：
 
 ```bash
 MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
@@ -135,6 +150,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/` | GET | 单页 HTML |
+| `/health` | GET | 健康检查 JSON（磁盘、扫描、ffmpeg/ffprobe、ollama、缓存、`uptime_seconds`）；**异常时 HTTP 503** |
 | `/api/progress?since=` | GET | 扫描进度与增量作品（含 `scan_root` 等） |
 | `/api/set-scan-root` | POST | JSON `{"path":"/绝对路径"}`，切换扫描根并重新扫描 |
 | `/api/shutdown` | POST | 退出进程（body 可为 `{}`） |
