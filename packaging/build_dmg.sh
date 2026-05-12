@@ -7,7 +7,7 @@
 set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-VERSION="1.0.13"
+VERSION="$(python3 -c 'import re, pathlib; t=pathlib.Path("media_browser.py").read_text(encoding="utf-8"); m=re.search(r"APP_VERSION = \"([^\"]+)\"", t); print(m.group(1) if m else "0.0.0")')"
 
 # 减少在非 APFS 卷上写出资源分支文件（._xxx）
 export COPYFILE_DISABLE=1

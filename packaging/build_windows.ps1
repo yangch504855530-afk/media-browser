@@ -4,7 +4,12 @@
 
 $ErrorActionPreference = "Stop"
 $ROOT = Split-Path -Parent $PSScriptRoot
-$VERSION = "1.0.13"
+$py = Join-Path $ROOT "media_browser.py"
+$VERSION = "0.0.0"
+if (Test-Path $py) {
+    $m = Select-String -Path $py -Pattern 'APP_VERSION = "([^"]+)"' | Select-Object -First 1
+    if ($m) { $VERSION = $m.Matches.Groups[1].Value }
+}
 
 # Check for ffmpeg
 $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue

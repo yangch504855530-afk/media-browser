@@ -8,3 +8,9 @@ __pycache__/
 ._*
 .DS_Store
 .mb-cache/
+.mb-run-demo-path
+package/*.dmg
+package/*.zip
+package/*.tar
+package/*.tar.gz
+package/*.oci

@@ -12,6 +12,17 @@ block_cipher = None
 SPECDIR = os.path.dirname(os.path.abspath(SPEC))
 ROOT = os.path.dirname(SPECDIR)
 
+def _app_version() -> str:
+    import re
+
+    p = os.path.join(ROOT, "media_browser.py")
+    with open(p, encoding="utf-8") as f:
+        m = re.search(r'APP_VERSION = "([^"]+)"', f.read())
+    return m.group(1) if m else "0.0.0"
+
+
+_APP_VER = _app_version()
+
 ff = shutil.which("ffmpeg")
 fp = shutil.which("ffprobe")
 binaries = []
@@ -79,8 +90,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "Media Browser",
             "CFBundleDisplayName": "Media Browser",
-            "CFBundleVersion": "1.0.13",
-            "CFBundleShortVersionString": "1.0.13",
+            "CFBundleVersion": _APP_VER,
+            "CFBundleShortVersionString": _APP_VER,
             "NSHighResolutionCapable": True,
         },
     )

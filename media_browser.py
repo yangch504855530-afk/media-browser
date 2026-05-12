@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -2589,8 +2589,8 @@ header select:focus { outline: none; border-color: #0a84ff; }
     user-select: none;
 }
 .video-thumbs-panel {
-    padding: 8px;
-    border-bottom: 1px solid #222;
+    padding: 0 0 8px 0;
+    border-bottom: none;
 }
 .video-thumbs-panel h4 {
     font-size: 11px;
@@ -2734,6 +2734,9 @@ body.batch-open #backToTop.show { bottom: 118px; }
     opacity: 0;
     transform: scale(0.96);
     transition: opacity 0.25s ease, transform 0.25s ease;
+    --mb-gallery-sidebar: min(460px, 44vw);
+    --mb-gallery-stage-maxw: min(52vw, calc(100vw - var(--mb-gallery-sidebar) - 96px));
+    --mb-gallery-stage-maxh: min(56vh, calc(100vh - 190px));
 }
 .modal.active .modal-body {
     opacity: 1;
@@ -2748,10 +2751,15 @@ body.batch-open #backToTop.show { bottom: 118px; }
     position: relative;
     padding: 20px;
 }
-.modal-main .video-wrap {
-    position: relative;
-    display: inline-block;
+.modal-main .video-wrap,
+.modal-main #galleryVideoWrap {
+    max-width: var(--mb-gallery-stage-maxw);
+    max-height: var(--mb-gallery-stage-maxh);
+}
+.modal-main .video-wrap video,
+.modal-main #galleryVideoWrap video {
     max-width: 100%;
+    max-height: var(--mb-gallery-stage-maxh);
 }
 .modal-main .transcode-overlay {
     position: absolute;
@@ -2769,9 +2777,10 @@ body.batch-open #backToTop.show { bottom: 118px; }
     padding: 12px;
     line-height: 1.4;
 }
-.modal-main video, .modal-main img {
-    max-width: 100%;
-    max-height: calc(100vh - 140px);
+.modal-main video,
+.modal-main img {
+    max-width: min(100%, var(--mb-gallery-stage-maxw));
+    max-height: var(--mb-gallery-stage-maxh);
     border-radius: 8px;
     box-shadow: 0 10px 40px rgba(0,0,0,0.5);
 }
@@ -2807,20 +2816,52 @@ body.batch-open #backToTop.show { bottom: 118px; }
 .modal-nav.next { right: 10px; }
 
 .modal-sidebar {
-    width: 260px;
+    width: var(--mb-gallery-sidebar);
+    flex-shrink: 0;
     background: #111;
     border-left: 1px solid #222;
     display: flex;
     flex-direction: column;
-    padding: 12px;
-    gap: 10px;
+    padding: 0;
+    gap: 0;
+    overflow: hidden;
+    min-height: 0;
+    align-self: stretch;
+}
+.modal-sidebar-top {
+    flex-shrink: 0;
+    max-height: min(85vh, 1200px);
     overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px 12px 10px;
+    border-bottom: 1px solid #252525;
+    background: #111;
+    z-index: 4;
+}
+.modal-sidebar-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 10px 12px 14px;
+    -webkit-overflow-scrolling: touch;
+}
+.sidebar-thumb-dock:empty {
+    display: none;
+}
+.sidebar-thumb-dock {
+    margin-top: 6px;
+}
+.sidebar-thumb-dock .vt-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
 }
 .modal-sidebar h3 {
     font-size: 13px;
     color: #888;
     font-weight: 500;
-    margin-bottom: 4px;
+    margin: 0 0 2px 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2897,7 +2938,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 .modal-close {
     position: absolute;
     top: 12px;
-    right: 280px;
+    right: calc(var(--mb-gallery-sidebar) + 18px);
     font-size: 28px;
     color: rgba(255,255,255,0.5);
     cursor: pointer;
@@ -2914,7 +2955,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 .modal-fs {
     position: absolute;
     top: 12px;
-    right: 328px;
+    right: calc(var(--mb-gallery-sidebar) + 62px);
     font-size: 20px;
     color: rgba(255,255,255,0.5);
     cursor: pointer;
@@ -2929,16 +2970,15 @@ body.batch-open #backToTop.show { bottom: 118px; }
     user-select: none;
 }
 .modal-fs:hover { color: #fff; background: rgba(255,255,255,0.1); }
-@media (max-width: 900px) {
-    .modal-fs { right: 60px; }
-}
 .img-wrap {
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    width: 85vw;
-    height: 72vh;
+    max-width: var(--mb-gallery-stage-maxw);
+    max-height: var(--mb-gallery-stage-maxh);
+    width: auto;
+    height: auto;
 }
 .img-wrap img {
     transition: transform 0.1s ease-out;
@@ -2947,8 +2987,14 @@ body.batch-open #backToTop.show { bottom: 118px; }
 }
 
 @media (max-width: 900px) {
+    .modal-body {
+        --mb-gallery-sidebar: 0px;
+        --mb-gallery-stage-maxw: min(92vw, calc(100vw - 20px));
+        --mb-gallery-stage-maxh: min(64vh, calc(100vh - 160px));
+    }
     .modal-sidebar { display: none; }
     .modal-close { right: 12px; }
+    .modal-fs { right: 60px; }
     #container { padding: 12px; }
     header input[type="text"] { width: 100%; }
     header .brand { max-width: 100%; }
@@ -3160,8 +3206,13 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I / Ctrl+I 删除 · ⌘← / ⌘→ 上/下一作品（列表与画廊）</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
-            <h3 id="sidebarTitle">作品文件</h3>
-            <div class="file-list" id="fileList"></div>
+            <div class="modal-sidebar-top">
+                <h3 id="sidebarTitle">作品文件</h3>
+                <div id="sidebarThumbDock" class="sidebar-thumb-dock" aria-label="当前视频帧缩略图"></div>
+            </div>
+            <div class="modal-sidebar-scroll" id="sidebarFileScroll">
+                <div id="fileList" class="file-list"></div>
+            </div>
         </div>
     </div>
 </div>
@@ -4411,7 +4462,7 @@ function renderGallery() {
     if (item.type === 'video') {
         const needsTc = url.indexOf('/play?') >= 0;
         const overlayHtml = needsTc ? '<div id="transcodeOverlay" class="transcode-overlay">正在转码，请稍候…</div>' : '';
-        mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline style="max-width:85vw;max-height:72vh;"></video></div>`;
+        mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline></video></div>`;
         const v = document.getElementById('galleryVideo');
         const ov = document.getElementById('transcodeOverlay');
         if (needsTc && v && ov) {
@@ -4441,7 +4492,7 @@ function renderGallery() {
         }
         setupGalleryVideoPinch();
     } else {
-        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" draggable="false" style="max-width:85vw;max-height:72vh;cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
+        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" draggable="false" style="cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
         setupImageZoom();
     }
 
@@ -4472,26 +4523,27 @@ function renderGallery() {
 }
 
 function renderSidebar(fileList, work, currentItem) {
-    let html = '';
-
+    const dock = document.getElementById('sidebarThumbDock');
+    let thumbsHtml = '';
     if (currentItem && currentItem.type === 'video' && currentItem.thumbs && currentItem.thumbs.length > 0) {
-        html += '<div class="video-thumbs-panel"><h4>视频帧</h4><div class="vt-list">';
+        thumbsHtml += '<div class="video-thumbs-panel"><h4>视频帧</h4><div class="vt-list">';
         for (let i = 0; i < currentItem.thumbs.length; i++) {
             const url = buildThumbUrl(currentItem.thumbs[i]);
             const active = i === galleryState.thumbIdx ? 'active' : '';
             const onclk = `event.stopPropagation(); jumpToThumb(${i})`;
-            html += `<div class="vt-item ${active}" onclick="${onclk}">
+            thumbsHtml += `<div class="vt-item ${active}" onclick="${onclk}">
                 <img src="${url}" onload="this.classList.add('loaded')" onerror="this.style.display='none'">
             </div>`;
         }
-        html += '</div></div>';
+        thumbsHtml += '</div></div>';
     }
+    if (dock) dock.innerHTML = thumbsHtml;
 
     const total = work.items.length;
     const showLoadMore = total > sidebarLimit && sidebarOffset + sidebarLimit < total;
     const slice = work.items.slice(sidebarOffset, sidebarOffset + sidebarLimit);
 
-    html += '<div class="file-list">';
+    let html = '';
     for (let i = 0; i < slice.length; i++) {
         const globalIdx = sidebarOffset + i;
         const it = slice[i];
@@ -4514,7 +4566,6 @@ function renderSidebar(fileList, work, currentItem) {
         const remain = total - (sidebarOffset + sidebarLimit);
         html += `<div class="file-load-more" onclick="loadMoreSidebar()">加载更多 (${remain})</div>`;
     }
-    html += '</div>';
     fileList.innerHTML = html;
 }
 
