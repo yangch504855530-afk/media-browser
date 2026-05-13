@@ -354,6 +354,213 @@ def remove_media_thumb_cache(media_path: str) -> None:
         pass
 
 
+_delete_trash_lock = threading.Lock()
+
+
+def _delete_trash_store_path() -> str:
+    """按当前扫描根隔离清单，避免换卷后误删。"""
+    return os.path.join(CACHE_DIR, f"delete_trash_{sha256_str(os.path.abspath(get_scan_root()))}.json")
+
+
+def _delete_trash_load_unlocked() -> list:
+    p = _delete_trash_store_path()
+    if not os.path.isfile(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def _delete_trash_save_unlocked(items: list) -> None:
+    p = _delete_trash_store_path()
+    tmp = p + ".tmp"
+    payload = {
+        "items": items,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def _delete_trash_prune_unlocked(items: list) -> list:
+    out = []
+    for it in items:
+        path = it.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        try:
+            if not os.path.isfile(path):
+                continue
+            if not is_path_under_root(path):
+                continue
+        except OSError:
+            continue
+        out.append(it)
+    return out
+
+
+def delete_trash_list() -> list:
+    """返回当前扫描根下仍存在的待删文件条目（顺带落盘剔除已消失路径）。"""
+    with _delete_trash_lock:
+        raw = _delete_trash_load_unlocked()
+        pruned = _delete_trash_prune_unlocked(raw)
+        if len(pruned) != len(raw):
+            _delete_trash_save_unlocked(pruned)
+        return [dict(x) for x in pruned]
+
+
+def delete_trash_add(path: str, error: str) -> int:
+    """删除失败时写入清单；同路径更新 last_error。返回当前清单长度。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    err = (error or "")[:2000]
+    with _delete_trash_lock:
+        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
+        found = False
+        for it in items:
+            if it.get("path") == path:
+                it["last_error"] = err
+                it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                it["last_failed_at"] = now
+                found = True
+                break
+        if not found:
+            items.append(
+                {
+                    "path": path,
+                    "added_at": now,
+                    "last_error": err,
+                    "fail_count": 1,
+                    "last_failed_at": now,
+                }
+            )
+        _delete_trash_save_unlocked(items)
+        return len(items)
+
+
+def _delete_trash_path_norm(p: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(p))
+    except Exception:
+        return p
+
+
+def delete_trash_remove_paths(paths: list) -> int:
+    """从清单移除（不删磁盘文件）。返回剩余条数。"""
+    want = set()
+    for p in paths or []:
+        if isinstance(p, str) and p:
+            want.add(_delete_trash_path_norm(p))
+    if not want:
+        return len(delete_trash_list())
+    with _delete_trash_lock:
+        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
+        items = [it for it in items if _delete_trash_path_norm(it.get("path", "")) not in want]
+        _delete_trash_save_unlocked(items)
+        return len(items)
+
+
+def delete_trash_clear() -> None:
+    with _delete_trash_lock:
+        _delete_trash_save_unlocked([])
+
+
+def delete_trash_retry_all() -> dict:
+    """依次重试删除清单内全部文件；成功则移除并清缩略图缓存。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    remaining: list = []
+    deleted = 0
+    errors: list = []
+    with _delete_trash_lock:
+        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
+        for it in items:
+            p = it.get("path")
+            if not isinstance(p, str) or not p:
+                continue
+            if not os.path.isfile(p) or not is_path_under_root(p):
+                continue
+            try:
+                os.remove(p)
+                remove_media_thumb_cache(p)
+                deleted += 1
+            except Exception as e:
+                err = str(e)
+                it["last_error"] = err[:2000]
+                it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                it["last_failed_at"] = now
+                remaining.append(it)
+                errors.append({"path": p, "error": err})
+        _delete_trash_save_unlocked(remaining)
+    return {"ok": True, "deleted": deleted, "remaining": len(remaining), "errors": errors}
+
+
+def delete_trash_delete_selected(paths: list) -> dict:
+    """仅删除「当前废纸篓队列」中出现的路径（子集），用于前端多选批量删。"""
+    raw: list[str] = []
+    for p in paths or []:
+        if isinstance(p, str) and p.strip():
+            raw.append(p.strip())
+    seen: set[str] = set()
+    unique_req: list[str] = []
+    for p in raw:
+        k = _delete_trash_path_norm(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        unique_req.append(p)
+
+    skipped: list = []
+    errors: list = []
+    deleted = 0
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with _delete_trash_lock:
+        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
+        for req_path in unique_req:
+            req_n = _delete_trash_path_norm(req_path)
+            found = False
+            for idx, it in enumerate(items):
+                p = it.get("path")
+                if not isinstance(p, str) or _delete_trash_path_norm(p) != req_n:
+                    continue
+                found = True
+                canon = p
+                if not os.path.isfile(canon) or not is_path_under_root(canon):
+                    skipped.append({"path": req_path, "error": "file_missing"})
+                    items.pop(idx)
+                    break
+                try:
+                    os.remove(canon)
+                    remove_media_thumb_cache(canon)
+                    deleted += 1
+                    items.pop(idx)
+                except Exception as e:
+                    err = str(e)
+                    it["last_error"] = err[:2000]
+                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                    it["last_failed_at"] = now
+                    errors.append({"path": canon, "error": err})
+                break
+            if not found:
+                skipped.append({"path": req_path, "error": "not_in_trash_queue"})
+        _delete_trash_save_unlocked(items)
+        remaining = len(items)
+
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "remaining": remaining,
+        "errors": errors,
+        "skipped": skipped,
+    }
+
+
 def get_video_info(path: str) -> dict:
     info = {"duration": 0.0, "width": 0, "height": 0, "codec": "", "bitrate": 0, "fps": 0.0}
     _probe_timeout = 90 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical") else 45
@@ -1871,6 +2078,10 @@ class Handler(BaseHTTPRequestHandler):
                 no_store=True,
             )
 
+        elif path == "/api/delete-trash":
+            items = delete_trash_list()
+            self._send_json({"ok": True, "items": items, "count": len(items)}, no_store=True)
+
         elif path.startswith("/api/tasks/"):
             rest = path[len("/api/tasks/") :]
             if not rest or "/" in rest:
@@ -2090,6 +2301,48 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                 )
             return
+        if parsed.path == "/api/delete-trash/remove":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            paths = data.get("paths")
+            if not isinstance(paths, list):
+                self._send_json({"ok": False, "error": "paths must be array"}, 400)
+                return
+            n = delete_trash_remove_paths(paths)
+            self._send_json({"ok": True, "count": n})
+            return
+        if parsed.path == "/api/delete-trash/delete-selected":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            paths = data.get("paths")
+            if not isinstance(paths, list):
+                self._send_json({"ok": False, "error": "paths must be array"}, 400)
+                return
+            self._send_json(delete_trash_delete_selected(paths))
+            return
+        if parsed.path == "/api/delete-trash/clear":
+            delete_trash_clear()
+            self._send_json({"ok": True, "count": 0})
+            return
+        if parsed.path == "/api/delete-trash/retry-all":
+            self._send_json(delete_trash_retry_all())
+            return
         if parsed.path != "/delete":
             self.send_error(404)
             return
@@ -2118,7 +2371,19 @@ class Handler(BaseHTTPRequestHandler):
             remove_media_thumb_cache(fpath)
             self._send_json({"ok": True})
         except Exception as e:
-            self._send_json({"ok": False, "error": str(e)}, 500)
+            err = str(e)
+            trash_n = 0
+            queued = False
+            try:
+                if os.path.isfile(fpath) and is_path_under_root(fpath):
+                    trash_n = delete_trash_add(fpath, err)
+                    queued = True
+            except Exception:
+                pass
+            self._send_json(
+                {"ok": False, "error": err, "queued": queued, "trash_count": trash_n},
+                500,
+            )
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -2277,6 +2542,181 @@ header select:focus { outline: none; border-color: #0a84ff; }
     cursor: pointer;
 }
 .review-reset-all:hover { border-color: #666; color: #ddd; }
+.mb-trash-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid #4a3a2a;
+    background: #221a12;
+    color: #ddb080;
+    cursor: pointer;
+}
+.mb-trash-btn:hover { border-color: #6a5538; color: #f0d4a8; }
+.mb-trash-badge {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: #5c4030;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+}
+.mb-trash-btn[data-empty="1"] .mb-trash-badge { opacity: 0.45; }
+.mb-trash-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 350;
+    background: rgba(0,0,0,0.55);
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+.mb-trash-overlay.active { display: flex; }
+.mb-trash-panel {
+    width: min(720px, 100%);
+    max-height: min(86vh, 640px);
+    background: #141414;
+    border: 1px solid #333;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.mb-trash-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid #2a2a2a;
+}
+.mb-trash-head h2 { font-size: 16px; font-weight: 600; color: #eee; }
+.mb-trash-head button {
+    border: none;
+    background: transparent;
+    color: #888;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+.mb-trash-head button:hover { color: #fff; }
+.mb-trash-desc {
+    padding: 10px 16px;
+    font-size: 12px;
+    color: #999;
+    line-height: 1.55;
+    border-bottom: 1px solid #222;
+}
+.mb-trash-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid #2a2a2a;
+    background: #111;
+}
+.mb-trash-all-lbl {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #ccc;
+    cursor: pointer;
+    user-select: none;
+}
+.mb-trash-all-lbl input { width: 16px; height: 16px; accent-color: #0a84ff; cursor: pointer; }
+.mb-trash-toolbar #mbTrashDeleteSelected {
+    font-size: 13px;
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid #0a84ff;
+    background: #0a84ff;
+    color: #fff;
+    cursor: pointer;
+}
+.mb-trash-toolbar #mbTrashDeleteSelected:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: none;
+}
+.mb-trash-sel-label { font-size: 12px; color: #777; flex: 1; min-width: 120px; }
+.mb-trash-list-wrap {
+    flex: 1;
+    overflow: auto;
+    padding: 8px 12px;
+    font-size: 12px;
+}
+.mb-trash-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 10px;
+    padding: 10px 8px;
+    border-bottom: 1px solid #222;
+    align-items: start;
+}
+.mb-trash-chk-lbl {
+    display: flex;
+    align-items: flex-start;
+    padding-top: 2px;
+    cursor: pointer;
+}
+.mb-trash-row-chk {
+    width: 16px;
+    height: 16px;
+    accent-color: #0a84ff;
+    cursor: pointer;
+}
+.mb-trash-path { color: #ccc; word-break: break-all; font-family: ui-monospace, monospace; font-size: 11px; }
+.mb-trash-err { color: #c98; font-size: 11px; margin-top: 4px; }
+.mb-trash-row-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+}
+.mb-trash-del-one {
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid #0a84ff;
+    background: #0a84ff;
+    color: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.mb-trash-del-one:hover { filter: brightness(1.08); }
+.mb-trash-dropq {
+    font-size: 11px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: #666;
+    cursor: pointer;
+    text-decoration: underline;
+    white-space: nowrap;
+}
+.mb-trash-dropq:hover { color: #aaa; }
+.mb-trash-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 14px 16px;
+    border-top: 1px solid #2a2a2a;
+}
+.mb-trash-actions button.primary {
+    background: #0a84ff;
+    border-color: #0a84ff;
+    color: #fff;
+}
+.mb-trash-empty { color: #666; padding: 24px 12px; text-align: center; }
 .review-strip {
     display: flex;
     align-items: center;
@@ -3086,6 +3526,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
+    <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
 </header>
 
@@ -3193,6 +3634,25 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button onclick="batchOpenFinder()">在 Finder 中打开</button>
 </div>
 
+<div id="mbTrashOverlay" class="mb-trash-overlay" aria-hidden="true">
+    <div class="mb-trash-panel" role="dialog" aria-labelledby="mbTrashTitle">
+        <div class="mb-trash-head">
+            <h2 id="mbTrashTitle">废纸篓（待删文件）</h2>
+            <button type="button" id="mbTrashClose" aria-label="关闭">&times;</button>
+        </div>
+        <p class="mb-trash-desc">以下路径曾因权限、磁盘只读、文件被占用等原因<strong>删除失败</strong>，已自动记入本队列。你要做的仍是<strong>删除这些指定文件</strong>：可勾选多项后点「删除所选」，或逐条点「删除此文件」，或在本机解除占用后点「全部再次删除」。若你已在访达中手动删掉文件，对应行会在刷新后自动消失；只有当你<strong>不想</strong>再尝试删除某条时，才用该行「移出队列」。</p>
+        <div class="mb-trash-toolbar">
+            <label class="mb-trash-all-lbl"><input type="checkbox" id="mbTrashSelectAll" title="全选当前列表"> 全选</label>
+            <button type="button" id="mbTrashDeleteSelected" disabled>删除所选</button>
+            <span id="mbTrashSelectedLabel" class="mb-trash-sel-label" aria-live="polite"></span>
+        </div>
+        <div id="mbTrashListWrap" class="mb-trash-list-wrap"></div>
+        <div class="mb-trash-actions">
+            <button type="button" class="primary" id="mbTrashRetryAll">全部再次删除</button>
+        </div>
+    </div>
+</div>
+
 <!-- 画廊模态框 -->
 <div class="modal" id="modal">
     <div class="modal-body">
@@ -3291,6 +3751,212 @@ function fmtDuration(sec) {
 function escapeHtml(t) {
     return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+const mbTrashBtn = document.getElementById('mbTrashBtn');
+const mbTrashCount = document.getElementById('mbTrashCount');
+const mbTrashOverlay = document.getElementById('mbTrashOverlay');
+const mbTrashListWrap = document.getElementById('mbTrashListWrap');
+let mbTrashPollTs = 0;
+let mbTrashItemsCache = [];
+
+async function mbRefreshTrashBadge(force) {
+    const now = Date.now();
+    if (!force && (now - mbTrashPollTs) < 5000) return;
+    mbTrashPollTs = now;
+    try {
+        const res = await fetch('/api/delete-trash', { cache: 'no-store' });
+        const d = await res.json();
+        const n = (d && typeof d.count === 'number') ? d.count : 0;
+        if (mbTrashCount) mbTrashCount.textContent = String(n);
+        if (mbTrashBtn) mbTrashBtn.setAttribute('data-empty', n ? '0' : '1');
+    } catch (err) {}
+}
+
+function mbCloseTrashPanel() {
+    if (!mbTrashOverlay) return;
+    mbTrashOverlay.classList.remove('active');
+    mbTrashOverlay.setAttribute('aria-hidden', 'true');
+}
+
+function mbRescanWorksAfterTrashDelete() {
+    pollGen++;
+    since = 0;
+    scanPollDone = false;
+    allWorks = [];
+    lastEnumError = null;
+    progressFill.style.width = '0%';
+    progressFill.style.background = '';
+    sortAndRenderAll();
+    poll();
+}
+
+function mbTrashUpdateSelectionUi() {
+    const wrap = mbTrashListWrap;
+    const sa = document.getElementById('mbTrashSelectAll');
+    const delBtn = document.getElementById('mbTrashDeleteSelected');
+    const label = document.getElementById('mbTrashSelectedLabel');
+    if (!wrap || !delBtn) return;
+    const chks = wrap.querySelectorAll('.mb-trash-row-chk');
+    let n = 0;
+    chks.forEach(function (c) { if (c.checked) n++; });
+    delBtn.disabled = n === 0;
+    if (label) label.textContent = n ? ('已选 ' + n + ' 项') : '';
+    if (sa) {
+        if (!chks.length) {
+            sa.checked = false;
+            sa.indeterminate = false;
+        } else {
+            let c = 0;
+            chks.forEach(function (x) { if (x.checked) c++; });
+            sa.checked = c === chks.length;
+            sa.indeterminate = c > 0 && c < chks.length;
+        }
+    }
+}
+
+async function mbTrashDeleteSelectedAction() {
+    if (!mbTrashListWrap) return;
+    const paths = [];
+    mbTrashListWrap.querySelectorAll('.mb-trash-row-chk:checked').forEach(function (c) {
+        const ix = parseInt(c.getAttribute('data-trash-sel-ix'), 10);
+        const row = mbTrashItemsCache[ix];
+        if (row && row.path) paths.push(row.path);
+    });
+    if (!paths.length) return;
+    if (!confirm('将永久删除已选的 ' + paths.length + ' 个文件，不可恢复。确定？')) return;
+    try {
+        const res = await fetch('/api/delete-trash/delete-selected', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ paths }),
+        });
+        const d = await res.json();
+        if (!d.ok) { alert(d.error || '操作失败'); return; }
+        let msg = '已删除 ' + (d.deleted || 0) + ' 个。';
+        if (d.skipped && d.skipped.length) msg += ' 跳过 ' + d.skipped.length + ' 项。';
+        if (d.errors && d.errors.length) msg += ' 仍有失败 ' + d.errors.length + ' 项。';
+        alert(msg);
+        await mbOpenTrashPanel();
+        mbRefreshTrashBadge(true);
+        if ((d.deleted || 0) > 0) mbRescanWorksAfterTrashDelete();
+    } catch (e) {
+        alert(e.message || String(e));
+    }
+}
+
+function mbRenderTrashList(items) {
+    if (!mbTrashListWrap) return;
+    mbTrashItemsCache = items || [];
+    if (!items || !items.length) {
+        mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">暂无记录。删除失败时会加入此队列，便于对<strong>指定文件</strong>再次执行删除。</div>';
+        mbTrashUpdateSelectionUi();
+        return;
+    }
+    let html = '';
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const p = it.path || '';
+        const err = it.last_error || '';
+        html += '<div class="mb-trash-row">';
+        html += '<label class="mb-trash-chk-lbl"><input type="checkbox" class="mb-trash-row-chk" data-trash-sel-ix="' + i + '" aria-label="选中以加入批量删除"></label>';
+        html += '<div><div class="mb-trash-path">' + escapeHtml(p) + '</div>';
+        if (err) html += '<div class="mb-trash-err">' + escapeHtml(err) + '</div>';
+        html += '</div><div class="mb-trash-row-actions">';
+        html += '<button type="button" class="mb-trash-del-one" data-trash-del-idx="' + i + '">删除此文件</button>';
+        html += '<button type="button" class="mb-trash-dropq" data-trash-rm-idx="' + i + '">移出队列</button>';
+        html += '</div></div>';
+    }
+    mbTrashListWrap.innerHTML = html;
+    mbTrashListWrap.querySelectorAll('.mb-trash-row-chk').forEach(function (c) {
+        c.addEventListener('change', mbTrashUpdateSelectionUi);
+    });
+    mbTrashListWrap.querySelectorAll('[data-trash-del-idx]').forEach(function (btn) {
+        btn.onclick = async function () {
+            const ix = parseInt(btn.getAttribute('data-trash-del-idx'), 10);
+            const row = mbTrashItemsCache[ix];
+            if (!row || !row.path) return;
+            if (!confirm('确定永久删除该文件？\\n' + row.path)) return;
+            try {
+                const res = await fetch('/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                    body: JSON.stringify({ path: row.path }),
+                });
+                const d = await res.json();
+                if (!d.ok) {
+                    let msg = '删除失败: ' + (d.error || '未知错误');
+                    if (d.queued) msg += '\\n已更新废纸篓记录。';
+                    alert(msg);
+                    mbRefreshTrashBadge(true);
+                    await mbOpenTrashPanel();
+                    return;
+                }
+                await mbOpenTrashPanel();
+                mbRefreshTrashBadge(true);
+                mbRescanWorksAfterTrashDelete();
+            } catch (e) {
+                alert(e.message || String(e));
+            }
+        };
+    });
+    mbTrashListWrap.querySelectorAll('[data-trash-rm-idx]').forEach(function (btn) {
+        btn.onclick = async function () {
+            const ix = parseInt(btn.getAttribute('data-trash-rm-idx'), 10);
+            const row = mbTrashItemsCache[ix];
+            if (!row || !row.path) return;
+            if (!confirm('从队列中移除此路径？\\n不会删除磁盘上的文件；仅在你确定不再通过本工具删除该项时使用。')) return;
+            try {
+                const res = await fetch('/api/delete-trash/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                    body: JSON.stringify({ paths: [row.path] }),
+                });
+                const d = await res.json();
+                if (!d.ok) { alert(d.error || '移除失败'); return; }
+                await mbOpenTrashPanel();
+                mbRefreshTrashBadge(true);
+            } catch (e) { alert(e.message || String(e)); }
+        };
+    });
+    mbTrashUpdateSelectionUi();
+}
+
+async function mbOpenTrashPanel() {
+    if (!mbTrashOverlay) return;
+    mbTrashOverlay.classList.add('active');
+    mbTrashOverlay.setAttribute('aria-hidden', 'false');
+    try {
+        const res = await fetch('/api/delete-trash', { cache: 'no-store' });
+        const d = await res.json();
+        mbRenderTrashList((d && d.items) ? d.items : []);
+        mbRefreshTrashBadge(true);
+    } catch (e) {
+        if (mbTrashListWrap) mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">加载失败</div>';
+        mbTrashUpdateSelectionUi();
+    }
+}
+
+async function mbTrashRetryAllAction() {
+    if (!confirm('将依次再次尝试永久删除队列中的全部文件，不可恢复。确定？')) return;
+    try {
+        const res = await fetch('/api/delete-trash/retry-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: '{}',
+        });
+        const d = await res.json();
+        if (!d.ok) { alert(d.error || '操作失败'); return; }
+        let msg = '已删除 ' + (d.deleted || 0) + ' 个；剩余 ' + (d.remaining || 0) + ' 个。';
+        if (d.errors && d.errors.length) msg += '\\n仍有失败项，请查看清单。';
+        alert(msg);
+        await mbOpenTrashPanel();
+        mbRefreshTrashBadge(true);
+        if ((d.deleted || 0) > 0) mbRescanWorksAfterTrashDelete();
+    } catch (e) {
+        alert(e.message || String(e));
+    }
+}
+
 const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob','.flv']);
 function buildVideoPlayUrl(filePath) {
     const i = filePath.lastIndexOf('.');
@@ -3968,7 +4634,10 @@ function attachCardLongPress(div, work) {
 async function deleteWorkAllFiles(work) {
     if (!work || !work.items.length) return;
     if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件，不可恢复。确定？')) return;
-    for (let i = 0; i < work.items.length; i++) {
+    let anyFail = false;
+    let lastErr = '';
+    let i = 0;
+    while (i < work.items.length) {
         const it = work.items[i];
         try {
             const res = await fetch('/delete', {
@@ -3978,19 +4647,34 @@ async function deleteWorkAllFiles(work) {
             });
             const data = await res.json();
             if (!data.ok) {
-                alert('删除失败: ' + (data.error || '未知错误'));
-                return;
+                anyFail = true;
+                lastErr = data.error || '未知错误';
+                if (data.queued) mbRefreshTrashBadge(true);
+                i++;
+                continue;
             }
+            if (it.type === 'video') work.video_count--;
+            else work.image_count--;
+            work.items.splice(i, 1);
         } catch (err) {
-            alert('删除失败: ' + (err.message || String(err)));
-            return;
+            anyFail = true;
+            lastErr = err.message || String(err);
+            i++;
         }
     }
-    const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
-    if (idx >= 0) allWorks.splice(idx, 1);
     hideCardCtx();
-    closeModal();
-    sortAndRenderAll();
+    if (work.items.length === 0) {
+        const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
+        if (idx >= 0) allWorks.splice(idx, 1);
+        closeModal();
+        sortAndRenderAll();
+    } else {
+        sortAndRenderAll();
+        if (anyFail) {
+            alert('部分文件未能删除（仍剩余 ' + work.items.length + ' 个）。最后错误：' + lastErr + '\\n失败项已记入废纸篓（若服务端可写），可在页眉「废纸篓」批量重试。');
+        }
+    }
+    mbRefreshTrashBadge(true);
 }
 
 function preloadAdjacentWorks() {
@@ -4410,6 +5094,7 @@ async function poll() {
                     : ('扫描完成，共 ' + allWorks.length + ' 个作品');
                 refreshEmptyHint(list.length);
             }
+            mbRefreshTrashBadge(false);
         } else {
             if (allWorks.length === 0) {
                 if (data.total > 0) {
@@ -4678,7 +5363,10 @@ async function deleteCurrentItem() {
         });
         const data = await res.json();
         if (!data.ok) {
-            alert('删除失败: ' + (data.error || '未知错误'));
+            let msg = '删除失败: ' + (data.error || '未知错误');
+            if (data.queued) msg += '\\n已加入废纸篓清单（当前 ' + (data.trash_count || 0) + ' 项），可点页眉「废纸篓」批量重试。';
+            alert(msg);
+            mbRefreshTrashBadge(true);
             return;
         }
     } catch (e) {
@@ -4831,6 +5519,13 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
+    if (mbTrashOverlay && mbTrashOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            mbCloseTrashPanel();
+            return;
+        }
+    }
     const modal = document.getElementById('modal');
     if (!modal || !modal.classList.contains('active')) {
         if (typeof activeTab !== 'undefined' && activeTab === 'review') {
@@ -5089,6 +5784,7 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
                 progressFill.style.background = '';
                 sortAndRenderAll();
                 poll();
+                mbRefreshTrashBadge(true);
             } catch (e) {
                 alert(e.message || String(e));
             }
@@ -5115,6 +5811,30 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
     const saveConfirmBtn = document.getElementById('saveConfirmBtn');
     if (loadInsightBtn) loadInsightBtn.addEventListener('click', () => loadTaskDetail(false));
     if (saveConfirmBtn) saveConfirmBtn.addEventListener('click', saveInsightConfirms);
+    const mbTrashClose = document.getElementById('mbTrashClose');
+    if (mbTrashBtn) mbTrashBtn.addEventListener('click', () => { mbOpenTrashPanel(); });
+    if (mbTrashClose) mbTrashClose.addEventListener('click', mbCloseTrashPanel);
+    if (mbTrashOverlay) mbTrashOverlay.addEventListener('click', (ev) => {
+        if (ev.target === mbTrashOverlay) mbCloseTrashPanel();
+    });
+    const mbTrashRetryAllBtn = document.getElementById('mbTrashRetryAll');
+    if (mbTrashRetryAllBtn) mbTrashRetryAllBtn.addEventListener('click', mbTrashRetryAllAction);
+    const mbTrashSelectAll = document.getElementById('mbTrashSelectAll');
+    if (mbTrashSelectAll && !mbTrashSelectAll.dataset.mbBound) {
+        mbTrashSelectAll.dataset.mbBound = '1';
+        mbTrashSelectAll.addEventListener('change', function () {
+            if (!mbTrashListWrap) return;
+            const on = mbTrashSelectAll.checked;
+            mbTrashListWrap.querySelectorAll('.mb-trash-row-chk').forEach(function (c) { c.checked = on; });
+            mbTrashUpdateSelectionUi();
+        });
+    }
+    const mbTrashDeleteSelectedBtn = document.getElementById('mbTrashDeleteSelected');
+    if (mbTrashDeleteSelectedBtn && !mbTrashDeleteSelectedBtn.dataset.mbBound) {
+        mbTrashDeleteSelectedBtn.dataset.mbBound = '1';
+        mbTrashDeleteSelectedBtn.addEventListener('click', function () { mbTrashDeleteSelectedAction(); });
+    }
+    setTimeout(function () { mbRefreshTrashBadge(true); }, 600);
     switchTab('review');
 })();
 
