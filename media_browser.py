@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
