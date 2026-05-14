@@ -97,7 +97,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **列表**：搜索、排序；筛选 **全部 / 有视频 / 有图片 / 仅待审**（「仅待审」= 尚未标为保留）。
 - **懒加载**：滚动追加卡片。
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
-- **删除**：`POST /delete`，路径须在扫描根下；删除**源文件成功后**，会按 `sha256(abspath)` 删除 `MB_CACHE_DIR` 下对应缩略图目录，避免孤儿缓存。
+- **删除**：`POST /delete`，路径须在扫描根下；删除**源文件成功后**，会按 `sha256(abspath)` 删除 `MB_CACHE_DIR` 下对应缩略图目录，避免孤儿缓存。若删除失败，路径会记入**废纸篓队列**（`MB_CACHE_DIR` 下按扫描根隔离的 JSON），可在页眉「废纸篓」中多选后批量重试或逐条再删。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
 - **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
 - **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
@@ -164,7 +164,12 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/tasks/{id}/preview` | POST | 预览批量重命名映射 |
 | `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
 | `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
-| `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存 |
+| `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存；失败时可能返回 `queued` / `trash_count` 并入废纸篓队列 |
+| `/api/delete-trash` | GET | 当前废纸篓队列（仍存在于扫描根下的待删路径） |
+| `/api/delete-trash/delete-selected` | POST | JSON `{"paths":["…"]}`，仅删除队列中出现的路径（子集批量） |
+| `/api/delete-trash/retry-all` | POST | 对队列内全部路径再次尝试删除 |
+| `/api/delete-trash/remove` | POST | JSON `{"paths":["…"]}`，仅从队列移除（不删磁盘） |
+| `/api/delete-trash/clear` | POST | 清空队列（不删磁盘） |
 
 需跨域时服务器会响应 **`OPTIONS`**。
 
