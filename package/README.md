@@ -25,6 +25,16 @@ docker save media-browser:1.2.2 | gzip -1 > package/media-browser-1.2.2-linux-$(
 
 版本号与 `media_browser.py` 中 `APP_VERSION` 保持一致。
 
+## QA（Playwright 画廊 E2E）
+
+```bash
+pip install -r requirements-dev.txt
+playwright install chromium
+pytest tests/test_gallery_e2e.py -v          # 仅画廊 E2E
+pytest tests/ -q -m 'not e2e'               # 其余自动化（不含浏览器）
+pytest tests/ -q                            # 全量（含 E2E）
+```
+
 ## GitHub Release
 
 打 `v*` 标签并 `git push origin v*` 后，`.github/workflows/release.yml` 会构建 macOS / Windows 并上传 Release 资源。

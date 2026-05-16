@@ -1,0 +1,134 @@
+"""QA E2E：画廊删除成功/失败后自动切换下一文件（Playwright + 嵌入式服务）。"""
+
+from __future__ import annotations
+
+import re
+import stat
+import sys
+
+import pytest
+
+pytestmark = pytest.mark.e2e
+
+
+def _delete_mod_key() -> str:
+    return "Meta" if sys.platform == "darwin" else "Control"
+
+
+def _wait_scan_and_open_gallery(page, base_url: str) -> None:
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.wait_for_selector(".work-card", timeout=60_000)
+    page.wait_for_function(
+        """() => typeof allWorks !== 'undefined'
+            && allWorks.length > 0
+            && allWorks[0].items
+            && allWorks[0].items.length >= 2""",
+        timeout=90_000,
+    )
+    page.evaluate("openGallery(allWorks[0].id, 0, -1)")
+    page.wait_for_selector("#modal.active", timeout=15_000)
+
+
+def _current_file_name(page) -> str:
+    text = page.locator("#modalFileInfo").inner_text()
+    m = re.search(r"([^\s·]+)\.(jpg|jpeg|png|gif|webp)", text, re.I)
+    assert m, f"cannot parse file name from modal info: {text!r}"
+    return m.group(1).lower()
+
+
+def test_gallery_delete_success_advances_to_next_file(playwright_browser, gallery_e2e_server):
+    """删除当前项成功后，画廊应显示同作品下一文件（b）。"""
+    base_url, album = gallery_e2e_server
+    page = playwright_browser.new_page()
+    try:
+        _wait_scan_and_open_gallery(page, base_url)
+        assert _current_file_name(page) == "a"
+        page.keyboard.press(f"{_delete_mod_key()}+I")
+        page.wait_for_function(
+            "() => { const t = document.getElementById('modalFileInfo')?.innerText || '';"
+            " return t.includes('b.jpg') || t.includes('b.JPG'); }",
+            timeout=15_000,
+        )
+        assert _current_file_name(page) == "b"
+        assert not (album / "a.jpg").exists()
+        assert (album / "b.jpg").exists()
+    finally:
+        page.close()
+
+
+def _album_readonly(album) -> None:
+    album.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
+
+
+def _album_writable(album) -> None:
+    album.chmod(
+        stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+    )
+
+
+def test_gallery_delete_failure_advances_to_next_file(playwright_browser, gallery_e2e_server):
+    """删除 API 失败（真实权限错误）时：alert 后仍切到下一文件，且废纸篓角标更新。"""
+    base_url, album = gallery_e2e_server
+    page = playwright_browser.new_page()
+    dialogs: list[str] = []
+
+    def on_dialog(d):
+        dialogs.append(d.message)
+        d.accept()
+
+    page.on("dialog", on_dialog)
+    try:
+        _wait_scan_and_open_gallery(page, base_url)
+        assert _current_file_name(page) == "a"
+        _album_readonly(album)
+        page.keyboard.press(f"{_delete_mod_key()}+I")
+        page.wait_for_function(
+            "() => { const t = document.getElementById('modalFileInfo')?.innerText || '';"
+            " return t.includes('b.jpg') || t.includes('b.JPG'); }",
+            timeout=15_000,
+        )
+        assert _current_file_name(page) == "b"
+        assert (album / "a.jpg").exists()
+        assert (album / "b.jpg").exists()
+        page.wait_for_function(
+            "() => (document.getElementById('mbTrashCount')?.textContent || '0') !== '0'",
+            timeout=15_000,
+        )
+        assert any("删除失败" in m for m in dialogs)
+    finally:
+        _album_writable(album)
+        page.close()
+
+
+def test_gallery_trash_panel_delete_selected(playwright_browser, gallery_e2e_server):
+    """废纸篓：真实失败入队后，勾选「删除所选」可删盘并清空角标。"""
+    base_url, album = gallery_e2e_server
+    page = playwright_browser.new_page()
+    page.on("dialog", lambda d: d.accept())
+    try:
+        _wait_scan_and_open_gallery(page, base_url)
+        _album_readonly(album)
+        page.keyboard.press(f"{_delete_mod_key()}+I")
+        page.wait_for_function(
+            "() => (document.getElementById('mbTrashCount')?.textContent || '0') !== '0'",
+            timeout=15_000,
+        )
+        _album_writable(album)
+        page.evaluate("closeModal()")
+        page.wait_for_function(
+            "() => !document.getElementById('modal')?.classList.contains('active')",
+            timeout=5_000,
+        )
+        page.locator("#mbTrashBtn").click()
+        page.wait_for_selector("#mbTrashOverlay.active", timeout=5_000)
+        page.locator(".mb-trash-row-chk").first.check()
+        page.on("dialog", lambda d: d.accept())
+        page.locator("#mbTrashDeleteSelected").click()
+        page.wait_for_function(
+            "() => document.getElementById('mbTrashCount')?.textContent === '0'",
+            timeout=20_000,
+        )
+        assert not (album / "a.jpg").exists()
+    finally:
+        _album_writable(album)
+        page.close()
