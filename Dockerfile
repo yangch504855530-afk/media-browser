@@ -1,8 +1,8 @@
 # Media Browser — Python + ffmpeg/ffprobe（与 media_browser.py 要求一致）
-# 发版时请与仓库内 APP_VERSION（当前 v1.2.1）对齐；镜像 tag 建议 media-browser:1.2.1
+# 发版时请与仓库内 APP_VERSION（当前 v1.2.2）对齐；镜像 tag 建议 media-browser:1.2.2
 FROM python:3.12-slim-bookworm
 
-ARG APP_VERSION=1.2.1
+ARG APP_VERSION=1.2.2
 LABEL org.opencontainers.image.title="Media Browser" \
       org.opencontainers.image.version="${APP_VERSION}"
 

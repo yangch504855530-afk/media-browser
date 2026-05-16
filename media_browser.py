@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -5349,12 +5349,48 @@ function navigate(dir) {
     }
 }
 
+/**
+ * 删除成功/失败后，画廊应落在的「下一屏」位置（与成功删除后的观感一致）。
+ * @param {object} work 当前作品
+ * @param {boolean} itemRemoved 是否已从 work.items 移除该文件
+ */
+function advanceGalleryAfterDeleteAttempt(work, itemRemoved) {
+    if (!work || !work.items.length) return;
+    const i = galleryState.itemIdx;
+    if (itemRemoved) {
+        if (galleryState.itemIdx >= work.items.length) {
+            galleryState.itemIdx = work.items.length - 1;
+        }
+        galleryState.thumbIdx = -1;
+        renderGallery();
+        return;
+    }
+    if (work.items.length > 1) {
+        if (i < work.items.length - 1) {
+            galleryState.itemIdx = i + 1;
+        } else {
+            galleryState.itemIdx = i - 1;
+        }
+        galleryState.thumbIdx = -1;
+        renderGallery();
+        return;
+    }
+    const nav = galleryWorkNavListAndIndex();
+    if (nav.wi >= 0 && nav.wi < nav.list.length - 1) {
+        openAdjacentWorkFromGallery(1);
+        return;
+    }
+    galleryState.thumbIdx = -1;
+    renderGallery();
+}
+
 async function deleteCurrentItem() {
     const work = allWorks.find(w => w.id === galleryState.workId);
     if (!work) return;
     const item = work.items[galleryState.itemIdx];
     if (!item) return;
 
+    let deleteOk = false;
     try {
         const res = await fetch('/delete', {
             method: 'POST',
@@ -5367,21 +5403,22 @@ async function deleteCurrentItem() {
             if (data.queued) msg += '\\n已加入废纸篓清单（当前 ' + (data.trash_count || 0) + ' 项），可点页眉「废纸篓」批量重试。';
             alert(msg);
             mbRefreshTrashBadge(true);
+            advanceGalleryAfterDeleteAttempt(work, false);
             return;
         }
+        deleteOk = true;
     } catch (e) {
         alert('删除失败: ' + e.message);
+        advanceGalleryAfterDeleteAttempt(work, false);
         return;
     }
 
-    // 从 items 中移除
-    work.items.splice(galleryState.itemIdx, 1);
+    if (!deleteOk) return;
 
-    // 更新计数
+    work.items.splice(galleryState.itemIdx, 1);
     if (item.type === 'video') work.video_count--;
     else work.image_count--;
 
-    // 如果作品空了，移除整个作品
     if (work.items.length === 0) {
         const idx = allWorks.findIndex(w => w.id === work.id);
         if (idx >= 0) allWorks.splice(idx, 1);
@@ -5390,13 +5427,7 @@ async function deleteCurrentItem() {
         return;
     }
 
-    // 调整当前索引
-    if (galleryState.itemIdx >= work.items.length) {
-        galleryState.itemIdx = work.items.length - 1;
-    }
-
-    // 刷新画廊
-    renderGallery();
+    advanceGalleryAfterDeleteAttempt(work, true);
 }
 
 function closeModal() {
