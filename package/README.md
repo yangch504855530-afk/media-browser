@@ -2,10 +2,10 @@
 
 本目录用于存放**本地或 CI 构建**的安装介质；大文件已列入 `.gitignore`，**不会提交到 Git**。
 
-## v1.2.2 预置包说明
+## v1.2.3 预置包说明
 
-- **macOS ARM**：本机执行 `./packaging/build_dmg.sh` 后，将 `dist/Media Browser v1.2.2.dmg` 复制到本目录。
-- **Windows**：在 Windows 上执行 `packaging/build_windows.ps1`，或推送标签 `v1.2.2` 后从 GitHub Actions `release.yml` 的 **windows** artifact 下载 `MediaBrowser-v1.2.2-windows.zip` 复制到本目录。
+- **macOS ARM**：本机执行 `./packaging/build_dmg.sh` 后，将 `dist/Media Browser v1.2.3.dmg` 复制到本目录。
+- **Windows**：在 Windows 上执行 `packaging/build_windows.ps1`，或推送标签 `v1.2.3` 后从 GitHub Actions `release.yml` 的 **windows** artifact 下载 `MediaBrowser-v1.2.3-windows.zip` 复制到本目录。
 - **Linux / Docker 离线包**：见下文 `docker build` + `docker save` 示例（文件名中的 `linux-$(uname -m)` 与架构一致）。
 
 
@@ -19,8 +19,8 @@
 ## Docker 镜像包（示例）
 
 ```bash
-docker build -t media-browser:1.2.2 .
-docker save media-browser:1.2.2 | gzip -1 > package/media-browser-1.2.2-linux-$(uname -m).tar.gz
+docker build -t media-browser:1.2.3 .
+docker save media-browser:1.2.3 | gzip -1 > package/media-browser-1.2.3-linux-$(uname -m).tar.gz
 ```
 
 版本号与 `media_browser.py` 中 `APP_VERSION` 保持一致。

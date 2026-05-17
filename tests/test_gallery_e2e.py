@@ -16,14 +16,40 @@ def _delete_mod_key() -> str:
 
 
 def _wait_scan_and_open_gallery(page, base_url: str) -> None:
+    """等待扫描数据就绪并打开画廊（不依赖 .work-card，避免筛选/虚拟列表导致不可见）。"""
     page.goto(base_url, wait_until="domcontentloaded")
-    page.wait_for_selector(".work-card", timeout=60_000)
+    page.evaluate(
+        """() => {
+            localStorage.removeItem('mb_filter');
+            localStorage.removeItem('mb_search');
+            if (typeof filterType !== 'undefined') filterType = 'all';
+            if (typeof searchInput !== 'undefined') searchInput.value = '';
+        }"""
+    )
     page.wait_for_function(
-        """() => typeof allWorks !== 'undefined'
-            && allWorks.length > 0
-            && allWorks[0].items
-            && allWorks[0].items.length >= 2""",
+        """async () => {
+            if (typeof allWorks === 'undefined') return false;
+            if (allWorks.length > 0 && allWorks[0].items && allWorks[0].items.length >= 2) {
+                return true;
+            }
+            try {
+                const r = await fetch('/api/works');
+                const d = await r.json();
+                if (d.done && d.works && d.works.length > 0) {
+                    for (const w of d.works) {
+                        if (!allWorks.find(x => x.id === w.id)) allWorks.push(w);
+                    }
+                    if (typeof scanPollDone !== 'undefined') scanPollDone = true;
+                    if (typeof sortAndRenderAll === 'function') sortAndRenderAll();
+                    return allWorks.length > 0
+                        && allWorks[0].items
+                        && allWorks[0].items.length >= 2;
+                }
+            } catch (e) { /* retry via poll */ }
+            return false;
+        }""",
         timeout=90_000,
+        polling=500,
     )
     page.evaluate("openGallery(allWorks[0].id, 0, -1)")
     page.wait_for_selector("#modal.active", timeout=15_000)
@@ -97,6 +123,32 @@ def test_gallery_delete_failure_advances_to_next_file(playwright_browser, galler
         assert any("删除失败" in m for m in dialogs)
     finally:
         _album_writable(album)
+        page.close()
+
+
+def test_gallery_delete_work_shortcut_removes_all_media_and_folder(
+    playwright_browser, gallery_e2e_server
+):
+    """⌘⇧I / Ctrl+Shift+I：删除本作品全部媒体并移除已空文件夹（v1.2.3）。"""
+    base_url, album = gallery_e2e_server
+    page = playwright_browser.new_page()
+    page.on("dialog", lambda d: d.accept())
+    try:
+        _wait_scan_and_open_gallery(page, base_url)
+        mod = _delete_mod_key()
+        page.keyboard.press(f"{mod}+Shift+I")
+        page.wait_for_function(
+            "() => !document.getElementById('modal')?.classList.contains('active')",
+            timeout=20_000,
+        )
+        page.wait_for_function(
+            "() => typeof allWorks !== 'undefined' && allWorks.length === 0",
+            timeout=15_000,
+        )
+        assert not album.exists()
+        assert not (album / "a.jpg").exists()
+        assert not (album / "b.jpg").exists()
+    finally:
         page.close()
 
 

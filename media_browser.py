@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -558,6 +558,117 @@ def delete_trash_delete_selected(paths: list) -> dict:
         "remaining": remaining,
         "errors": errors,
         "skipped": skipped,
+    }
+
+
+def _path_under_work_dir(file_path: str, work_path: str) -> bool:
+    try:
+        wp = os.path.realpath(work_path)
+        fp = os.path.realpath(file_path)
+    except OSError:
+        return False
+    if fp == wp:
+        return os.path.isfile(fp)
+    return fp.startswith(wp + os.sep)
+
+
+def _can_remove_work_folder_dir(work_path: str) -> bool:
+    """根目录平铺作品（path=扫描根）不删除文件夹本身。"""
+    try:
+        root = os.path.realpath(get_scan_root())
+        wp = os.path.realpath(work_path)
+    except OSError:
+        return False
+    if wp == root:
+        return False
+    return wp.startswith(root + os.sep) and os.path.isdir(wp)
+
+
+def try_remove_empty_work_folder(work_path: str) -> bool:
+    """媒体删光后，自底向上移除空子目录并尝试删除作品文件夹（A+B 之 B）。"""
+    if not _can_remove_work_folder_dir(work_path):
+        return False
+    wp = os.path.realpath(work_path)
+    removed_top = False
+    try:
+        for dirpath, _dirnames, _filenames in os.walk(wp, topdown=False):
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+                    if os.path.normcase(dirpath) == os.path.normcase(wp):
+                        removed_top = True
+            except OSError:
+                pass
+        if not removed_top and os.path.isdir(wp):
+            try:
+                if not os.listdir(wp):
+                    os.rmdir(wp)
+                    removed_top = True
+            except OSError:
+                pass
+    except OSError:
+        return False
+    return removed_top
+
+
+def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
+    """删除作品目录下指定媒体路径；全部成功后尝试移除已清空的作品文件夹。"""
+    if not isinstance(work_path, str) or not work_path.strip():
+        return {"ok": False, "error": "missing work_path"}
+    try:
+        wp = os.path.realpath(os.path.abspath(os.path.expanduser(work_path.strip())))
+    except OSError:
+        return {"ok": False, "error": "invalid work_path"}
+    if not os.path.isdir(wp) or not is_path_under_root(wp):
+        return {"ok": False, "error": "forbidden work_path"}
+
+    raw_paths: list[str] = []
+    seen: set[str] = set()
+    for p in paths or []:
+        if not isinstance(p, str) or not p.strip():
+            continue
+        try:
+            fp = os.path.realpath(p.strip())
+        except OSError:
+            continue
+        key = os.path.normcase(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _path_under_work_dir(fp, wp):
+            continue
+        if not is_path_under_root(fp):
+            continue
+        raw_paths.append(fp)
+
+    deleted = 0
+    deleted_paths: list[str] = []
+    errors: list[dict] = []
+    for fp in raw_paths:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            os.remove(fp)
+            remove_media_thumb_cache(fp)
+            deleted += 1
+            deleted_paths.append(fp)
+        except Exception as e:
+            err = str(e)
+            delete_trash_add(fp, err)
+            errors.append({"path": fp, "error": err})
+
+    folder_removed = False
+    if not errors and _can_remove_work_folder_dir(wp):
+        folder_removed = try_remove_empty_work_folder(wp)
+
+    trash_n = len(delete_trash_list())
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "deleted_paths": deleted_paths,
+        "errors": errors,
+        "folder_removed": folder_removed,
+        "trash_count": trash_n,
     }
 
 
@@ -2343,6 +2454,28 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/delete-trash/retry-all":
             self._send_json(delete_trash_retry_all())
             return
+        if parsed.path == "/api/works/delete-all":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            work_path = data.get("work_path", "")
+            paths = data.get("paths")
+            if not isinstance(paths, list):
+                self._send_json({"ok": False, "error": "paths must be array"}, 400)
+                return
+            result = delete_work_all_media_and_folder(work_path, paths)
+            if not result.get("ok"):
+                self._send_json(result, 400)
+                return
+            self._send_json(result)
+            return
         if parsed.path != "/delete":
             self.send_error(404)
             return
@@ -3663,7 +3796,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
             <div class="file-info" id="modalFileInfo"></div>
-            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I / Ctrl+I 删除 · ⌘← / ⌘→ 上/下一作品（列表与画廊）</div>
+            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I 删当前 · ⌘⇧I 删本作品 · ⌘← / ⌘→ 上/下一作品（列表与画廊）</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
             <div class="modal-sidebar-top">
@@ -4631,50 +4764,71 @@ function attachCardLongPress(div, work) {
     });
 }
 
+function mbNormPath(p) {
+    return (p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function workCanRemoveEmptyFolder(work) {
+    const inp = document.getElementById('scanRootInput');
+    const root = inp ? inp.value.trim() : '';
+    if (!root || !work || !work.path) return false;
+    return mbNormPath(work.path) !== mbNormPath(root);
+}
+
+function deleteCurrentWork() {
+    const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
+    if (work) deleteWorkAllFiles(work);
+}
+
 async function deleteWorkAllFiles(work) {
     if (!work || !work.items.length) return;
-    if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件，不可恢复。确定？')) return;
-    let anyFail = false;
-    let lastErr = '';
-    let i = 0;
-    while (i < work.items.length) {
-        const it = work.items[i];
-        try {
-            const res = await fetch('/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json; charset=utf-8' },
-                body: JSON.stringify({ path: it.path }),
-            });
-            const data = await res.json();
-            if (!data.ok) {
-                anyFail = true;
-                lastErr = data.error || '未知错误';
-                if (data.queued) mbRefreshTrashBadge(true);
-                i++;
-                continue;
+    const folderNote = workCanRemoveEmptyFolder(work) ? '；若文件夹已空将一并移除' : '';
+    if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件' + folderNote + '，不可恢复。确定？')) return;
+    const paths = work.items.map(function (it) { return it.path; });
+    try {
+        const res = await fetch('/api/works/delete-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ work_path: work.path, paths: paths }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            alert('删除失败: ' + (data.error || '未知错误'));
+            return;
+        }
+        const deletedSet = new Set(data.deleted_paths || []);
+        for (let i = work.items.length - 1; i >= 0; i--) {
+            if (deletedSet.has(work.items[i].path)) {
+                const it = work.items[i];
+                if (it.type === 'video') work.video_count--;
+                else work.image_count--;
+                work.items.splice(i, 1);
             }
-            if (it.type === 'video') work.video_count--;
-            else work.image_count--;
-            work.items.splice(i, 1);
-        } catch (err) {
-            anyFail = true;
-            lastErr = err.message || String(err);
-            i++;
         }
-    }
-    hideCardCtx();
-    if (work.items.length === 0) {
-        const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
-        if (idx >= 0) allWorks.splice(idx, 1);
-        closeModal();
-        sortAndRenderAll();
-    } else {
-        sortAndRenderAll();
-        if (anyFail) {
-            alert('部分文件未能删除（仍剩余 ' + work.items.length + ' 个）。最后错误：' + lastErr + '\\n失败项已记入废纸篓（若服务端可写），可在页眉「废纸篓」批量重试。');
+        hideCardCtx();
+        const modal = document.getElementById('modal');
+        const inGallery = modal && modal.classList.contains('active') && galleryState.workId === work.id;
+        if (work.items.length === 0) {
+            const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
+            if (idx >= 0) allWorks.splice(idx, 1);
+            closeModal();
+            sortAndRenderAll();
+        } else {
+            sortAndRenderAll();
+            if (data.errors && data.errors.length) {
+                alert('部分文件未能删除（仍剩余 ' + work.items.length + ' 个）。失败项已记入废纸篓，可在页眉「废纸篓」批量重试。');
+            }
+            if (inGallery) {
+                if (galleryState.itemIdx >= work.items.length) {
+                    galleryState.itemIdx = Math.max(0, work.items.length - 1);
+                }
+                renderGallery();
+            }
         }
+        mbRefreshTrashBadge(true);
+    } catch (err) {
+        alert('请求失败: ' + (err.message || String(err)));
     }
-    mbRefreshTrashBadge(true);
 }
 
 function preloadAdjacentWorks() {
@@ -5186,16 +5340,17 @@ function renderGallery() {
     const codec = item.codec ? `${item.codec.toUpperCase()} · ` : '';
     const bitrate = item.bitrate ? `${(item.bitrate / 1000000).toFixed(1)}Mbps · ` : '';
     const fps = item.fps ? `${item.fps}fps · ` : '';
-    const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除：⌘I 或 Ctrl+I；⌘← / ⌘→ 切换作品（列表与画廊）">🗑 删除</span>`;
+    const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除当前：⌘I / Ctrl+I">🗑 删除</span>`;
+    const delWorkBtn = `<span onclick="event.stopPropagation(); deleteCurrentWork();" style="cursor:pointer;color:#ff6666;margin-left:10px;font-size:12px;" title="删除本作品全部媒体：⌘⇧I / Ctrl+Shift+I">🗑 删本作品</span>`;
     const reviewBtn = `<button type="button" id="galleryReviewBtn" class="gallery-review-btn" data-work-id="${escapeHtml(work.id)}">标记</button>`;
-    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}${reviewBtn}`;
+    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}${delWorkBtn}${reviewBtn}`;
     updateGalleryReviewBtn(work.id);
     const sh = document.getElementById('shortcutHint');
     if (sh) {
         if (item.type === 'video') {
-            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻文件（末档再→ 进下一作品）· ⌘←⌘→ 切作品 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删除';
+            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻文件（末档再→ 进下一作品）· ⌘←⌘→ 切作品 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删当前 · ⌘⇧I 删本作品';
         } else {
-            sh.textContent = '← → 翻图片（末张再→ 进下一作品首张）· ⌘←⌘→ 切作品 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删除';
+            sh.textContent = '← → 翻图片（末张再→ 进下一作品首张）· ⌘←⌘→ 切作品 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删当前 · ⌘⇧I 删本作品';
         }
     }
     sidebarTitle.textContent = work.name;
@@ -5572,7 +5727,12 @@ document.addEventListener('keydown', (e) => {
 
     // 全局
     if (e.key === 'Escape') { closeModal(); return; }
-    if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey)) {
+    if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+        e.preventDefault();
+        deleteCurrentWork();
+        return;
+    }
+    if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
         e.preventDefault();
         deleteCurrentItem();
         return;

@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.2**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.3**，发版前请与打包配置核对）。
 
 ---
 
@@ -97,7 +97,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **列表**：搜索、排序；筛选 **全部 / 有视频 / 有图片 / 仅待审**（「仅待审」= 尚未标为保留）。
 - **懒加载**：滚动追加卡片。
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
-- **删除**：`POST /delete`，路径须在扫描根下；删除**源文件成功后**，会按 `sha256(abspath)` 删除 `MB_CACHE_DIR` 下对应缩略图目录，避免孤儿缓存。若删除失败，路径会记入**废纸篓队列**（`MB_CACHE_DIR` 下按扫描根隔离的 JSON），可在页眉「废纸篓」中多选后批量重试或逐条再删；画廊内删除失败在提示后也会**自动切到下一文件**（与删除成功后的落点一致，便于连续审阅）。
+- **删除**：`POST /delete` 删除单个文件；**`POST /api/works/delete-all`** 一次性删除**当前作品（文件夹）**内全部媒体，并在媒体删光后**尝试移除已空的作品文件夹**（根目录平铺作品不删扫描根）。路径须在扫描根下；删除**源文件成功后**会按 `sha256(abspath)` 清理 `MB_CACHE_DIR` 缩略图。失败项记入**废纸篓队列**，可在页眉「废纸篓」批量重试；画廊内单文件删除失败在提示后也会**自动切到下一文件**。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
 - **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
 - **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
@@ -122,6 +122,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `双击` | — | **还原**原始大小 |
 | `ESC` | 关闭画廊 | 关闭画廊 |
 | `⌘I` / `Ctrl+I` | 删除当前文件 | 删除当前文件 |
+| `⌘⇧I` / `Ctrl+Shift+I` | **删除本作品全部媒体**（并尝试移除已空文件夹） | 同上 |
 | `⌘←` / `Ctrl+←` | **切换到上一作品**（打开该作品**最后一个**媒体） | 同上 |
 | `⌘→` / `Ctrl+→` | **切换到下一作品**（打开该作品**第一个**媒体） | 同上 |
 
@@ -165,6 +166,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
 | `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
 | `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存；失败时可能返回 `queued` / `trash_count` 并入废纸篓队列 |
+| `/api/works/delete-all` | POST | JSON `{"work_path":"…","paths":["…"]}`，批量删作品内媒体；全部成功后尝试移除已空 `work_path`（非扫描根） |
 | `/api/delete-trash` | GET | 当前废纸篓队列（仍存在于扫描根下的待删路径） |
 | `/api/delete-trash/delete-selected` | POST | JSON `{"paths":["…"]}`，仅删除队列中出现的路径（子集批量） |
 | `/api/delete-trash/retry-all` | POST | 对队列内全部路径再次尝试删除 |
