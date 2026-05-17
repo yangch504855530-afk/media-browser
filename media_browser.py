@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -1147,19 +1147,107 @@ def _normalize_scan_path_input(s: str) -> str:
         ("\u2018", "'"),
         ("\u2019", "'"),
         ("\ufeff", ""),
+        ("\u200b", ""),
+        ("\u200c", ""),
+        ("\u200d", ""),
+        ("\u2060", ""),
     ):
         t = t.replace(a, b)
-    return t
+    return t.strip().strip('"').strip("'")
+
+
+def _check_scan_root_directory(p: str) -> tuple[bool, str | None]:
+    """判断路径是否为可访问的目录（含 macOS /Volumes NAS 自动挂载触发）。"""
+    try:
+        if os.path.isdir(p):
+            return True, None
+        if sys.platform == "darwin" and p.startswith("/Volumes/"):
+            try:
+                os.listdir(p)
+            except OSError as e:
+                errno = getattr(e, "errno", None)
+                if errno == 2:
+                    return (
+                        False,
+                        f"未找到「{p}」。请先用 Finder（⌘K）连接服务器并挂载 NAS，"
+                        "再在「扫描根目录」填写 /Volumes/下的文件夹路径。",
+                    )
+                if errno == 13:
+                    return False, f"没有权限访问「{p}」。请在系统设置中允许本应用访问该磁盘。"
+                return False, f"无法访问「{p}」: {e}"
+            if os.path.isdir(p):
+                return True, None
+        if os.path.lexists(p) and os.path.isfile(p):
+            return False, "请选择文件夹路径，而不是单个文件。"
+        return False, "路径不存在或不是文件夹。"
+    except OSError as e:
+        return False, f"无法访问路径: {e}"
+
+
+def resolve_scan_root_path(raw: str) -> tuple[str | None, str | None]:
+    """解析用户输入的扫描根路径。返回 (绝对路径, 错误说明)。"""
+    t = _normalize_scan_path_input(raw)
+    if not t:
+        return None, "请输入目录路径"
+
+    low = t.lower()
+    if low.startswith(("smb://", "afp://", "nfs://", "ftp://", "cifs://")):
+        return (
+            None,
+            "这是网络地址，不能直接作为扫描根目录。请先用 Finder（⌘K）挂载 NAS，"
+            "再填写本机路径，例如 /Volumes/你的共享名/子文件夹",
+        )
+    if low.startswith("\\\\"):
+        return (
+            None,
+            "这是 Windows 网络路径格式。在 Mac 上请先用 Finder（⌘K）挂载，"
+            "再使用 /Volumes/… 路径。",
+        )
+
+    if t.startswith("file://"):
+        try:
+            from urllib.parse import unquote, urlparse
+
+            t = unquote(urlparse(t).path)
+        except Exception:
+            return None, "无法解析 file:// 路径"
+
+    if os.sep == "/" and "\\" in t and not re.match(r"^[A-Za-z]:\\", t):
+        t = t.replace("\\", "/")
+
+    t = os.path.expanduser(t)
+    if not os.path.isabs(t):
+        t = os.path.abspath(t)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for cand in (t, os.path.abspath(t)):
+        try:
+            rp = os.path.realpath(cand)
+        except OSError:
+            rp = os.path.abspath(cand)
+        for p in (rp, os.path.abspath(cand)):
+            key = os.path.normcase(p)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(p)
+
+    last_err: str | None = None
+    for p in candidates:
+        ok, err = _check_scan_root_directory(p)
+        if ok:
+            return p, None
+        last_err = err
+    return None, last_err or "路径不存在或不是文件夹"
 
 
 def replace_scan_root(new_root: str) -> bool:
     """切换扫描根目录并启动新扫描任务。返回是否成功。"""
     global _scan_root, scanner
-    p = os.path.realpath(os.path.abspath(os.path.expanduser(_normalize_scan_path_input(new_root))))
-    try:
-        if not os.path.isdir(p):
-            return False
-    except OSError:
+    p, err = resolve_scan_root_path(new_root)
+    if not p:
+        if err:
+            logger.warning("扫描根目录无效: %s", err)
         return False
     _scan_root = p
     prof = _apply_perf_profile_for_scan_root(_scan_root)
@@ -2407,8 +2495,9 @@ class Handler(BaseHTTPRequestHandler):
             if replace_scan_root(p):
                 self._send_json({"ok": True, "path": get_scan_root()})
             else:
+                _resolved, err = resolve_scan_root_path(p)
                 self._send_json(
-                    {"ok": False, "error": "路径不存在或不是文件夹"},
+                    {"ok": False, "error": err or "路径不存在或不是文件夹"},
                     400,
                 )
             return
@@ -3635,7 +3724,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <h1>📁 Media Browser <span class="app-ver">v__APP_VERSION__</span></h1>
         <div class="scan-root-row" title="可填写本机任意目录；无需重启。启动默认仍可由 MB_ROOT_DIR 决定。">
             <label for="scanRootInput">扫描根目录</label>
-            <input type="text" id="scanRootInput" value="__MB_ROOT_DIR__" spellcheck="false" autocomplete="off" />
+            <input type="text" id="scanRootInput" value="__MB_ROOT_DIR__" spellcheck="false" autocomplete="off" title="NAS 请先用 Finder（⌘K）挂载，再填 /Volumes/共享名/子路径；不要填 smb:// 地址" placeholder="/Volumes/你的NAS/文件夹" />
             <button type="button" id="applyScanRoot">应用并扫描</button>
         </div>
     </div>

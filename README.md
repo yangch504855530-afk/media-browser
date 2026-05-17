@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.3**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.4**，发版前请与打包配置核对）。
 
 ---
 
@@ -74,6 +74,13 @@ docker compose up -d --build
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
 | `MB_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | 同上 |
 | `MB_LOG_FORMAT` | `text`（默认；终端下彩色）或 `json`（单行 JSON，便于采集） | `text` | 同上 |
+
+### macOS 扫描 NAS（⌘K 挂载）
+
+1. 在 Finder 用 **⌘K** 连接服务器（SMB），挂载成功后会在 **`/Volumes/共享名`** 出现盘符。
+2. 在页眉「扫描根目录」填写**本机绝对路径**，例如 `/Volumes/MyNAS/photos`（可点「应用并扫描」）。
+3. **不要**直接填 `smb://…` 或 `\\服务器\共享` —— 那是网络 URL，不是本机文件夹；应用会提示改用 `/Volumes/…`。
+4. 若仍提示找不到路径：确认 NAS 在 Finder 侧边栏可见；可先 `open /Volumes/你的共享名` 唤醒挂载；子路径需存在且为文件夹。
 
 启动时向 stderr 输出**结构化日志**（级别与格式见 `MB_LOG_LEVEL` / `MB_LOG_FORMAT`）。NAS / 外置机械盘示例：
 
@@ -153,7 +160,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/` | GET | 单页 HTML |
 | `/health` | GET | 健康检查 JSON（磁盘、扫描、ffmpeg/ffprobe、ollama、缓存、`uptime_seconds`）；**异常时 HTTP 503** |
 | `/api/progress?since=` | GET | 扫描进度与增量作品（含 `scan_root` 等） |
-| `/api/set-scan-root` | POST | JSON `{"path":"/绝对路径"}`，切换扫描根并重新扫描 |
+| `/api/set-scan-root` | POST | JSON `{"path":"/绝对路径"}`，切换扫描根并重新扫描；失败时 `error` 含具体原因（如误填 `smb://`、NAS 未挂载） |
 | `/api/shutdown` | POST | 退出进程（body 可为 `{}`） |
 | `/thumb/...` | GET | 缩略图 |
 | `/file?path=` | GET | 原文件 |
@@ -269,6 +276,9 @@ Actions 会并行构建：
 | 主题 | 说明 |
 |------|------|
 | 扫描根可配 | 页眉路径 +「应用并扫描」、`POST /api/set-scan-root` |
+| macOS NAS 路径 | v1.2.4+：支持 `/Volumes/…`、拒绝 `smb://` 并提示；`/Volumes` 下可触发挂载检测 |
+| 删本作品 | v1.2.3：`/api/works/delete-all`、画廊 ⌘⇧I |
+| 废纸篓与画廊删除 | v1.2.1–1.2.2：失败入队、删失败仍翻页 |
 | 退出 | 页眉「退出应用」、`POST /api/shutdown` |
 | 扫描性能与护盘 | `MB_SCAN_*`、`MB_THUMB_COUNT`、`MB_DISK_PROFILE`、单次 ffprobe、软链与兜底枚举等 |
 | 删除与缓存 | 删文件后同步删对应缩略图目录 |

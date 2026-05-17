@@ -22,7 +22,8 @@ def test_int_env_default_and_bounds(monkeypatch):
 def test_normalize_scan_path_input():
     assert mb._normalize_scan_path_input("  /tmp/foo  ") == "/tmp/foo"
     s = mb._normalize_scan_path_input("\u201c/path/with/curly\u201d")
-    assert '"' in s and "\u201c" not in s
+    assert s == "/path/with/curly"
+    assert "\u201c" not in s
     assert mb._normalize_scan_path_input("\ufeff/tmp/x") == "/tmp/x"
 
 
