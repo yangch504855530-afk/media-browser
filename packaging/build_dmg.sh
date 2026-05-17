@@ -71,7 +71,20 @@ DMG_OUT="$ROOT/dist/$DMG_NAME"
 
 echo "==> Creating DMG on boot volume temp, then copy to dist/"
 rm -f "$DMG_TMP" "$DMG_OUT"
-hdiutil create -volname "Media Browser ${VERSION}" -srcfolder "$APP_SRC" -ov -format UDZO "$DMG_TMP"
+create_dmg_ok=0
+for attempt in 1 2 3 4; do
+  rm -f "$DMG_TMP"
+  if hdiutil create -volname "Media Browser ${VERSION}" -srcfolder "$APP_SRC" -ov -format UDZO "$DMG_TMP"; then
+    create_dmg_ok=1
+    break
+  fi
+  echo "hdiutil create failed (attempt ${attempt}/4), retrying..." >&2
+  sleep $((attempt * 4))
+done
+if [[ "$create_dmg_ok" -ne 1 ]]; then
+  echo "hdiutil create failed after retries" >&2
+  exit 1
+fi
 cp -f "$DMG_TMP" "$DMG_OUT"
 rm -f "$DMG_TMP"
 
