@@ -51,7 +51,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -267,6 +267,16 @@ def setup_logging() -> logging.Logger:
 
 
 logger = setup_logging()
+
+
+def scan_root_readonly() -> bool:
+    """Docker 等场景：页眉扫描根只读（改路径请改 compose 挂载）。"""
+    return os.environ.get("MB_SCAN_ROOT_READONLY", "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+        "on",
+    )
 
 
 def get_scan_root() -> str:
@@ -2224,6 +2234,10 @@ class Handler(BaseHTTPRequestHandler):
                 HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(get_scan_root()))
                 .replace("__THUMB_COUNT__", str(THUMB_COUNT))
                 .replace("__APP_VERSION__", html_mod.escape(APP_VERSION))
+                .replace(
+                    "__MB_SCAN_READONLY__",
+                    "true" if scan_root_readonly() else "false",
+                )
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3711,9 +3725,79 @@ body.batch-open #backToTop.show { bottom: 118px; }
 @media (max-width: 767px) {
     body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
     body.mb-review-tab .mb-mobile-tabbar { display: flex; }
-    #backToTop { bottom: calc(64px + env(safe-area-inset-bottom, 0px)); }
+    body.mb-mobile #backToTop { bottom: calc(64px + env(safe-area-inset-bottom, 0px)); }
+    body.mb-mobile #batchBar { bottom: calc(52px + env(safe-area-inset-bottom, 0px)); padding: 8px 12px; }
+    body.mb-mobile #batchBar .batch-hint { display: none; }
+    body.mb-mobile #batchBar button { padding: 8px 10px; font-size: 12px; }
     .folder-nav-hint { display: none; }
     .mb-review-secondary { display: none !important; }
+    header { padding: 10px 12px; gap: 8px; }
+    header .brand { max-width: 100%; flex: 1 1 100%; }
+    header h1 { font-size: 16px; }
+    header .app-tabs { display: none; }
+    header .scan-root-row.mb-scan-hidden { display: none !important; }
+    header .scan-root-row:not(.mb-scan-hidden) { width: 100%; }
+    header .scan-root-row:not(.mb-scan-hidden) #scanRootInput { max-width: 100%; font-size: 12px; }
+    header #search { display: none; width: 100%; flex: 1 1 100%; order: 20; }
+    body.mb-mobile-search-open header #search { display: block; }
+    header #sortSelect,
+    header .filters,
+    header #resetAllReviewTags,
+    header #exitApp { display: none !important; }
+    header #mbTrashBtn { margin-left: auto; font-size: 12px; padding: 6px 10px; }
+    .mb-mobile-bar {
+        display: flex; align-items: center; gap: 8px; width: 100%; flex: 1 1 100%; order: 15;
+    }
+    .mb-mobile-bar button {
+        background: #1e1e1e; border: 1px solid #3a3a3a; color: #ccc; border-radius: 8px;
+        padding: 8px 12px; font-size: 13px; cursor: pointer; min-height: 40px;
+    }
+    .mb-mobile-bar .mb-mobile-status { flex: 1; font-size: 11px; color: #777; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mb-mobile-drawer {
+        display: none; position: fixed; inset: 0; z-index: 350; background: rgba(0,0,0,0.55);
+    }
+    .mb-mobile-drawer.active { display: flex; align-items: flex-end; }
+    .mb-mobile-drawer-sheet {
+        width: 100%; max-height: min(78vh, 520px); overflow: auto;
+        background: #141414; border-radius: 16px 16px 0 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+        border-top: 1px solid #333;
+    }
+    .mb-mobile-drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .mb-mobile-drawer-head h3 { font-size: 16px; color: #eee; }
+    .mb-mobile-drawer-close { border: none; background: transparent; color: #aaa; font-size: 24px; cursor: pointer; padding: 4px 8px; }
+    .mb-mobile-drawer label { display: block; font-size: 12px; color: #888; margin: 10px 0 6px; }
+    .mb-mobile-drawer select { width: 100%; margin-bottom: 8px; }
+    .mb-mobile-drawer .filters { flex-wrap: wrap; margin-bottom: 12px; }
+    .mb-mobile-drawer .filters button { min-height: 40px; margin: 0 6px 6px 0; }
+    .mb-mobile-drawer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .mb-mobile-drawer-actions button { flex: 1 1 calc(50% - 8px); min-height: 44px; }
+    #container { padding: 10px; }
+    .work-card { margin-bottom: 12px; }
+    .work-card .title { font-size: 15px; }
+    body.mb-mobile .modal.active .shortcut-hint { display: none; }
+    body.mb-mobile .modal.active .file-info { font-size: 11px; max-height: 2.6em; overflow: hidden; text-overflow: ellipsis; }
+    body.mb-mobile .modal.active .modal-body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+    body.mb-mobile .modal.active .modal-main { padding-bottom: calc(52px + env(safe-area-inset-bottom, 0px)); }
+    .mb-gallery-bar {
+        display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 260;
+        height: calc(52px + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
+        background: rgba(12,12,12,0.96); border-top: 1px solid #333;
+        align-items: stretch; justify-content: space-around; gap: 4px; padding-left: 6px; padding-right: 6px;
+    }
+    body.mb-mobile .modal.active .mb-gallery-bar { display: flex; }
+    .mb-gallery-bar button {
+        flex: 1; border: none; background: transparent; color: #ddd; font-size: 12px;
+        padding: 6px 4px; cursor: pointer; min-height: 44px; border-radius: 8px;
+    }
+    .mb-gallery-bar button.mb-danger { color: #ff6961; }
+    .mb-gallery-bar button.mb-primary { color: #0a84ff; font-weight: 600; }
+    .mb-gallery-bar button:active { background: rgba(255,255,255,0.06); }
+    body.mb-mobile .modal-nav { display: none; }
+}
+.mb-mobile-bar { display: none; }
+.mb-mobile-drawer { display: none; }
+@media (min-width: 768px) {
+    .mb-mobile-drawer { display: none !important; }
 }
 </style>
 </head>
@@ -3722,7 +3806,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <header id="headerBar">
     <div class="brand">
         <h1>📁 Media Browser <span class="app-ver">v__APP_VERSION__</span></h1>
-        <div class="scan-root-row" title="可填写本机任意目录；无需重启。启动默认仍可由 MB_ROOT_DIR 决定。">
+        <div class="scan-root-row" id="scanRootRow" title="可填写本机任意目录；无需重启。启动默认仍可由 MB_ROOT_DIR 决定。">
             <label for="scanRootInput">扫描根目录</label>
             <input type="text" id="scanRootInput" value="__MB_ROOT_DIR__" spellcheck="false" autocomplete="off" title="NAS 请先用 Finder（⌘K）挂载，再填 /Volumes/共享名/子路径；不要填 smb:// 地址" placeholder="/Volumes/你的NAS/文件夹" />
             <button type="button" id="applyScanRoot">应用并扫描</button>
@@ -3750,7 +3834,41 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
     <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
+    <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
+        <button type="button" id="mbMobileSearchBtn" title="搜索">搜索</button>
+        <button type="button" id="mbMobileFilterBtn">筛选</button>
+        <button type="button" id="mbMobileTrashBtn">废纸篓</button>
+        <span id="mbMobileStatus" class="mb-mobile-status"></span>
+    </div>
 </header>
+
+<div id="mbMobileDrawer" class="mb-mobile-drawer" aria-hidden="true">
+    <div class="mb-mobile-drawer-sheet" role="dialog" aria-labelledby="mbMobileDrawerTitle">
+        <div class="mb-mobile-drawer-head">
+            <h3 id="mbMobileDrawerTitle">筛选与更多</h3>
+            <button type="button" class="mb-mobile-drawer-close" id="mbMobileDrawerClose" aria-label="关闭">&times;</button>
+        </div>
+        <label for="sortSelectDrawer">排序</label>
+        <select id="sortSelectDrawer">
+            <option value="name">按名称</option>
+            <option value="files">按文件数</option>
+            <option value="size">按大小</option>
+            <option value="duration">按时长</option>
+            <option value="mtime">按修改时间</option>
+        </select>
+        <label>筛选</label>
+        <div class="filters mb-drawer-filters">
+            <button class="active" data-filter="all">全部</button>
+            <button data-filter="video">有视频</button>
+            <button data-filter="image">有图片</button>
+            <button data-filter="pending">仅待审</button>
+        </div>
+        <div class="mb-mobile-drawer-actions">
+            <button type="button" id="mbDrawerResetReview">标记全重置</button>
+            <button type="button" id="mbDrawerExit">退出应用</button>
+        </div>
+    </div>
+</div>
 
 <section id="analysisPanel" class="analysis-panel" aria-live="polite">
     <div class="analysis-card">
@@ -3822,7 +3940,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <div id="reviewSecondary" class="mb-review-secondary" aria-hidden="true">
 <div class="mb-review-secondary-card">
 <div class="mb-hint-title">布局说明</div>
-<p>桌面：左侧作品列表与右侧提示栏分栏。平板：点 ⟨ 可折叠左侧列表。手机：底部「作品 / 画廊 / 设置」切换；画廊内横划切文件，长横划切作品；双指捏合缩放图片或视频画面。</p>
+<p>桌面：左侧作品列表与右侧提示栏分栏。平板：点 ⟨ 可折叠左侧列表。手机：底部「作品 / 画廊 / 更多」；画廊底栏可删当前/删作品、保留；横划切文件，长横划切作品；双指捏合缩放。</p>
 </div>
 </div>
 </div>
@@ -3831,7 +3949,15 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <nav id="mobileTabbar" class="mb-mobile-tabbar" aria-label="底部导航">
 <button type="button" data-mtab="works" class="active">作品</button>
 <button type="button" data-mtab="gallery">画廊</button>
-<button type="button" data-mtab="settings">设置</button>
+<button type="button" data-mtab="more">更多</button>
+</nav>
+
+<nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
+    <button type="button" id="mbGalPrev" title="上一个">◀</button>
+    <button type="button" id="mbGalReview" class="mb-primary">保留</button>
+    <button type="button" id="mbGalDelete" class="mb-danger">删除</button>
+    <button type="button" id="mbGalDeleteWork" class="mb-danger">删作品</button>
+    <button type="button" id="mbGalNext" title="下一个">▶</button>
 </nav>
 
 <div id="cardCtxMenu" class="mb-card-ctx" role="menu" aria-hidden="true">
@@ -3901,6 +4027,34 @@ body.batch-open #backToTop.show { bottom: 118px; }
 
 <script>
 const THUMB_COUNT = __THUMB_COUNT__;
+const MB_SCAN_READONLY = (__MB_SCAN_READONLY__ === true || String(__MB_SCAN_READONLY__) === 'true');
+function mbDetectMobile() {
+    return window.matchMedia('(max-width: 767px)').matches
+        || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
+}
+let mbMobile = mbDetectMobile();
+function mbSyncMobileClass() {
+    mbMobile = mbDetectMobile();
+    document.body.classList.toggle('mb-mobile', mbMobile);
+    const bar = document.getElementById('mbMobileBar');
+    if (bar) bar.setAttribute('aria-hidden', mbMobile ? 'false' : 'true');
+}
+mbSyncMobileClass();
+window.addEventListener('resize', mbSyncMobileClass);
+function mbBatchStepSize() { return mbMobile ? 6 : 12; }
+function mbSyncFilterButtons() {
+    document.querySelectorAll('.filters button').forEach(function (b) {
+        b.classList.toggle('active', b.dataset.filter === filterType);
+    });
+}
+function mbSyncSortSelects() {
+    const d = document.getElementById('sortSelectDrawer');
+    if (d && d.value !== sortSelect.value) d.value = sortSelect.value;
+}
+function mbSyncMobileStatusText() {
+    const ms = document.getElementById('mbMobileStatus');
+    if (ms && mbMobile) ms.textContent = statusEl ? (statusEl.textContent || '') : '';
+}
 const container = document.getElementById('container');
 const statusEl = document.getElementById('status');
 const progressFill = document.getElementById('progressFill');
@@ -3916,7 +4070,7 @@ const cardCtxMenu = document.getElementById('cardCtxMenu');
 
 const MB_LAZY_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 const MB_V_THRESHOLD = 500;
-const MB_V_ROW = 280;
+const MB_V_ROW = mbMobile ? 240 : 280;
 let mbVirtual = { active: false, list: [], anchor: 0 };
 let mbLastGalleryWorkId = null;
 let mbThumbIO = null;
@@ -3941,7 +4095,6 @@ let sortKey = 'name';
 let since = 0;
 let selectedIds = new Set();
 let displayedIds = new Set();
-const BATCH_STEP = 12;
 let renderOffset = 0;
 
 let galleryState = { workId: null, itemIdx: 0 };
@@ -4183,7 +4336,7 @@ const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob',
 function buildVideoPlayUrl(filePath) {
     const i = filePath.lastIndexOf('.');
     const ext = i >= 0 ? filePath.slice(i).toLowerCase() : '';
-    if (TRANSCODE_VIDEO_EXTS.has(ext)) {
+    if (mbMobile || TRANSCODE_VIDEO_EXTS.has(ext)) {
         return '/play?path=' + encodeURIComponent(filePath);
     }
     return '/file?path=' + encodeURIComponent(filePath);
@@ -4243,6 +4396,11 @@ function updateGalleryReviewBtn(workId) {
     btn.textContent = kept ? '保留' : '待审';
     btn.className = 'gallery-review-btn ' + (kept ? 'kept' : 'pending');
     btn.title = kept ? '点击标为待审' : '点击标为保留';
+    const galBtn = document.getElementById('mbGalReview');
+    if (galBtn) {
+        galBtn.textContent = kept ? '标待审' : '保留';
+        galBtn.className = 'mb-primary' + (kept ? ' kept' : '');
+    }
 }
 function resetAllReviewTags() {
     if (!confirm('将所有作品的标记恢复为「待审」？')) return;
@@ -4661,16 +4819,43 @@ function sortWorks(list) {
 sortSelect.addEventListener('change', () => {
     sortKey = sortSelect.value;
     localStorage.setItem('mb_sort', sortKey);
+    mbSyncSortSelects();
     sortAndRenderAll();
 });
+const sortSelectDrawer = document.getElementById('sortSelectDrawer');
+if (sortSelectDrawer) {
+    sortSelectDrawer.addEventListener('change', () => {
+        sortSelect.value = sortSelectDrawer.value;
+        sortKey = sortSelectDrawer.value;
+        localStorage.setItem('mb_sort', sortKey);
+        sortAndRenderAll();
+        mbCloseMobileDrawer();
+    });
+}
+
+function mbOpenMobileDrawer() {
+    const d = document.getElementById('mbMobileDrawer');
+    if (!d) return;
+    mbSyncSortSelects();
+    mbSyncFilterButtons();
+    d.classList.add('active');
+    d.setAttribute('aria-hidden', 'false');
+}
+function mbCloseMobileDrawer() {
+    const d = document.getElementById('mbMobileDrawer');
+    if (!d) return;
+    d.classList.remove('active');
+    d.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('mb-mobile-search-open');
+}
 
 document.querySelectorAll('.filters button').forEach(btn => {
     btn.addEventListener('click', () => {
-        document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
         filterType = btn.dataset.filter;
         localStorage.setItem('mb_filter', filterType);
+        mbSyncFilterButtons();
         sortAndRenderAll();
+        mbCloseMobileDrawer();
     });
 });
 
@@ -5145,6 +5330,7 @@ function sortAndRenderAll() {
         }
     }
     refreshEmptyHint(list.length);
+    mbSyncMobileStatusText();
     if (list.length > MB_V_THRESHOLD) {
         mbVirtual.active = true;
         mbVirtual.list = list;
@@ -5157,7 +5343,7 @@ function sortAndRenderAll() {
 
 function renderMoreWorks(list) {
     if (mbVirtual.active) return;
-    const slice = list.slice(renderOffset, renderOffset + BATCH_STEP);
+    const slice = list.slice(renderOffset, renderOffset + mbBatchStepSize());
     for (const w of slice) {
         if (displayedIds.has(w.id)) continue;
         displayedIds.add(w.id);
@@ -5389,7 +5575,9 @@ function renderGallery() {
 
     if (item.type === 'video') {
         const needsTc = url.indexOf('/play?') >= 0;
-        const overlayHtml = needsTc ? '<div id="transcodeOverlay" class="transcode-overlay">正在转码，请稍候…</div>' : '';
+        const overlayHtml = needsTc
+            ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在转码，请稍候…') + '</div>'
+            : '';
         mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline></video></div>`;
         const v = document.getElementById('galleryVideo');
         const ov = document.getElementById('transcodeOverlay');
@@ -5420,7 +5608,7 @@ function renderGallery() {
         }
         setupGalleryVideoPinch();
     } else {
-        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" draggable="false" style="cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
+        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" loading="lazy" decoding="async" draggable="false" style="cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
         setupImageZoom();
     }
 
@@ -5938,6 +6126,54 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
 });
 
 (function mbInitShell() {
+    if (MB_SCAN_READONLY) {
+        const row = document.getElementById('scanRootRow');
+        if (row) row.classList.add('mb-scan-hidden');
+        const applyBtn = document.getElementById('applyScanRoot');
+        if (applyBtn) applyBtn.style.display = 'none';
+        const drawerExit = document.getElementById('mbDrawerExit');
+        if (drawerExit) drawerExit.style.display = 'none';
+    }
+    const drawer = document.getElementById('mbMobileDrawer');
+    const drawerClose = document.getElementById('mbMobileDrawerClose');
+    if (drawer) {
+        drawer.addEventListener('click', (e) => {
+            if (e.target === drawer) mbCloseMobileDrawer();
+        });
+    }
+    if (drawerClose) drawerClose.addEventListener('click', mbCloseMobileDrawer);
+    const mbMobileFilterBtn = document.getElementById('mbMobileFilterBtn');
+    if (mbMobileFilterBtn) mbMobileFilterBtn.addEventListener('click', mbOpenMobileDrawer);
+    const mbMobileSearchBtn = document.getElementById('mbMobileSearchBtn');
+    if (mbMobileSearchBtn) {
+        mbMobileSearchBtn.addEventListener('click', () => {
+            document.body.classList.toggle('mb-mobile-search-open');
+            if (document.body.classList.contains('mb-mobile-search-open')) {
+                searchInput.focus();
+            }
+        });
+    }
+    const mbMobileTrashBtn = document.getElementById('mbMobileTrashBtn');
+    if (mbMobileTrashBtn) mbMobileTrashBtn.addEventListener('click', () => mbOpenTrashPanel());
+    const mbDrawerReset = document.getElementById('mbDrawerResetReview');
+    if (mbDrawerReset) mbDrawerReset.addEventListener('click', () => { resetAllReviewTags(); mbCloseMobileDrawer(); });
+    const mbDrawerExit = document.getElementById('mbDrawerExit');
+    if (mbDrawerExit) mbDrawerExit.addEventListener('click', () => document.getElementById('exitApp')?.click());
+    const mbGalPrev = document.getElementById('mbGalPrev');
+    const mbGalNext = document.getElementById('mbGalNext');
+    const mbGalDelete = document.getElementById('mbGalDelete');
+    const mbGalDeleteWork = document.getElementById('mbGalDeleteWork');
+    const mbGalReview = document.getElementById('mbGalReview');
+    if (mbGalPrev) mbGalPrev.addEventListener('click', () => navigate(-1));
+    if (mbGalNext) mbGalNext.addEventListener('click', () => navigate(1));
+    if (mbGalDelete) mbGalDelete.addEventListener('click', () => deleteCurrentItem());
+    if (mbGalDeleteWork) mbGalDeleteWork.addEventListener('click', () => deleteCurrentWork());
+    if (mbGalReview) {
+        mbGalReview.addEventListener('click', () => {
+            const work = allWorks.find(w => w.id === galleryState.workId);
+            if (work) toggleWorkReview(work.id);
+        });
+    }
     const tc = document.getElementById('worksColToggle');
     const wc = document.getElementById('worksColumn');
     if (tc && wc) {
@@ -5965,11 +6201,8 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
                         if (fl.length) openGallery(fl[0].id, 0, -1);
                         else alert('暂无作品');
                     }
-                } else if (t === 'settings') {
-                    const hb = document.getElementById('headerBar');
-                    if (hb) hb.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    const inp = document.getElementById('scanRootInput');
-                    if (inp) setTimeout(() => inp.focus(), 450);
+                } else if (t === 'more') {
+                    mbOpenMobileDrawer();
                 }
             });
         });

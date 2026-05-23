@@ -34,6 +34,7 @@ services:
       MB_DISK_PROFILE: nas
       MB_SCAN_WORKERS: "1"
       MB_THUMB_COUNT: "2"
+      MB_SCAN_ROOT_READONLY: "1"
       # 可选：MB_AUTO_OPEN=0（容器内无浏览器）
       # 可选：MB_LOG_FORMAT=json
       TZ: Asia/Shanghai

@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.4**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.5**，发版前请与打包配置核对）。
 
 ---
 
@@ -54,6 +54,22 @@ docker compose up -d --build
 
 容器默认以 `uid=1000` 运行。若宿主机 UID 不同，请修改 `docker-compose.yml` 中的 `user` 行（见文件内注释）。
 
+### 手机访问（局域网 WiFi）
+
+1. 确保手机与 NAS **同一 WiFi**。
+2. 浏览器打开 **`http://<NAS局域网IP>:8765`**（例如 `http://192.168.1.10:8765`）。
+3. **v1.2.5+** 已针对手机优化：精简页眉、底部「作品 / 画廊 / 更多」、画廊底栏（上一张 / 保留 / 删除 / 删作品 / 下一张）；视频在手机上**默认走转码**（更耗 NAS CPU，兼容性更好）。
+4. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
+5. 大库首屏较慢属正常；请等待扫描进度条完成。NAS 上已默认 `MB_DISK_PROFILE=nas` 降低并发。
+
+升级容器示例：
+
+```bash
+cd /path/to/media-browser
+git pull
+docker compose up -d --build
+```
+
 ---
 
 ## 环境变量
@@ -72,6 +88,7 @@ docker compose up -d --build
 | `MB_SCAN_WORKERS` | 同时处理「作品」任务的线程数；默认 **2**，减少对机械盘/NAS 并发随机读 | `2`（慢速盘 profile 下更保守） | 同上 |
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；越大越慢、读盘越多 | `5`（慢速盘 profile 下更保守） | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
+| `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
 | `MB_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | 同上 |
 | `MB_LOG_FORMAT` | `text`（默认；终端下彩色）或 `json`（单行 JSON，便于采集） | `text` | 同上 |
 
@@ -277,6 +294,7 @@ Actions 会并行构建：
 |------|------|
 | 扫描根可配 | 页眉路径 +「应用并扫描」、`POST /api/set-scan-root` |
 | macOS NAS 路径 | v1.2.4+：支持 `/Volumes/…`、拒绝 `smb://` 并提示；`/Volumes` 下可触发挂载检测 |
+| 手机 / Docker LAN | v1.2.5+：移动布局、画廊底栏删除、手机默认视频转码、Docker 扫描根只读 |
 | 删本作品 | v1.2.3：`/api/works/delete-all`、画廊 ⌘⇧I |
 | 废纸篓与画廊删除 | v1.2.1–1.2.2：失败入队、删失败仍翻页 |
 | 退出 | 页眉「退出应用」、`POST /api/shutdown` |

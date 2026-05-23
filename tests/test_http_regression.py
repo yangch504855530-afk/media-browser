@@ -42,6 +42,7 @@ def _build_homepage_bytes() -> bytes:
         mb.HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(mb.get_scan_root()))
         .replace("__THUMB_COUNT__", str(mb.THUMB_COUNT))
         .replace("__APP_VERSION__", html_mod.escape(mb.APP_VERSION))
+        .replace("__MB_SCAN_READONLY__", "true" if mb.scan_root_readonly() else "false")
     )
     return page.encode("utf-8")
 
