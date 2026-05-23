@@ -62,3 +62,48 @@ def test_tags_to_chinese_sentence():
     assert mb._tags_to_chinese_sentence([]) == ""
     assert mb._tags_to_chinese_sentence(["海浪"]) == "海浪。"
     assert mb._tags_to_chinese_sentence(["a", "b"]) == "a、b。"
+
+
+def test_ffmpeg_hw_configured(monkeypatch):
+    monkeypatch.delenv("MB_FFMPEG_HW", raising=False)
+    assert mb._ffmpeg_hw_configured() == "off"
+    monkeypatch.setenv("MB_FFMPEG_HW", "auto")
+    mb._invalidate_ffmpeg_hw_cache()
+    assert mb._ffmpeg_hw_configured() == "auto"
+    monkeypatch.setenv("MB_FFMPEG_HW", "bogus")
+    mb._invalidate_ffmpeg_hw_cache()
+    assert mb._ffmpeg_hw_configured() == "off"
+
+
+def test_resolve_ffmpeg_hw_off(monkeypatch):
+    monkeypatch.setenv("MB_FFMPEG_HW", "off")
+    mb._invalidate_ffmpeg_hw_cache()
+    hw = mb.resolve_ffmpeg_hw()
+    assert hw["configured"] == "off"
+    assert hw["active"] == "off"
+    assert hw["available"] is False
+
+
+def test_resolve_ffmpeg_hw_auto_without_device(monkeypatch):
+    monkeypatch.setenv("MB_FFMPEG_HW", "auto")
+    monkeypatch.setattr(mb, "_ffmpeg_vaapi_device_path", lambda: None)
+    monkeypatch.setattr(mb, "_ffmpeg_has_encoder", lambda _e: True)
+    mb._invalidate_ffmpeg_hw_cache()
+    hw = mb.resolve_ffmpeg_hw()
+    assert hw["active"] == "off"
+    assert hw["available"] is False
+    assert hw["error"] is None
+
+
+def test_ffmpeg_build_transcode_cmd_vaapi():
+    cmd = mb._ffmpeg_build_transcode_cmd(
+        "/src.avi",
+        "/out.mp4",
+        has_audio=True,
+        hw_mode="vaapi",
+        vaapi_device="/dev/dri/renderD128",
+        for_pipe=False,
+    )
+    assert "-vaapi_device" in cmd
+    assert "h264_vaapi" in cmd
+    assert cmd[-1] == "/out.mp4"

@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.2.5**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.3.0**，发版前请与打包配置核对）。
 
 ---
 
@@ -58,9 +58,10 @@ docker compose up -d --build
 
 1. 确保手机与 NAS **同一 WiFi**。
 2. 浏览器打开 **`http://<NAS局域网IP>:8765`**（例如 `http://192.168.1.10:8765`）。
-3. **v1.2.5+** 已针对手机优化：精简页眉、底部「作品 / 画廊 / 更多」、画廊底栏（上一张 / 保留 / 删除 / 删作品 / 下一张）；视频在手机上**默认走转码**（更耗 NAS CPU，兼容性更好）。
-4. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
-5. 大库首屏较慢属正常；请等待扫描进度条完成。NAS 上已默认 `MB_DISK_PROFILE=nas` 降低并发。
+3. **v1.3.0+** 手机播放：mp4/mov 等走 **/file 直出**（手机硬解）；avi/mkv 等走 **/api/play-ready** 异步转码缓存后再播；画廊打开时隐藏底栏、支持「关闭」按钮。
+4. **v1.3.0+ Docker NAS**：页眉 **媒体库下拉**（`MB_SCAN_PRESETS`）切换扫描根；Intel 核显 **VAAPI 硬转**（`MB_FFMPEG_HW=auto`，需 compose 挂载 `/dev/dri` + `group_add render`）。
+5. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
+6. 大库首屏较慢属正常；请等待扫描进度条完成。NAS 上已默认 `MB_DISK_PROFILE=nas` 降低并发。
 
 升级容器示例：
 
@@ -89,6 +90,10 @@ docker compose up -d --build
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；越大越慢、读盘越多 | `5`（慢速盘 profile 下更保守） | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
 | `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
+| `MB_SCAN_PRESETS` | 媒体库白名单：`路径\|标签;路径\|标签`；设后页眉为下拉切换，默认不自动扫描 | 未设置 | 同上 |
+| `MB_AUTO_SCAN` | 启动时是否立即扫描（设 `MB_SCAN_PRESETS` 时默认 `0`） | 见说明 | 同上 |
+| `MB_FFMPEG_HW` | 播放转码硬件加速：`off` / `auto` / `vaapi` / `qsv`（Docker 可设 `auto`） | `off` | 同上 |
+| `MB_FFMPEG_VAAPI_DEVICE` | VAAPI 设备路径 | `/dev/dri/renderD128` 或首个 `renderD*` | 同上 |
 | `MB_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | 同上 |
 | `MB_LOG_FORMAT` | `text`（默认；终端下彩色）或 `json`（单行 JSON，便于采集） | `text` | 同上 |
 
@@ -294,7 +299,8 @@ Actions 会并行构建：
 |------|------|
 | 扫描根可配 | 页眉路径 +「应用并扫描」、`POST /api/set-scan-root` |
 | macOS NAS 路径 | v1.2.4+：支持 `/Volumes/…`、拒绝 `smb://` 并提示；`/Volumes` 下可触发挂载检测 |
-| 手机 / Docker LAN | v1.2.5+：移动布局、画廊底栏删除、手机默认视频转码、Docker 扫描根只读 |
+| 手机 / Docker LAN | v1.3.0+：mp4 手机硬解直出、avi 等 play-ready 缓存转码、媒体库 preset、Intel VAAPI 硬转、画廊关闭 UX |
+| 手机 / Docker LAN（旧） | v1.2.5：移动布局、画廊底栏删除、Docker 扫描根只读 |
 | 删本作品 | v1.2.3：`/api/works/delete-all`、画廊 ⌘⇧I |
 | 废纸篓与画廊删除 | v1.2.1–1.2.2：失败入队、删失败仍翻页 |
 | 退出 | 页眉「退出应用」、`POST /api/shutdown` |

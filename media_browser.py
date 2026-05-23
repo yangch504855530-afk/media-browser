@@ -22,7 +22,11 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_OLLAMA_TIMEOUT  单次请求超时秒数，默认 300
   MB_ANALYZE_FRAME_COUNT  每个视频抽帧送模型，默认 5，范围 2～12
   MB_LOG_LEVEL   日志级别：DEBUG / INFO / WARNING / ERROR（默认 INFO）
-  MB_LOG_FORMAT  日志格式：text（默认，TTY 下彩色）或 json（单行 JSON，便于采集）
+  MB_SCAN_ROOT_READONLY  页眉扫描根只读（Docker 可与 MB_SCAN_PRESETS 配合）
+  MB_SCAN_PRESETS  媒体库白名单，格式 path|标签;path|标签（设此后页眉为下拉切换；默认不自动扫描，MB_AUTO_SCAN=1 可恢复）
+  MB_AUTO_SCAN  启动时是否立即扫描（默认：未设 preset 时为是；设了 MB_SCAN_PRESETS 时为否）
+  MB_FFMPEG_HW  播放转码硬件加速：off | auto | vaapi | qsv（默认 off；Docker 可设 auto）
+  MB_FFMPEG_VAAPI_DEVICE  VAAPI 设备路径（默认 /dev/dri/renderD128 或 renderD*）
 
 完整说明（功能、环境变量、打包、路线图）见项目根目录 README.md。
 """
@@ -51,7 +55,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.3.0"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -190,6 +194,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 _SKIP_SCAN_SUBDIR_NAMES = frozenset({".Trash", ".Trashes"})
 # 浏览器常无法直接播放的封装 → 走 /play 经 ffmpeg 转 H.264 + AAC（分片 MP4）
 PLAY_TRANSCODE_EXTS = frozenset({".avi", ".ts", ".mts", ".m2ts", ".wmv", ".vob", ".flv"})
+# 手机浏览器通常可直接播放（走 /file + Range）；其余格式走 /play 转码
+MOBILE_NATIVE_PLAY_EXTS = frozenset({".mp4", ".m4v", ".mov", ".3gp"})
+PLAY_CACHE_DIR = os.path.join(CACHE_DIR, "play_mp4")
 
 if getattr(sys, "frozen", False):
     os.makedirs(ROOT_DIR, exist_ok=True)
@@ -303,6 +310,22 @@ def video_needs_transcoded_play(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in PLAY_TRANSCODE_EXTS
 
 
+def video_play_needs_transcode(path: str, mobile: bool = False) -> bool:
+    return video_should_use_play_endpoint(path, mobile=mobile)
+
+
+def video_should_use_play_endpoint(path: str, mobile: bool = False) -> bool:
+    """是否应走 GET /play（实时转 H.264）。手机端 mp4/mov 等优先 /file 直出。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in VIDEO_EXTS:
+        return False
+    if ext in PLAY_TRANSCODE_EXTS:
+        return True
+    if mobile and ext not in MOBILE_NATIVE_PLAY_EXTS:
+        return True
+    return False
+
+
 def is_path_under_root(path: str) -> bool:
     """解析后的路径必须位于当前扫描根目录之下（含根目录本身），用于限制 /file、/open、删除。"""
     try:
@@ -327,6 +350,339 @@ if not os.path.exists(PLACEHOLDER):
 # ===================== 工具函数 =====================
 def sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def _play_cache_key(source: str) -> str:
+    rp = os.path.realpath(source)
+    st = os.stat(rp)
+    raw = f"{rp}\n{st.st_mtime_ns}\n{st.st_size}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def play_cache_path(source: str) -> str:
+    key = _play_cache_key(source)
+    return os.path.join(PLAY_CACHE_DIR, key[:2], key + ".mp4")
+
+
+def is_play_cache_file(path: str) -> bool:
+    try:
+        rp = os.path.realpath(path)
+        base = os.path.realpath(PLAY_CACHE_DIR)
+    except OSError:
+        return False
+    if not rp.startswith(base + os.sep):
+        return False
+    return os.path.isfile(rp)
+
+
+def is_servable_file_path(path: str) -> bool:
+    return is_path_under_root(path) or is_play_cache_file(path)
+
+
+_play_transcode_guard = threading.Lock()
+_play_transcode_jobs: dict[str, dict] = {}
+_play_transcode_locks: dict[str, threading.Lock] = {}
+
+
+def _play_job_lock(key: str) -> threading.Lock:
+    with _play_transcode_guard:
+        if key not in _play_transcode_locks:
+            _play_transcode_locks[key] = threading.Lock()
+        return _play_transcode_locks[key]
+
+
+_ffmpeg_hw_lock = threading.Lock()
+_ffmpeg_hw_cached: dict | None = None
+
+
+def _ffmpeg_hw_configured() -> str:
+    raw = (os.environ.get("MB_FFMPEG_HW") or "off").strip().lower()
+    if raw in ("off", "0", "false", "no"):
+        return "off"
+    if raw in ("auto", "vaapi", "qsv"):
+        return raw
+    return "off"
+
+
+def _ffmpeg_vaapi_device_path() -> str | None:
+    env = (os.environ.get("MB_FFMPEG_VAAPI_DEVICE") or "").strip()
+    if env and os.path.exists(env):
+        return env
+    render = "/dev/dri/renderD128"
+    if os.path.exists(render):
+        return render
+    dri = "/dev/dri"
+    if os.path.isdir(dri):
+        try:
+            for name in sorted(os.listdir(dri)):
+                if name.startswith("renderD"):
+                    return os.path.join(dri, name)
+        except OSError:
+            pass
+    return None
+
+
+def _ffmpeg_has_encoder(encoder: str) -> bool:
+    try:
+        r = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return encoder in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _invalidate_ffmpeg_hw_cache() -> None:
+    global _ffmpeg_hw_cached
+    with _ffmpeg_hw_lock:
+        _ffmpeg_hw_cached = None
+
+
+def resolve_ffmpeg_hw() -> dict:
+    """解析 MB_FFMPEG_HW：返回 configured / active / device / available / error。"""
+    global _ffmpeg_hw_cached
+    with _ffmpeg_hw_lock:
+        if _ffmpeg_hw_cached is not None:
+            return dict(_ffmpeg_hw_cached)
+        configured = _ffmpeg_hw_configured()
+        device = _ffmpeg_vaapi_device_path()
+        active = "off"
+        error: str | None = None
+        if configured == "off":
+            pass
+        elif configured in ("auto", "vaapi"):
+            if not device:
+                error = "未找到 /dev/dri/renderD*（Docker 需挂载 devices 与 group_add render）"
+            elif not os.access(device, os.R_OK | os.W_OK):
+                error = f"无法访问 VAAPI 设备 {device}"
+            elif not _ffmpeg_has_encoder("h264_vaapi"):
+                error = "ffmpeg 无 h264_vaapi 编码器（镜像需 intel-media-va-driver）"
+            else:
+                active = "vaapi"
+        elif configured == "qsv":
+            if not _ffmpeg_has_encoder("h264_qsv"):
+                error = "ffmpeg 无 h264_qsv 编码器"
+            else:
+                active = "qsv"
+        if configured == "auto" and active == "off" and error:
+            error = None
+        _ffmpeg_hw_cached = {
+            "configured": configured,
+            "active": active,
+            "device": device if active == "vaapi" else None,
+            "available": active != "off",
+            "error": error,
+        }
+        return dict(_ffmpeg_hw_cached)
+
+
+def _ffmpeg_x264_preset() -> str:
+    return "ultrafast" if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical") else "veryfast"
+
+
+def _ffmpeg_sw_video_encode_args(preset: str) -> list[str]:
+    return [
+        "-c:v", "libx264", "-preset", preset, "-crf", "23",
+        "-profile:v", "baseline", "-level", "3.1",
+        "-pix_fmt", "yuv420p",
+    ]
+
+
+def _ffmpeg_build_transcode_cmd(
+    source: str,
+    dest_or_pipe: str,
+    *,
+    has_audio: bool,
+    hw_mode: str,
+    vaapi_device: str | None,
+    for_pipe: bool,
+) -> list[str]:
+    preset = _ffmpeg_x264_preset()
+    cmd = [FFMPEG_BIN]
+    if not for_pipe:
+        cmd.append("-y")
+    cmd += ["-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "2"]
+    if hw_mode == "vaapi" and vaapi_device:
+        cmd += [
+            "-vaapi_device", vaapi_device,
+            "-fflags", "+genpts", "-err_detect", "ignore_err",
+            "-i", source,
+            "-map", "0:v:0",
+            "-vf", "format=nv12,hwupload",
+            "-c:v", "h264_vaapi",
+            "-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
+            "-profile:v", "66", "-level", "31",
+        ]
+    elif hw_mode == "qsv":
+        cmd += [
+            "-init_hw_device", "qsv=hw",
+            "-filter_hw_device", "hw",
+            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+            "-fflags", "+genpts", "-err_detect", "ignore_err",
+            "-i", source,
+            "-map", "0:v:0",
+            "-c:v", "h264_qsv", "-preset", "veryfast",
+            "-profile:v", "baseline", "-level", "3.1",
+        ]
+    else:
+        cmd += [
+            "-fflags", "+genpts", "-err_detect", "ignore_err",
+            "-i", source,
+            "-map", "0:v:0",
+            *_ffmpeg_sw_video_encode_args(preset),
+        ]
+    if has_audio:
+        cmd += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+    else:
+        cmd += ["-an"]
+    if for_pipe:
+        cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", dest_or_pipe]
+    else:
+        cmd += ["-movflags", "+faststart", "-f", "mp4", dest_or_pipe]
+    return cmd
+
+
+def _ffmpeg_run_transcode(cmd: list[str], *, timeout: int = 7200) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "ffmpeg failed").strip()[:500]
+        raise RuntimeError(err or "ffmpeg failed")
+
+
+def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
+    has_audio = ffprobe_has_audio(source)
+    hw = resolve_ffmpeg_hw()
+    active = hw.get("active") or "off"
+    device = hw.get("device")
+    if active in ("vaapi", "qsv"):
+        cmd = _ffmpeg_build_transcode_cmd(
+            source,
+            dest,
+            has_audio=has_audio,
+            hw_mode=active,
+            vaapi_device=device,
+            for_pipe=False,
+        )
+        try:
+            _ffmpeg_run_transcode(cmd)
+            if os.path.isfile(dest) and os.path.getsize(dest) >= 512:
+                logger.info("play 转码使用 %s（%s）", active, device or "qsv")
+                return
+            raise RuntimeError("转码输出为空或过小")
+        except Exception as e:
+            logger.warning("play 转码 %s 失败，回退 CPU: %s", active, str(e)[:200])
+    cmd = _ffmpeg_build_transcode_cmd(
+        source,
+        dest,
+        has_audio=has_audio,
+        hw_mode="off",
+        vaapi_device=None,
+        for_pipe=False,
+    )
+    _ffmpeg_run_transcode(cmd)
+    if not os.path.isfile(dest) or os.path.getsize(dest) < 512:
+        raise RuntimeError("转码输出为空或过小")
+
+
+def _play_transcode_worker(source: str, key: str) -> None:
+    out = play_cache_path(source)
+    part = out + ".part"
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with _play_job_lock(key):
+            if os.path.isfile(out) and os.path.getsize(out) > 512:
+                st = {"status": "ready", "error": None, "finished": time.monotonic()}
+            else:
+                if os.path.isfile(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                _ffmpeg_transcode_to_mp4(source, part)
+                os.replace(part, out)
+                st = {"status": "ready", "error": None, "finished": time.monotonic()}
+        with _play_transcode_guard:
+            _play_transcode_jobs[key] = st
+    except Exception as e:
+        logger.warning("play 转码失败 %s: %s", source, e)
+        try:
+            if os.path.isfile(part):
+                os.remove(part)
+        except OSError:
+            pass
+        with _play_transcode_guard:
+            _play_transcode_jobs[key] = {
+                "status": "error",
+                "error": str(e)[:500],
+                "finished": time.monotonic(),
+            }
+
+
+def play_ready_payload(source: str) -> dict:
+    """GET /api/play-ready — 异步转码到 play_mp4 缓存，完成后用 /file Range 播放。"""
+    try:
+        rp = os.path.realpath(source)
+    except OSError as e:
+        return {"ok": False, "ready": False, "status": "error", "error": str(e)}
+    if not os.path.isfile(rp) or not is_path_under_root(rp):
+        return {"ok": False, "ready": False, "status": "error", "error": "文件不存在或不在扫描根下"}
+    ext = os.path.splitext(rp)[1].lower()
+    if ext not in VIDEO_EXTS:
+        return {"ok": False, "ready": False, "status": "error", "error": "不是支持的视频格式"}
+    if not video_should_use_play_endpoint(rp, mobile=True):
+        from urllib.parse import quote
+
+        return {
+            "ok": True,
+            "ready": True,
+            "status": "ready",
+            "url": "/file?path=" + quote(rp, safe=""),
+        }
+    fa, fe = _tool_version_ok(FFMPEG_BIN)
+    if not fa:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "error",
+            "error": f"ffmpeg 不可用: {fe or 'missing'}",
+        }
+    cached = play_cache_path(rp)
+    if os.path.isfile(cached) and os.path.getsize(cached) > 512:
+        from urllib.parse import quote
+
+        return {
+            "ok": True,
+            "ready": True,
+            "status": "ready",
+            "url": "/file?path=" + quote(cached, safe=""),
+        }
+    key = _play_cache_key(rp)
+    with _play_transcode_guard:
+        job = _play_transcode_jobs.get(key)
+        if job and job.get("status") == "working":
+            elapsed = int(time.monotonic() - float(job.get("started", time.monotonic())))
+            return {"ok": True, "ready": False, "status": "working", "elapsed": elapsed}
+        if job and job.get("status") == "error":
+            return {
+                "ok": False,
+                "ready": False,
+                "status": "error",
+                "error": job.get("error") or "转码失败",
+            }
+        _play_transcode_jobs[key] = {
+            "status": "working",
+            "error": None,
+            "started": time.monotonic(),
+        }
+        threading.Thread(
+            target=_play_transcode_worker,
+            args=(rp, key),
+            daemon=True,
+        ).start()
+    return {"ok": True, "ready": False, "status": "working", "elapsed": 0}
 
 
 def ensure_placeholder(dst: str):
@@ -907,8 +1263,26 @@ class MediaScanner:
         self.enum_error = None
         self.thread = None
         self._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        self.started = False
+        self.idle = False
+
+    def mark_idle(self):
+        """preset 模式启动时不自动扫描，等待用户在页内选择媒体库。"""
+        with self.lock:
+            self.idle = True
+            self.started = False
+            self.done = True
+            self.works = []
+            self.pending_works = []
+            self._pending_root_files = []
+            self.scanned_dirs = 0
+            self.total_dirs = 0
+            self.enum_error = None
 
     def start(self):
+        self.idle = False
+        self.started = True
+        self.done = False
         self._enumerate()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -1137,15 +1511,31 @@ class MediaScanner:
 
     def get_progress(self, since: int = 0):
         with self.lock:
-            return {
-                "scanned": self.scanned_dirs,
-                "total": self.total_dirs,
-                "done": self.done,
-                "works": self.works[since:],
-                "next_since": len(self.works),
-                "enum_error": self.enum_error,
-                "scan_root": get_scan_root(),
-            }
+            if self.idle and not self.started:
+                body = {
+                    "scanned": 0,
+                    "total": 0,
+                    "done": True,
+                    "idle": True,
+                    "works": [],
+                    "next_since": 0,
+                    "enum_error": None,
+                    "scan_root": get_scan_root(),
+                }
+            else:
+                body = {
+                    "scanned": self.scanned_dirs,
+                    "total": self.total_dirs,
+                    "done": self.done,
+                    "idle": False,
+                    "works": self.works[since:],
+                    "next_since": len(self.works),
+                    "enum_error": self.enum_error,
+                    "scan_root": get_scan_root(),
+                }
+            if scan_presets_enabled():
+                body["scan_presets"] = get_scan_presets()
+            return body
 
 
 def _normalize_scan_path_input(s: str) -> str:
@@ -1259,6 +1649,9 @@ def replace_scan_root(new_root: str) -> bool:
         if err:
             logger.warning("扫描根目录无效: %s", err)
         return False
+    if scan_presets_enabled() and not is_scan_root_in_presets(p):
+        logger.warning("扫描根不在 MB_SCAN_PRESETS 白名单: %s", p)
+        return False
     _scan_root = p
     prof = _apply_perf_profile_for_scan_root(_scan_root)
     logger.info(
@@ -1276,6 +1669,120 @@ def replace_scan_root(new_root: str) -> bool:
     except Exception:
         pass
     return True
+
+
+_SCAN_PRESETS: list[dict] = []
+
+
+def parse_scan_presets_env() -> list[tuple[str, str]]:
+    raw = os.environ.get("MB_SCAN_PRESETS", "").strip()
+    if not raw:
+        return []
+    out: list[tuple[str, str]] = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "|" in part:
+            path_part, label = part.split("|", 1)
+        else:
+            path_part, label = part, os.path.basename(part.rstrip("/")) or part
+        path_part = path_part.strip()
+        label = (label or path_part).strip()
+        if path_part:
+            out.append((path_part, label))
+    return out
+
+
+def build_scan_presets() -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    for raw_path, label in parse_scan_presets_env():
+        p, err = resolve_scan_root_path(raw_path)
+        if not p:
+            logger.warning("MB_SCAN_PRESETS 无效项「%s」: %s", raw_path, err or "路径不可访问")
+            continue
+        key = os.path.normcase(os.path.realpath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"path": p, "label": label or p})
+    return items
+
+
+def scan_presets_enabled() -> bool:
+    return bool(_SCAN_PRESETS)
+
+
+def get_scan_presets() -> list[dict]:
+    return list(_SCAN_PRESETS)
+
+
+def is_scan_root_in_presets(path: str) -> bool:
+    if not scan_presets_enabled():
+        return True
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return False
+    for item in _SCAN_PRESETS:
+        try:
+            if os.path.realpath(item["path"]) == rp:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def preset_reject_reason(raw: str) -> str | None:
+    if not scan_presets_enabled():
+        return None
+    p, err = resolve_scan_root_path(raw)
+    if not p:
+        return err or "路径不存在或不是文件夹"
+    if not is_scan_root_in_presets(p):
+        return "该路径不在已配置的媒体库列表中"
+    return None
+
+
+def should_auto_scan_on_startup() -> bool:
+    if scan_presets_enabled():
+        return os.environ.get("MB_AUTO_SCAN", "").strip().lower() in (
+            "1",
+            "yes",
+            "true",
+            "on",
+        )
+    return True
+
+
+def bootstrap_scan_configuration() -> None:
+    global _scan_root, _SCAN_PRESETS
+    _SCAN_PRESETS = build_scan_presets()
+    if scan_presets_enabled():
+        env_root = os.environ.get("MB_ROOT_DIR") or ROOT_DIR
+        p, _ = resolve_scan_root_path(str(env_root))
+        allowed = {os.path.realpath(x["path"]) for x in _SCAN_PRESETS}
+        if p and os.path.realpath(p) in allowed:
+            _scan_root = p
+        else:
+            _scan_root = _SCAN_PRESETS[0]["path"]
+            if p:
+                logger.warning(
+                    "MB_ROOT_DIR=%s 不在 MB_SCAN_PRESETS 中，已使用 %s",
+                    env_root,
+                    _scan_root,
+                )
+        logger.info(
+            "媒体库 preset 共 %s 个：%s",
+            len(_SCAN_PRESETS),
+            "；".join(f"{x['label']}({x['path']})" for x in _SCAN_PRESETS),
+        )
+    else:
+        _scan_root = os.path.realpath(os.path.abspath(os.path.expanduser(ROOT_DIR)))
+
+
+bootstrap_scan_configuration()
 
 
 scanner = MediaScanner()
@@ -1343,6 +1850,8 @@ def build_health_payload() -> tuple[dict, int]:
     prog = scanner.get_progress(0)
     if prog.get("enum_error"):
         scan_state = "error"
+    elif prog.get("idle"):
+        scan_state = "awaiting_scan"
     elif not prog.get("done"):
         scan_state = "scanning"
     else:
@@ -1353,11 +1862,14 @@ def build_health_payload() -> tuple[dict, int]:
         "scanned": prog.get("scanned"),
         "total": prog.get("total"),
         "works_ready": len(scanner.works),
+        "scan_root": get_scan_root(),
     }
+    if scan_presets_enabled():
+        scan["presets"] = get_scan_presets()
 
     fa, fe = _tool_version_ok(FFMPEG_BIN)
     pa, pe = _tool_version_ok(FFPROBE_BIN)
-    ffmpeg = {"available": fa, "binary": FFMPEG_BIN, "error": fe}
+    ffmpeg = {"available": fa, "binary": FFMPEG_BIN, "error": fe, "hw": resolve_ffmpeg_hw()}
     ffprobe = {"available": pa, "binary": FFPROBE_BIN, "error": pe}
 
     oh, om, _ofr, _oto = _ollama_config()
@@ -2111,34 +2623,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_transcoded_mp4(self, fpath: str):
         has_audio = ffprobe_has_audio(fpath)
-        cmd = [
-            FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
-            "-nostdin", "-threads", "2",
-            "-i", fpath,
-            "-map", "0:v:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-        ]
-        if has_audio:
-            cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
-        else:
-            cmd += ["-an"]
-        cmd += [
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4", "pipe:1",
-        ]
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        hw = resolve_ffmpeg_hw()
+        active = hw.get("active") or "off"
+        device = hw.get("device")
+        cmd = _ffmpeg_build_transcode_cmd(
+            fpath,
+            "pipe:1",
+            has_audio=has_audio,
+            hw_mode=active if active in ("vaapi", "qsv") else "off",
+            vaapi_device=device,
+            for_pipe=True,
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
         )
         try:
+            first = proc.stdout.read(65536) if proc.stdout else b""
+            if not first:
+                err = (proc.stderr.read(800) if proc.stderr else b"").decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                logger.warning("转码无输出 %s: %s", fpath, err or "empty stdout")
+                self.send_error(502, "transcode failed")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(first)
             while True:
                 chunk = proc.stdout.read(131072)
                 if not chunk:
@@ -2153,6 +2669,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             try:
                 proc.wait(timeout=5)
+            except Exception:
+                pass
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
             except Exception:
                 pass
 
@@ -2230,6 +2751,7 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/":
+            presets_json = json.dumps(get_scan_presets(), ensure_ascii=False)
             page = (
                 HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(get_scan_root()))
                 .replace("__THUMB_COUNT__", str(THUMB_COUNT))
@@ -2238,6 +2760,11 @@ class Handler(BaseHTTPRequestHandler):
                     "__MB_SCAN_READONLY__",
                     "true" if scan_root_readonly() else "false",
                 )
+                .replace(
+                    "__MB_SCAN_PRESET_MODE__",
+                    "true" if scan_presets_enabled() else "false",
+                )
+                .replace("__MB_SCAN_PRESETS_JSON__", presets_json)
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2343,13 +2870,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
 
+        elif path == "/api/play-ready":
+            fpath = qs.get("path", [""])[0]
+            fpath = unquote(fpath)
+            self._send_json(play_ready_payload(fpath), no_store=True)
+
         elif path == "/file":
             fpath = qs.get("path", [""])[0]
             fpath = unquote(fpath)
             if (
                 os.path.exists(fpath)
                 and os.path.isfile(fpath)
-                and is_path_under_root(fpath)
+                and is_servable_file_path(fpath)
             ):
                 self._send_file(fpath)
             else:
@@ -2361,8 +2893,17 @@ class Handler(BaseHTTPRequestHandler):
             if not (os.path.isfile(fpath) and is_path_under_root(fpath)):
                 self.send_error(404)
                 return
-            if not video_needs_transcoded_play(fpath):
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext not in VIDEO_EXTS:
                 self.send_error(400)
+                return
+            fa, fe = _tool_version_ok(FFMPEG_BIN)
+            if not fa:
+                self.send_error(503, f"ffmpeg unavailable: {fe or 'missing'}")
+                return
+            cached = play_cache_path(fpath)
+            if os.path.isfile(cached) and os.path.getsize(cached) > 512:
+                self._send_file(cached, "video/mp4")
                 return
             self._stream_transcoded_mp4(fpath)
 
@@ -2505,6 +3046,11 @@ class Handler(BaseHTTPRequestHandler):
             p = data.get("path", "")
             if not isinstance(p, str) or not p.strip():
                 self._send_json({"ok": False, "error": "missing path"}, 400)
+                return
+            preset_err = preset_reject_reason(p)
+            if preset_err:
+                code = 403 if scan_presets_enabled() else 400
+                self._send_json({"ok": False, "error": preset_err}, code)
                 return
             if replace_scan_root(p):
                 self._send_json({"ok": True, "path": get_scan_root()})
@@ -2685,6 +3231,13 @@ header .scan-root-row {
     line-height: 1.35;
 }
 header .scan-root-row label { flex-shrink: 0; }
+header .scan-root-row.mb-scan-hidden { display: none !important; }
+header .mb-scan-root-hint {
+    font-size: 11px;
+    color: #888;
+    line-height: 1.35;
+    margin-top: 2px;
+}
 header #scanRootInput {
     flex: 1;
     min-width: 140px;
@@ -2693,6 +3246,21 @@ header #scanRootInput {
     font-size: 11px;
     padding: 6px 10px;
 }
+header #scanRootPreset {
+    flex: 1;
+    min-width: 140px;
+    max-width: min(480px, 50vw);
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    padding: 6px 10px;
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    color: #eee;
+    border-radius: 6px;
+}
+header #scanRootPreset.mb-hidden { display: none !important; }
+header #scanRootPreset:not(.mb-hidden) { display: block; }
+header #scanRootPreset:focus { outline: none; border-color: #0a84ff; }
 header #applyScanRoot {
     flex-shrink: 0;
     font-size: 12px;
@@ -3738,6 +4306,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     header .scan-root-row.mb-scan-hidden { display: none !important; }
     header .scan-root-row:not(.mb-scan-hidden) { width: 100%; }
     header .scan-root-row:not(.mb-scan-hidden) #scanRootInput { max-width: 100%; font-size: 12px; }
+    header .scan-root-row:not(.mb-scan-hidden) #scanRootPreset { max-width: 100%; font-size: 12px; }
     header #search { display: none; width: 100%; flex: 1 1 100%; order: 20; }
     body.mb-mobile-search-open header #search { display: block; }
     header #sortSelect,
@@ -3778,6 +4347,18 @@ body.batch-open #backToTop.show { bottom: 118px; }
     body.mb-mobile .modal.active .file-info { font-size: 11px; max-height: 2.6em; overflow: hidden; text-overflow: ellipsis; }
     body.mb-mobile .modal.active .modal-body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
     body.mb-mobile .modal.active .modal-main { padding-bottom: calc(52px + env(safe-area-inset-bottom, 0px)); }
+    body.mb-mobile.mb-gallery-open { padding-bottom: 0; }
+    body.mb-mobile.mb-gallery-open .mb-mobile-tabbar { display: none !important; }
+    body.mb-mobile.mb-gallery-open .modal { z-index: 300; }
+    body.mb-mobile.mb-gallery-open .modal-close {
+        top: calc(8px + env(safe-area-inset-top, 0px));
+        right: 12px;
+        z-index: 320;
+        width: 44px;
+        height: 44px;
+        font-size: 32px;
+        background: rgba(0,0,0,0.35);
+    }
     .mb-gallery-bar {
         display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 260;
         height: calc(52px + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -3807,8 +4388,9 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <div class="brand">
         <h1>📁 Media Browser <span class="app-ver">v__APP_VERSION__</span></h1>
         <div class="scan-root-row" id="scanRootRow" title="可填写本机任意目录；无需重启。启动默认仍可由 MB_ROOT_DIR 决定。">
-            <label for="scanRootInput">扫描根目录</label>
+            <label for="scanRootInput" id="scanRootLabel">扫描根目录</label>
             <input type="text" id="scanRootInput" value="__MB_ROOT_DIR__" spellcheck="false" autocomplete="off" title="NAS 请先用 Finder（⌘K）挂载，再填 /Volumes/共享名/子路径；不要填 smb:// 地址" placeholder="/Volumes/你的NAS/文件夹" />
+            <select id="scanRootPreset" class="mb-hidden" aria-hidden="true" title="在 docker-compose 配置的媒体库之间切换"></select>
             <button type="button" id="applyScanRoot">应用并扫描</button>
         </div>
     </div>
@@ -3862,6 +4444,11 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button data-filter="video">有视频</button>
             <button data-filter="image">有图片</button>
             <button data-filter="pending">仅待审</button>
+        </div>
+        <div id="mbDrawerScanRootBlock" class="mb-drawer-scan-root" style="display:none">
+            <label for="scanRootPresetDrawer">媒体库</label>
+            <select id="scanRootPresetDrawer"></select>
+            <button type="button" id="applyScanRootDrawer" class="primary" style="margin-top:8px;width:100%">切换并扫描</button>
         </div>
         <div class="mb-mobile-drawer-actions">
             <button type="button" id="mbDrawerResetReview">标记全重置</button>
@@ -3953,6 +4540,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 </nav>
 
 <nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
+    <button type="button" id="mbGalClose" title="关闭">关闭</button>
     <button type="button" id="mbGalPrev" title="上一个">◀</button>
     <button type="button" id="mbGalReview" class="mb-primary">保留</button>
     <button type="button" id="mbGalDelete" class="mb-danger">删除</button>
@@ -4028,6 +4616,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <script>
 const THUMB_COUNT = __THUMB_COUNT__;
 const MB_SCAN_READONLY = (__MB_SCAN_READONLY__ === true || String(__MB_SCAN_READONLY__) === 'true');
+const MB_SCAN_PRESET_MODE = (__MB_SCAN_PRESET_MODE__ === true || String(__MB_SCAN_PRESET_MODE__) === 'true');
+const MB_SCAN_PRESETS = __MB_SCAN_PRESETS_JSON__;
 function mbDetectMobile() {
     return window.matchMedia('(max-width: 767px)').matches
         || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
@@ -4102,6 +4692,7 @@ let sidebarOffset = 0;
 let sidebarLimit = 40;
 let lastEnumError = null;
 let scanPollDone = false;
+let scanIdle = false;
 let pollGen = 0;
 let activeTab = 'review';
 let insightTaskId = null;
@@ -4333,13 +4924,62 @@ async function mbTrashRetryAllAction() {
 }
 
 const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob','.flv']);
+/** 手机可原生播放的封装 → /file Range 直出（iOS 对 /play pipe fMP4 极不稳定） */
+const MOBILE_NATIVE_VIDEO_EXTS = new Set(['.mp4','.m4v','.mov','.3gp']);
 function buildVideoPlayUrl(filePath) {
     const i = filePath.lastIndexOf('.');
     const ext = i >= 0 ? filePath.slice(i).toLowerCase() : '';
-    if (mbMobile || TRANSCODE_VIDEO_EXTS.has(ext)) {
+    if (videoNeedsTranscodePlay(filePath)) {
         return '/play?path=' + encodeURIComponent(filePath);
     }
     return '/file?path=' + encodeURIComponent(filePath);
+}
+function videoNeedsTranscodePlay(filePath) {
+    const i = filePath.lastIndexOf('.');
+    const ext = i >= 0 ? filePath.slice(i).toLowerCase() : '';
+    if (TRANSCODE_VIDEO_EXTS.has(ext)) return true;
+    if (mbMobile && !MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return true;
+    return false;
+}
+async function prepareGalleryVideo(filePath, videoEl, overlayEl) {
+    if (!videoEl || !overlayEl) return;
+    overlayEl.style.display = 'flex';
+    const t0 = Date.now();
+    for (;;) {
+        try {
+            const res = await fetch('/api/play-ready?path=' + encodeURIComponent(filePath), { cache: 'no-store' });
+            const data = await res.json();
+            if (data.ready && data.url) {
+                videoEl.src = data.url;
+                return;
+            }
+            if (!data.ok || data.status === 'error') {
+                overlayEl.textContent = data.error || '转码失败';
+                overlayEl.style.display = 'flex';
+                return;
+            }
+            const sec = (data.elapsed != null) ? data.elapsed : Math.floor((Date.now() - t0) / 1000);
+            overlayEl.textContent = (mbMobile ? '手机端转码中' : '正在转码') + '… ' + sec + 's';
+        } catch (e) {
+            showGalleryVideoError(overlayEl);
+            return;
+        }
+        await new Promise(function (r) { setTimeout(r, 1500); });
+    }
+}
+function showGalleryVideoError(ov) {
+    if (!ov) return;
+    fetch('/health').then(r => r.json()).then((h) => {
+        if (h && h.ffmpeg && h.ffmpeg.available === false) {
+            ov.textContent = '播放失败：服务端 ffmpeg 不可用（' + (h.ffmpeg.error || '请检查 Docker 镜像') + '）';
+        } else {
+            ov.textContent = '播放失败：请检查网络、文件格式或 NAS 磁盘是否可读';
+        }
+        ov.style.display = 'flex';
+    }).catch(() => {
+        ov.textContent = '播放失败（可在 /health 查看 ffmpeg 状态）';
+        ov.style.display = 'flex';
+    });
 }
 window.insightRowThumbError = function(ev) {
     const img = ev && ev.target;
@@ -5272,6 +5912,13 @@ function refreshEmptyHint(filteredCount) {
             + '<li>关闭后使用 <code>MB_ROOT_DIR=/正确路径</code> 再启动</li></ul>';
         return;
     }
+    if (scanIdle && allWorks.length === 0) {
+        el.style.display = 'block';
+        el.className = 'empty-hint';
+        el.innerHTML = '<h2>尚未开始扫描</h2><p>请在页眉选择<strong>媒体库</strong>，点击「切换并扫描」。</p>'
+            + '<p style="margin-top:10px;color:#777;font-size:12px;">Docker 可在 <code>MB_SCAN_PRESETS</code> 中配置可选库。</p>';
+        return;
+    }
     if (!scanPollDone) {
         el.style.display = 'none';
         el.innerHTML = '';
@@ -5501,10 +6148,19 @@ async function poll() {
         const data = await res.json();
         if (myGen !== pollGen) return;
         since = data.next_since;
+        scanIdle = !!data.idle;
         if (data.enum_error) lastEnumError = data.enum_error;
         if (data.scan_root) {
-            const inp = document.getElementById('scanRootInput');
-            if (inp && document.activeElement !== inp) inp.value = data.scan_root;
+            mbSyncScanRootUi(data.scan_root);
+        }
+        if (data.idle) {
+            progressFill.style.width = '0%';
+            progressFill.style.background = '';
+            scanPollDone = true;
+            statusEl.textContent = '请选择媒体库并点击「切换并扫描」';
+            sortAndRenderAll();
+            mbSyncMobileStatusText();
+            return;
         }
         const pct = data.total > 0 ? (data.scanned / data.total * 100) : 0;
         progressFill.style.width = pct + '%';
@@ -5558,6 +6214,7 @@ function openGallery(workId, itemIdx, thumbIdx) {
     sidebarLimit = work.items.length > 80 ? 40 : work.items.length;
     renderGallery();
     document.getElementById('modal').classList.add('active');
+    document.body.classList.add('mb-gallery-open');
     document.body.style.overflow = 'hidden';
 }
 
@@ -5574,21 +6231,23 @@ function renderGallery() {
     const url = item.type === 'video' ? buildVideoPlayUrl(item.path) : buildFileUrl(item.path);
 
     if (item.type === 'video') {
-        const needsTc = url.indexOf('/play?') >= 0;
+        const needsTc = videoNeedsTranscodePlay(item.path);
         const overlayHtml = needsTc
             ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在转码，请稍候…') + '</div>'
-            : '';
-        mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" src="${url}" controls preload="metadata" playsinline></video></div>`;
+            : '<div id="transcodeOverlay" class="transcode-overlay" style="display:none"></div>';
+        mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" controls preload="metadata" playsinline webkit-playsinline></video></div>`;
         const v = document.getElementById('galleryVideo');
         const ov = document.getElementById('transcodeOverlay');
-        if (needsTc && v && ov) {
+        if (v && ov) {
             const hideOv = () => { ov.style.display = 'none'; };
             v.addEventListener('playing', hideOv, { once: true });
             v.addEventListener('canplay', hideOv, { once: true });
-            v.addEventListener('error', () => {
-                ov.textContent = '播放失败（请确认已安装 ffmpeg，或打包应用内包含 ffmpeg）';
-                ov.style.display = 'flex';
-            }, { once: true });
+            v.addEventListener('error', () => { showGalleryVideoError(ov); }, { once: true });
+            if (needsTc) {
+                prepareGalleryVideo(item.path, v, ov);
+            } else {
+                v.src = buildVideoPlayUrl(item.path);
+            }
         }
         if (v) {
             v.onended = () => {
@@ -5863,11 +6522,24 @@ async function deleteCurrentItem() {
 }
 
 function closeModal() {
+    const v = document.getElementById('galleryVideo');
+    if (v) {
+        try { v.pause(); } catch (e) {}
+        v.removeAttribute('src');
+        try { v.load(); } catch (e2) {}
+    }
     const modal = document.getElementById('modal');
     modal.classList.remove('active');
     setTimeout(() => { document.getElementById('modalMedia').innerHTML = ''; }, 250);
     document.body.style.overflow = '';
+    document.body.classList.remove('mb-gallery-open');
+    if (mbMobile && mobileTabbar) {
+        mobileTabbar.querySelectorAll('[data-mtab]').forEach((btn) => {
+            btn.classList.toggle('active', btn.getAttribute('data-mtab') === 'works');
+        });
+    }
     galleryState = { workId: null, itemIdx: 0 };
+    mbSyncMobileStatusText();
 }
 
 function setupImageZoom() {
@@ -6125,10 +6797,104 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
     if (e.target.id === 'modalMain') closeModal();
 });
 
+function mbGetScanRootSwitchPath() {
+    const sel = document.getElementById('scanRootPreset');
+    const inp = document.getElementById('scanRootInput');
+    if (MB_SCAN_PRESET_MODE && MB_SCAN_PRESETS && MB_SCAN_PRESETS.length && sel && !sel.classList.contains('mb-hidden')) {
+        return (sel.value || '').trim();
+    }
+    return inp ? inp.value.trim() : '';
+}
+
+function mbSyncScanRootUi(path) {
+    const inp = document.getElementById('scanRootInput');
+    const sel = document.getElementById('scanRootPreset');
+    const drawerSel = document.getElementById('scanRootPresetDrawer');
+    if (inp && document.activeElement !== inp) inp.value = path;
+    if (sel && document.activeElement !== sel) sel.value = path;
+    if (drawerSel && document.activeElement !== drawerSel) drawerSel.value = path;
+}
+
+function mbFillScanPresetSelect(selectEl, currentPath) {
+    if (!selectEl || !MB_SCAN_PRESETS || !MB_SCAN_PRESETS.length) return;
+    selectEl.innerHTML = '';
+    MB_SCAN_PRESETS.forEach((p) => {
+        const o = document.createElement('option');
+        o.value = p.path;
+        o.textContent = p.label + ' (' + p.path + ')';
+        selectEl.appendChild(o);
+    });
+    if (currentPath) selectEl.value = currentPath;
+}
+
+function mbInitScanPresetUi() {
+    if (!MB_SCAN_PRESET_MODE || !MB_SCAN_PRESETS || !MB_SCAN_PRESETS.length) return;
+    const inp = document.getElementById('scanRootInput');
+    const sel = document.getElementById('scanRootPreset');
+    const lbl = document.getElementById('scanRootLabel');
+    const btn = document.getElementById('applyScanRoot');
+    const row = document.getElementById('scanRootRow');
+    const drawerBlock = document.getElementById('mbDrawerScanRootBlock');
+    const drawerSel = document.getElementById('scanRootPresetDrawer');
+    const cur = inp ? inp.value.trim() : '';
+    if (inp) inp.style.display = 'none';
+    if (lbl) lbl.textContent = '媒体库';
+    if (sel) {
+        sel.classList.remove('mb-hidden');
+        sel.removeAttribute('aria-hidden');
+        mbFillScanPresetSelect(sel, cur);
+    }
+    if (row) row.classList.add('mb-preset-mode');
+    if (btn) btn.textContent = '切换并扫描';
+    if (drawerBlock) drawerBlock.style.display = 'block';
+    if (drawerSel) mbFillScanPresetSelect(drawerSel, cur);
+}
+
+async function mbApplyScanRootSwitch() {
+    const path = mbGetScanRootSwitchPath();
+    if (!path) { alert('请选择媒体库'); return; }
+    try {
+        const res = await fetch('/api/set-scan-root', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path }),
+        });
+        const data = await res.json();
+        if (!data.ok) { alert(data.error || '设置失败'); return; }
+        mbSyncScanRootUi(data.path);
+        pollGen++;
+        since = 0;
+        allWorks = [];
+        scanPollDone = false;
+        scanIdle = false;
+        lastEnumError = null;
+        selectedIds.clear();
+        progressFill.style.width = '0%';
+        progressFill.style.background = '';
+        sortAndRenderAll();
+        poll();
+        mbRefreshTrashBadge(true);
+        mbCloseMobileDrawer();
+    } catch (e) {
+        alert(e.message || String(e));
+    }
+}
+
 (function mbInitShell() {
-    if (MB_SCAN_READONLY) {
+    mbInitScanPresetUi();
+    if (MB_SCAN_READONLY && !MB_SCAN_PRESET_MODE) {
         const row = document.getElementById('scanRootRow');
+        const scanRootInput = document.getElementById('scanRootInput');
+        const path = scanRootInput ? scanRootInput.value.trim() : '';
         if (row) row.classList.add('mb-scan-hidden');
+        const brand = document.querySelector('header .brand');
+        if (brand && path && !document.getElementById('mbScanRootHint')) {
+            const hint = document.createElement('div');
+            hint.id = 'mbScanRootHint';
+            hint.className = 'mb-scan-root-hint';
+            hint.textContent = '扫描根：' + path + ' · Docker 请在 docker-compose.yml 修改 MB_ROOT_DIR / volumes 后重启';
+            brand.appendChild(hint);
+        }
         const applyBtn = document.getElementById('applyScanRoot');
         if (applyBtn) applyBtn.style.display = 'none';
         const drawerExit = document.getElementById('mbDrawerExit');
@@ -6159,11 +6925,13 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
     if (mbDrawerReset) mbDrawerReset.addEventListener('click', () => { resetAllReviewTags(); mbCloseMobileDrawer(); });
     const mbDrawerExit = document.getElementById('mbDrawerExit');
     if (mbDrawerExit) mbDrawerExit.addEventListener('click', () => document.getElementById('exitApp')?.click());
+    const mbGalClose = document.getElementById('mbGalClose');
     const mbGalPrev = document.getElementById('mbGalPrev');
     const mbGalNext = document.getElementById('mbGalNext');
     const mbGalDelete = document.getElementById('mbGalDelete');
     const mbGalDeleteWork = document.getElementById('mbGalDeleteWork');
     const mbGalReview = document.getElementById('mbGalReview');
+    if (mbGalClose) mbGalClose.addEventListener('click', () => closeModal());
     if (mbGalPrev) mbGalPrev.addEventListener('click', () => navigate(-1));
     if (mbGalNext) mbGalNext.addEventListener('click', () => navigate(1));
     if (mbGalDelete) mbGalDelete.addEventListener('click', () => deleteCurrentItem());
@@ -6275,33 +7043,17 @@ document.getElementById('modalMain').addEventListener('click', (e) => {
         });
     }
     if (applyScanRoot && scanRootInput) {
-        applyScanRoot.addEventListener('click', async () => {
-            const path = scanRootInput.value.trim();
-            if (!path) { alert('请输入目录路径'); return; }
-            try {
-                const res = await fetch('/api/set-scan-root', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path }),
-                });
-                const data = await res.json();
-                if (!data.ok) { alert(data.error || '设置失败'); return; }
-                scanRootInput.value = data.path;
-                pollGen++;
-                since = 0;
-                allWorks = [];
-                scanPollDone = false;
-                lastEnumError = null;
-                selectedIds.clear();
-                progressFill.style.width = '0%';
-                progressFill.style.background = '';
-                sortAndRenderAll();
-                poll();
-                mbRefreshTrashBadge(true);
-            } catch (e) {
-                alert(e.message || String(e));
-            }
-        });
+        applyScanRoot.addEventListener('click', () => { mbApplyScanRootSwitch(); });
+    }
+    const applyScanRootDrawer = document.getElementById('applyScanRootDrawer');
+    if (applyScanRootDrawer) {
+        applyScanRootDrawer.addEventListener('click', () => { mbApplyScanRootSwitch(); });
+    }
+    const scanRootPreset = document.getElementById('scanRootPreset');
+    const scanRootPresetDrawer = document.getElementById('scanRootPresetDrawer');
+    if (scanRootPreset && scanRootPresetDrawer) {
+        scanRootPreset.addEventListener('change', () => { scanRootPresetDrawer.value = scanRootPreset.value; });
+        scanRootPresetDrawer.addEventListener('change', () => { scanRootPreset.value = scanRootPresetDrawer.value; });
     }
     const tabReview = document.getElementById('tabReview');
     const tabAnalysis = document.getElementById('tabAnalysis');
@@ -6407,7 +7159,13 @@ def main():
         threading.Thread(target=_open_browser, daemon=True).start()
 
     logger.info("按 Ctrl+C 停止")
-    scanner.start()
+    if should_auto_scan_on_startup():
+        scanner.start()
+    else:
+        scanner.mark_idle()
+        logger.info(
+            "已配置 MB_SCAN_PRESETS，启动时不自动扫描；请在页内选择媒体库后点「切换并扫描」（MB_AUTO_SCAN=1 可恢复启动即扫）"
+        )
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     _http_server = server
 

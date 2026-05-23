@@ -1,14 +1,24 @@
 # Media Browser — Python + ffmpeg/ffprobe（与 media_browser.py 要求一致）
-# 发版时请与仓库内 APP_VERSION（当前 v1.2.5）对齐；镜像 tag 建议 media-browser:1.2.5
+# 发版时请与仓库内 APP_VERSION（当前 v1.3.0）对齐；镜像 tag 建议 media-browser:1.3.0
 FROM python:3.12-slim-bookworm
 
-ARG APP_VERSION=1.2.5
+# NAS / 国内网络构建时 apt 拉 deb.debian.org 易超时，导致「Unable to locate package ffmpeg」。
+# docker compose 默认传 mirrors.aliyun.com；海外直连可：docker compose build --build-arg APT_MIRROR=
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG APP_VERSION=1.3.0
 LABEL org.opencontainers.image.title="Media Browser" \
       org.opencontainers.image.version="${APP_VERSION}"
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    if [ -n "${APT_MIRROR}" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        [ -f "$f" ] || continue; \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" "$f"; \
+      done; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg intel-media-va-driver libva-drm2; \
+    rm -rf /var/lib/apt/lists/*
 
 # 创建非 root 用户（uid=1000），避免缩略图在宿主机上生成 root 权限文件
 RUN groupadd -g 1000 appgroup && \

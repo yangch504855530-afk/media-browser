@@ -2,7 +2,7 @@
 # 内含：media_browser.py、Dockerfile、docker-compose.yml；缩略图缓存在同级的 cache/ 子目录。
 # 在此目录执行：docker compose up -d --build
 #
-# 扫描根在容器内固定为 /scan：下面两个挂载会成为「一级子目录」tmp、torrent。
+# 扫描根在容器内固定为 /scan；MB_SCAN_PRESETS 列出页内可切换的媒体库。
 #
 # 首次建议执行：
 #   mkdir -p "/vol1/1000/handle-pri/media-browser/cache"
@@ -16,16 +16,27 @@
 
 services:
   media-browser:
-    build: .
+    build:
+      context: .
+      args:
+        # 构建阶段 apt 源；若仍失败可改为 mirrors.ustc.edu.cn 或留空 "" 直连 deb.debian.org
+        APT_MIRROR: mirrors.aliyun.com
     image: media-browser:local
     container_name: media-browser
     restart: unless-stopped
     # 如宿主机 UID/GID 不是 1000:1000，请取消下行注释并修改
     # user: "1000:1000"
+    # Intel/AMD 核显硬转：宿主机 getent group render → 填入 group_add（G4600 示例为 105）
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "105"
     ports:
       - "8765:8765"
     environment:
       MB_ROOT_DIR: /scan
+      MB_SCAN_PRESETS: "/scan|全部;/scan/tmp|tmp 审阅;/scan/torrent|自动下载"
+      MB_AUTO_SCAN: "0"
       # 缩略图缓存：宿主机 …/media-browser/cache → 容器 /cache
       MB_CACHE_DIR: /cache
       MB_HOST: "0.0.0.0"
@@ -35,7 +46,8 @@ services:
       MB_SCAN_WORKERS: "1"
       MB_THUMB_COUNT: "2"
       MB_SCAN_ROOT_READONLY: "1"
-      # 可选：MB_AUTO_OPEN=0（容器内无浏览器）
+      # 核显硬转：auto=探测 VAAPI；无 GPU 时自动回退 CPU。宿主机 getent group render → group_add
+      MB_FFMPEG_HW: "auto"
       # 可选：MB_LOG_FORMAT=json
       TZ: Asia/Shanghai
     healthcheck:

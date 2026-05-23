@@ -11,7 +11,8 @@ def test_build_health_payload_has_expected_keys():
     assert "uptime_seconds" in body
     for k in ("disk", "scan", "ffmpeg", "ffprobe", "ollama", "cache"):
         assert k in body
-    assert body["scan"].get("state") in ("idle", "scanning", "error")
+    assert "hw" in body["ffmpeg"]
+    assert body["scan"].get("state") in ("idle", "scanning", "error", "awaiting_scan")
     assert "used_percent" in body["disk"] or "error" in body["disk"]
 
 
