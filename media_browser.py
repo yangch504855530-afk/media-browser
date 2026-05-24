@@ -55,7 +55,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.1"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -683,6 +683,148 @@ def play_ready_payload(source: str) -> dict:
             daemon=True,
         ).start()
     return {"ok": True, "ready": False, "status": "working", "elapsed": 0}
+
+
+_review_state_lock = threading.Lock()
+
+
+def _review_state_store_path(scan_root: str | None = None) -> str:
+    root = os.path.realpath(scan_root or get_scan_root())
+    key = sha256_str(root)
+    review_dir = os.path.join(CACHE_DIR, "review")
+    os.makedirs(review_dir, exist_ok=True)
+    return os.path.join(review_dir, f"{key}.json")
+
+
+def empty_review_state(scan_root: str | None = None) -> dict:
+    root = os.path.realpath(scan_root or get_scan_root())
+    return {
+        "version": 1,
+        "scan_root": root,
+        "updated_at": None,
+        "global": {
+            "last_work_id": None,
+            "last_item_path": None,
+            "last_opened_at": None,
+        },
+        "works": {},
+    }
+
+
+def load_review_state(scan_root: str | None = None) -> dict:
+    path = _review_state_store_path(scan_root)
+    with _review_state_lock:
+        if not os.path.isfile(path):
+            return empty_review_state(scan_root)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return empty_review_state(scan_root)
+        if not isinstance(data, dict):
+            return empty_review_state(scan_root)
+        data.setdefault("version", 1)
+        data.setdefault("global", {})
+        data.setdefault("works", {})
+        if not isinstance(data["global"], dict):
+            data["global"] = {}
+        if not isinstance(data["works"], dict):
+            data["works"] = {}
+        data["global"].setdefault("last_work_id", None)
+        data["global"].setdefault("last_item_path", None)
+        data["global"].setdefault("last_opened_at", None)
+        return data
+
+
+def save_review_state(state: dict, scan_root: str | None = None) -> None:
+    path = _review_state_store_path(scan_root)
+    root = os.path.realpath(scan_root or get_scan_root())
+    payload = dict(state)
+    payload["version"] = 1
+    payload["scan_root"] = root
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload.setdefault("global", {})
+    payload.setdefault("works", {})
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    part = path + ".part"
+    with _review_state_lock:
+        with open(part, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(part, path)
+
+
+def review_state_get_payload() -> dict:
+    state = load_review_state()
+    return {
+        "ok": True,
+        "state": state,
+        "store_path": _review_state_store_path(),
+    }
+
+
+def patch_review_state_work(work_id: str, patch: dict) -> dict:
+    if not work_id or not isinstance(work_id, str):
+        return {"ok": False, "error": "invalid work_id"}
+    if not isinstance(patch, dict):
+        return {"ok": False, "error": "invalid patch"}
+    state = load_review_state()
+    works = state.setdefault("works", {})
+    entry = dict(works.get(work_id) or {})
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if "tag" in patch:
+        tag = patch.get("tag")
+        if tag not in ("kept", "pending"):
+            return {"ok": False, "error": "tag must be kept or pending"}
+        entry["tag"] = tag
+        entry["tag_updated_at"] = now
+
+    if "last_item_path" in patch:
+        lip = patch.get("last_item_path")
+        entry["last_item_path"] = lip if isinstance(lip, str) and lip.strip() else None
+        entry["last_opened_at"] = now
+    if "last_item_idx" in patch:
+        try:
+            entry["last_item_idx"] = int(patch["last_item_idx"])
+        except (TypeError, ValueError):
+            pass
+
+    works[work_id] = entry
+    gl = state.setdefault("global", {})
+    if patch.get("update_global", True):
+        gl["last_work_id"] = work_id
+        if "last_item_path" in patch:
+            gl["last_item_path"] = entry.get("last_item_path")
+        gl["last_opened_at"] = now
+
+    save_review_state(state)
+    return {"ok": True, "work_id": work_id, "work": entry, "global": gl}
+
+
+def clear_review_state(scan_root: str | None = None) -> None:
+    path = _review_state_store_path(scan_root)
+    with _review_state_lock:
+        if os.path.isfile(path):
+            os.remove(path)
+
+
+def import_review_tags(tags: dict) -> dict:
+    """合并 {work_id: kept|pending} 到当前 scan_root 审阅账本（仅填空 tag）。"""
+    state = load_review_state()
+    works = state.setdefault("works", {})
+    imported = 0
+    for wid, tag in (tags or {}).items():
+        if not isinstance(wid, str) or tag not in ("kept", "pending"):
+            continue
+        ent = dict(works.get(wid) or {})
+        if ent.get("tag") in ("kept", "pending"):
+            continue
+        ent["tag"] = tag
+        ent["tag_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        works[wid] = ent
+        imported += 1
+    save_review_state(state)
+    return {"ok": True, "imported": imported, "state": state}
 
 
 def ensure_placeholder(dst: str):
@@ -2741,9 +2883,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+    def _read_json_body(self) -> tuple[dict | None, str | None]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, "invalid json"
+        if not isinstance(data, dict):
+            return None, "json body must be object"
+        return data, None
+
+    def do_PATCH(self):
+        parsed = urlparse(self.path)
+        m = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
+        if not m:
+            self.send_error(404)
+            return
+        data, err = self._read_json_body()
+        if err:
+            self._send_json({"ok": False, "error": err}, 400)
+            return
+        self._send_json(patch_review_state_work(m.group(1), data or {}))
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -2874,6 +3042,9 @@ class Handler(BaseHTTPRequestHandler):
             fpath = qs.get("path", [""])[0]
             fpath = unquote(fpath)
             self._send_json(play_ready_payload(fpath), no_store=True)
+
+        elif path == "/api/review-state":
+            self._send_json(review_state_get_payload(), no_store=True)
 
         elif path == "/file":
             fpath = qs.get("path", [""])[0]
@@ -3124,6 +3295,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(result, 400)
                 return
             self._send_json(result)
+            return
+        if parsed.path == "/api/review-state/clear":
+            clear_review_state()
+            self._send_json({"ok": True, "state": empty_review_state()})
+            return
+        if parsed.path == "/api/review-state/import":
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
+                return
+            tags = data.get("tags") if data else {}
+            if not isinstance(tags, dict):
+                self._send_json({"ok": False, "error": "tags must be object"}, 400)
+                return
+            self._send_json(import_review_tags(tags))
             return
         if parsed.path != "/delete":
             self.send_error(404)
@@ -4234,7 +4420,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     .modal-body {
         --mb-gallery-sidebar: 0px;
         --mb-gallery-stage-maxw: min(92vw, calc(100vw - 20px));
-        --mb-gallery-stage-maxh: min(64vh, calc(100vh - 160px));
+        --mb-gallery-stage-maxh: min(58vh, calc(100vh - 180px));
     }
     .modal-sidebar { display: none; }
     .modal-close { right: 12px; }
@@ -4258,6 +4444,26 @@ body.batch-open #backToTop.show { bottom: 118px; }
 .mb-review-secondary-card { max-width: 420px; }
 .mb-hint-title { color: #bbb; font-weight: 600; margin-bottom: 8px; font-size: 14px; }
 .mb-v-spacer { width: 100%; pointer-events: none; flex-shrink: 0; }
+.mb-continue-review {
+    display: block;
+    width: calc(100% - 24px);
+    margin: 10px 12px 4px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: 1px solid #2f5e42;
+    background: linear-gradient(180deg, #1a3324 0%, #142818 100%);
+    color: #8fd9a8;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+    line-height: 1.35;
+}
+.mb-continue-review.mb-hidden { display: none !important; }
+.mb-continue-review:active { opacity: 0.85; }
+@media (max-width: 767px) {
+    .mb-continue-review { font-size: 12px; margin: 8px 10px 4px; width: calc(100% - 20px); }
+}
 .mb-card-ctx {
     position: fixed; z-index: 400; min-width: 200px; background: #1a1a1a; border: 1px solid #3a3a3a; border-radius: 10px;
     box-shadow: 0 12px 40px rgba(0,0,0,0.55); padding: 6px 0; display: none;
@@ -4350,6 +4556,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     body.mb-mobile.mb-gallery-open { padding-bottom: 0; }
     body.mb-mobile.mb-gallery-open .mb-mobile-tabbar { display: none !important; }
     body.mb-mobile.mb-gallery-open .modal { z-index: 300; }
+    body.mb-mobile.mb-gallery-open .modal.active .mb-gallery-bar { display: flex; z-index: 330; }
     body.mb-mobile.mb-gallery-open .modal-close {
         top: calc(8px + env(safe-area-inset-top, 0px));
         right: 12px;
@@ -4360,10 +4567,12 @@ body.batch-open #backToTop.show { bottom: 118px; }
         background: rgba(0,0,0,0.35);
     }
     .mb-gallery-bar {
-        display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 260;
+        display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 330;
         height: calc(52px + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
-        background: rgba(12,12,12,0.96); border-top: 1px solid #333;
+        background: rgba(12,12,12,0.98); border-top: 1px solid #444;
         align-items: stretch; justify-content: space-around; gap: 4px; padding-left: 6px; padding-right: 6px;
+        -webkit-backdrop-filter: blur(8px);
+        backdrop-filter: blur(8px);
     }
     body.mb-mobile .modal.active .mb-gallery-bar { display: flex; }
     .mb-gallery-bar button {
@@ -4410,7 +4619,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button class="active" data-filter="all">全部</button>
         <button data-filter="video">有视频</button>
         <button data-filter="image">有图片</button>
-        <button data-filter="pending">仅待审</button>
+        <button data-filter="pending" title="尚未标记为保留的作品">待审阅</button>
+        <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
@@ -4443,7 +4653,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button class="active" data-filter="all">全部</button>
             <button data-filter="video">有视频</button>
             <button data-filter="image">有图片</button>
-            <button data-filter="pending">仅待审</button>
+            <button data-filter="pending" title="尚未标记为保留的作品">待审阅</button>
+            <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
         </div>
         <div id="mbDrawerScanRootBlock" class="mb-drawer-scan-root" style="display:none">
             <label for="scanRootPresetDrawer">媒体库</label>
@@ -4523,6 +4734,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <div id="container"></div>
 <div id="emptyHint" class="empty-hint" style="display:none;" aria-live="polite"></div>
 <div id="status">准备扫描...</div>
+<button type="button" id="mbContinueReview" class="mb-continue-review mb-hidden" title="从上次审阅位置继续">继续审阅</button>
 </aside>
 <div id="reviewSecondary" class="mb-review-secondary" aria-hidden="true">
 <div class="mb-review-secondary-card">
@@ -4537,15 +4749,6 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <button type="button" data-mtab="works" class="active">作品</button>
 <button type="button" data-mtab="gallery">画廊</button>
 <button type="button" data-mtab="more">更多</button>
-</nav>
-
-<nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
-    <button type="button" id="mbGalClose" title="关闭">关闭</button>
-    <button type="button" id="mbGalPrev" title="上一个">◀</button>
-    <button type="button" id="mbGalReview" class="mb-primary">保留</button>
-    <button type="button" id="mbGalDelete" class="mb-danger">删除</button>
-    <button type="button" id="mbGalDeleteWork" class="mb-danger">删作品</button>
-    <button type="button" id="mbGalNext" title="下一个">▶</button>
 </nav>
 
 <div id="cardCtxMenu" class="mb-card-ctx" role="menu" aria-hidden="true">
@@ -4611,6 +4814,14 @@ body.batch-open #backToTop.show { bottom: 118px; }
             </div>
         </div>
     </div>
+    <nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
+        <button type="button" id="mbGalClose" title="关闭">关闭</button>
+        <button type="button" id="mbGalPrev" title="上一个">◀</button>
+        <button type="button" id="mbGalReview" class="mb-primary">保留</button>
+        <button type="button" id="mbGalDelete" class="mb-danger">删除</button>
+        <button type="button" id="mbGalDeleteWork" class="mb-danger">删作品</button>
+        <button type="button" id="mbGalNext" title="下一个">▶</button>
+    </nav>
 </div>
 
 <script>
@@ -4666,6 +4877,9 @@ let mbLastGalleryWorkId = null;
 let mbThumbIO = null;
 let mbVirtScrollRaf = 0;
 let mbCtxWork = null;
+let mbReviewState = null;
+let mbReviewCheckpointTimer = null;
+let mbReviewImportDone = false;
 
 function mbRic(cb) {
     if (window.requestIdleCallback) requestIdleCallback(cb, { timeout: 900 });
@@ -4991,10 +5205,123 @@ window.insightRowThumbError = function(ev) {
     );
 };
 function getWorkReviewTag(workId) {
+    if (mbReviewState && mbReviewState.works && mbReviewState.works[workId]) {
+        const t = mbReviewState.works[workId].tag;
+        if (t === 'kept' || t === 'pending') return t;
+    }
+    return 'pending';
+}
+function mbGetWorkReviewEntry(workId) {
+    if (!mbReviewState || !mbReviewState.works) return null;
+    return mbReviewState.works[workId] || null;
+}
+function mbApplyReviewWorkLocal(workId, patch) {
+    if (!mbReviewState) mbReviewState = { global: {}, works: {} };
+    if (!mbReviewState.global) mbReviewState.global = {};
+    if (!mbReviewState.works) mbReviewState.works = {};
+    mbReviewState.works[workId] = Object.assign({}, mbReviewState.works[workId] || {}, patch);
+}
+function mbResolveItemIndex(work, itemPath, fallbackIdx) {
+    if (!work || !work.items || !work.items.length) return 0;
+    if (itemPath) {
+        const idx = work.items.findIndex(function (it) { return it.path === itemPath; });
+        if (idx >= 0) return idx;
+    }
+    if (fallbackIdx != null && fallbackIdx >= 0 && fallbackIdx < work.items.length) return fallbackIdx;
+    return 0;
+}
+async function mbPatchReviewWork(workId, patch, debounceMs) {
+    mbApplyReviewWorkLocal(workId, patch);
+    if (patch && patch.update_global !== false) {
+        mbReviewState.global = mbReviewState.global || {};
+        mbReviewState.global.last_work_id = workId;
+        if (patch.last_item_path !== undefined) mbReviewState.global.last_item_path = patch.last_item_path;
+    }
+    mbUpdateContinueReviewUi();
+    const payload = Object.assign({}, patch || {});
+    const send = async function () {
+        try {
+            await fetch('/api/review-state/work/' + encodeURIComponent(workId), {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+        } catch (e) {}
+    };
+    if (debounceMs) {
+        clearTimeout(mbReviewCheckpointTimer);
+        mbReviewCheckpointTimer = setTimeout(send, debounceMs);
+    } else {
+        await send();
+    }
+}
+function mbSaveReviewCheckpoint(workId, itemPath, itemIdx) {
+    mbPatchReviewWork(workId, {
+        last_item_path: itemPath,
+        last_item_idx: itemIdx,
+        update_global: true,
+    }, 350);
+}
+function mbUpdateContinueReviewUi() {
+    const btn = document.getElementById('mbContinueReview');
+    if (!btn) return;
+    const g = mbReviewState && mbReviewState.global;
+    if (!g || !g.last_work_id) {
+        btn.classList.add('mb-hidden');
+        return;
+    }
+    const work = allWorks.find(function (w) { return w.id === g.last_work_id; });
+    if (!work || !work.items || !work.items.length) {
+        btn.classList.add('mb-hidden');
+        return;
+    }
+    const ent = mbGetWorkReviewEntry(g.last_work_id) || {};
+    const lip = g.last_item_path || ent.last_item_path;
+    const idx = mbResolveItemIndex(work, lip, ent.last_item_idx);
+    const item = work.items[idx];
+    btn.textContent = '继续审阅：' + work.name + (item ? ' · ' + item.name : '');
+    btn.classList.remove('mb-hidden');
+}
+function mbContinueReview() {
+    if (!mbReviewState || !mbReviewState.global) return false;
+    const gw = mbReviewState.global.last_work_id;
+    if (!gw) return false;
+    const work = allWorks.find(function (w) { return w.id === gw; });
+    if (!work || !work.items.length) return false;
+    const ent = mbGetWorkReviewEntry(gw) || {};
+    const lip = mbReviewState.global.last_item_path || ent.last_item_path;
+    const idx = mbResolveItemIndex(work, lip, ent.last_item_idx);
+    openGallery(gw, idx, -1, { forceItemIdx: true });
+    return true;
+}
+async function mbLoadReviewState() {
     try {
-        const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
-        return o[workId] === 'kept' ? 'kept' : 'pending';
-    } catch (e) { return 'pending'; }
+        const res = await fetch('/api/review-state', { cache: 'no-store' });
+        const data = await res.json();
+        if (data.ok && data.state) mbReviewState = data.state;
+    } catch (e) {
+        return;
+    }
+    if (!mbReviewImportDone) {
+        mbReviewImportDone = true;
+        try {
+            if (!localStorage.getItem('mb_review_imported_v140')) {
+                const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
+                if (Object.keys(o).length) {
+                    const ir = await fetch('/api/review-state/import', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ tags: o }),
+                    });
+                    const imported = await ir.json();
+                    if (imported.ok && imported.state) mbReviewState = imported.state;
+                }
+                localStorage.setItem('mb_review_imported_v140', '1');
+            }
+        } catch (e) {}
+    }
+    mbUpdateContinueReviewUi();
+    if (allWorks.length) sortAndRenderAll();
 }
 function buildReviewStripHtml(workId) {
     const kept = getWorkReviewTag(workId) === 'kept';
@@ -5004,11 +5331,7 @@ function buildReviewStripHtml(workId) {
     return '<div class="review-strip"><span class="review-tag ' + cls + '">' + txt + '</span>' + btn + '</div>';
 }
 function setWorkReviewTag(workId, tag) {
-    try {
-        const o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}');
-        o[workId] = tag;
-        localStorage.setItem('mb_review_tags', JSON.stringify(o));
-    } catch (e) {}
+    mbPatchReviewWork(workId, { tag: tag, update_global: false }, false);
     const card = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
     if (card) {
         const strip = card.querySelector('.review-strip');
@@ -5042,9 +5365,22 @@ function updateGalleryReviewBtn(workId) {
         galBtn.className = 'mb-primary' + (kept ? ' kept' : '');
     }
 }
-function resetAllReviewTags() {
-    if (!confirm('将所有作品的标记恢复为「待审」？')) return;
+async function resetAllReviewTags() {
+    if (!confirm('将所有作品的标记与审阅进度清空？（不删除媒体文件）')) return;
+    try {
+        const res = await fetch('/api/review-state/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        const data = await res.json();
+        if (data.ok && data.state) mbReviewState = data.state;
+        else mbReviewState = { global: {}, works: {} };
+    } catch (e) {
+        mbReviewState = { global: {}, works: {} };
+    }
     localStorage.removeItem('mb_review_tags');
+    mbUpdateContinueReviewUi();
     sortAndRenderAll();
 }
 function buildThumbUrl(cachePath) {
@@ -5527,13 +5863,12 @@ function clearSelection() {
     document.querySelectorAll('.work-card .chk').forEach(c => c.checked = false);
     updateBatchBar();
 }
-function batchMarkReview(state) {
+async function batchMarkReview(state) {
     const list = Array.from(selectedIds);
     if (list.length === 0) return;
-    let o = {};
-    try { o = JSON.parse(localStorage.getItem('mb_review_tags') || '{}'); } catch (e) {}
-    for (const id of list) { o[id] = state; }
-    localStorage.setItem('mb_review_tags', JSON.stringify(o));
+    for (const id of list) {
+        await mbPatchReviewWork(id, { tag: state, update_global: false }, false);
+    }
     clearSelection();
     sortAndRenderAll();
 }
@@ -5553,7 +5888,23 @@ function workMatchesFilter(w, ft) {
     if (ft === 'video') return w.video_count > 0;
     if (ft === 'image') return w.image_count > 0;
     if (ft === 'pending') return getWorkReviewTag(w.id) !== 'kept';
+    if (ft === 'kept') return getWorkReviewTag(w.id) === 'kept';
     return true;
+}
+function mbFilterReviewLabel() {
+    if (filterType === 'pending') return ' · 待审阅';
+    if (filterType === 'kept') return ' · 已审阅';
+    return '';
+}
+function mbBuildWorksStatusText(listLen, narrowed) {
+    const suffix = mbFilterReviewLabel();
+    if (allWorks.length > 0) {
+        if (narrowed) {
+            return '显示 ' + listLen + ' / 共 ' + allWorks.length + ' 个作品' + suffix;
+        }
+        return '共 ' + listLen + ' 个作品' + suffix;
+    }
+    return '共 0 个作品';
 }
 function workMatchesSearch(w, q) {
     if (!q) return true;
@@ -5937,7 +6288,15 @@ function refreshEmptyHint(filteredCount) {
     if (filteredCount === 0) {
         el.style.display = 'block';
         el.className = 'empty-hint';
-        el.innerHTML = '<h2>当前筛选/搜索下没有结果</h2><p>库中仍有 ' + allWorks.length + ' 个作品，可能被搜索词或「有视频 / 有图片」筛掉了。</p>'
+        let extra = '';
+        if (filterType === 'pending') {
+            extra = '<p>当前没有「待审阅」作品；在画廊中标记为「保留」后会归入「已审阅」。</p>';
+        } else if (filterType === 'kept') {
+            extra = '<p>当前没有「已审阅」（保留）作品；在画廊中点击「保留」即可标记。</p>';
+        } else {
+            extra = '<p>库中仍有 ' + allWorks.length + ' 个作品，可能被搜索词或其它筛选条件隐藏。</p>';
+        }
+        el.innerHTML = '<h2>当前筛选/搜索下没有结果</h2>' + extra
             + '<div class="cta-row"><button type="button" onclick="resetFilters()">恢复全部显示</button>'
             + '<button type="button" class="secondary" onclick="localStorage.clear(); location.reload();">清除本地记录并刷新</button></div>';
         return;
@@ -5969,9 +6328,7 @@ function sortAndRenderAll() {
     if (scanPollDone || allWorks.length > 0) {
         if (allWorks.length > 0) {
             const narrowed = list.length !== allWorks.length || searchInput.value.trim() !== '' || filterType !== 'all';
-            statusEl.textContent = narrowed
-                ? ('显示 ' + list.length + ' / 共 ' + allWorks.length + ' 个作品')
-                : ('共 ' + list.length + ' 个作品');
+            statusEl.textContent = mbBuildWorksStatusText(list.length, narrowed);
         } else {
             statusEl.textContent = '共 0 个作品';
         }
@@ -5986,6 +6343,7 @@ function sortAndRenderAll() {
     } else {
         renderMoreWorks(list);
     }
+    mbUpdateContinueReviewUi();
 }
 
 function renderMoreWorks(list) {
@@ -6200,14 +6558,21 @@ async function poll() {
     }
 }
 
-function openGallery(workId, itemIdx, thumbIdx) {
+function openGallery(workId, itemIdx, thumbIdx, opts) {
     const work = allWorks.find(w => w.id === workId);
     if (!work || !work.items.length) return;
     mbLastGalleryWorkId = workId;
+    let resolvedIdx = itemIdx;
+    if (!(opts && opts.forceItemIdx) && itemIdx === 0 && (thumbIdx === -1 || thumbIdx === undefined)) {
+        const ent = mbGetWorkReviewEntry(workId);
+        if (ent && (ent.last_item_path || ent.last_item_idx != null)) {
+            resolvedIdx = mbResolveItemIndex(work, ent.last_item_path, ent.last_item_idx);
+        }
+    }
     markWorkOpenedKept(workId);
     galleryState = {
         workId,
-        itemIdx: Math.max(0, Math.min(itemIdx, work.items.length - 1)),
+        itemIdx: Math.max(0, Math.min(resolvedIdx, work.items.length - 1)),
         thumbIdx: thumbIdx !== undefined ? thumbIdx : -1
     };
     sidebarOffset = 0;
@@ -6296,6 +6661,7 @@ function renderGallery() {
     const activeEl = fileList.querySelector('.file-item.active');
     if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     preloadAdjacentWorks();
+    mbSaveReviewCheckpoint(work.id, item.path, galleryState.itemIdx);
 }
 
 function renderSidebar(fileList, work, currentItem) {
@@ -6873,6 +7239,7 @@ async function mbApplyScanRootSwitch() {
         progressFill.style.background = '';
         sortAndRenderAll();
         poll();
+        mbLoadReviewState();
         mbRefreshTrashBadge(true);
         mbCloseMobileDrawer();
     } catch (e) {
@@ -6923,6 +7290,11 @@ async function mbApplyScanRootSwitch() {
     if (mbMobileTrashBtn) mbMobileTrashBtn.addEventListener('click', () => mbOpenTrashPanel());
     const mbDrawerReset = document.getElementById('mbDrawerResetReview');
     if (mbDrawerReset) mbDrawerReset.addEventListener('click', () => { resetAllReviewTags(); mbCloseMobileDrawer(); });
+    const mbContinueBtn = document.getElementById('mbContinueReview');
+    if (mbContinueBtn) mbContinueBtn.addEventListener('click', () => { mbContinueReview(); });
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') mbLoadReviewState();
+    });
     const mbDrawerExit = document.getElementById('mbDrawerExit');
     if (mbDrawerExit) mbDrawerExit.addEventListener('click', () => document.getElementById('exitApp')?.click());
     const mbGalClose = document.getElementById('mbGalClose');
@@ -6962,6 +7334,7 @@ async function mbApplyScanRootSwitch() {
                     if (reviewShell) reviewShell.scrollIntoView({ block: 'start' });
                     window.scrollTo({ top: 0, behavior: 'smooth' });
                 } else if (t === 'gallery') {
+                    if (mbContinueReview()) return;
                     const ok = mbLastGalleryWorkId && allWorks.some((x) => x.id === mbLastGalleryWorkId);
                     if (ok) openGallery(mbLastGalleryWorkId, 0, -1);
                     else {
@@ -7103,6 +7476,7 @@ async function mbApplyScanRootSwitch() {
     switchTab('review');
 })();
 
+mbLoadReviewState();
 poll();
 </script>
 </body>
