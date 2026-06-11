@@ -40,6 +40,8 @@ services:
       # 缩略图缓存：宿主机 …/media-browser/cache → 容器 /cache
       MB_CACHE_DIR: /cache
       MB_HOST: "0.0.0.0"
+      # 非本机监听必须设置访问令牌：先执行 export MB_ACCESS_TOKEN='足够长的随机字符串'
+      MB_ACCESS_TOKEN: "${MB_ACCESS_TOKEN:?Set MB_ACCESS_TOKEN before docker compose up}"
       MB_PORT: "8765"
       # 机械盘 / 大库：保守并发与条带帧数（可按观察再调大）
       MB_DISK_PROFILE: nas

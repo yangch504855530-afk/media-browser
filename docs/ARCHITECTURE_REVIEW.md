@@ -1,6 +1,6 @@
 # Media Browser 架构评估（单文件 `media_browser.py`）
 
-> 统计基于仓库当前版本（约 **4624 行**；随功能迭代会与「4418 行」略有出入）。  
+> 统计基于仓库 v1.4.2（约 **7700 行**，其中大部分为内嵌前端模板）。
 > 指标由 `ast` 解析脚本生成，用于相对评估而非绝对审计。
 
 ---
@@ -11,13 +11,13 @@
 
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| **总行数** | ~4624 | 含巨型内嵌 `HTML_PAGE` 模板 |
-| **顶层函数** | **42** | 模块 `body` 内 `def` |
-| **函数定义节点（含类内/嵌套）** | **76** | `ast.walk` 中全部 `FunctionDef` |
+| **总行数** | ~7700 | 含巨型内嵌 `HTML_PAGE` 模板 |
+| **顶层函数** | 持续增长 | 模块 `body` 内 `def` |
+| **函数定义节点（含类内/嵌套）** | **137+** | `ast.walk` 中全部 `FunctionDef` |
 | **类** | **6** | `_JsonLogFormatter`、`_ColorTextFormatter`、`MediaScanner`、`AnalysisTaskManager`、`Handler`、`ThreadedHTTPServer` |
 | **模块级赋值名** | **26**（其中约 **19** 为非双下划线/可视为「配置与全局单例」） | 含 `ROOT_DIR`、`scanner`、`logger` 等 |
-| **单函数最大行数** | **155** | `Handler.do_POST` |
-| **长函数 Top 3** | `do_POST` 155 行、`do_GET` 119 行、`_vision_analyze_video` 82 行 | HTTP 与 AI 路径集中 |
+| **单函数最大行数** | **250+** | `Handler.do_POST` |
+| **长函数热点** | `do_POST`、`do_GET`、内嵌前端函数 | HTTP、前端与 AI 路径集中 |
 
 **内嵌前端**：`HTML_PAGE` 自约 **2092** 行起至文件末尾前，约 **2500+ 行** 的 HTML/CSS/JS 与 Python 同文件，是行数膨胀的主因。
 

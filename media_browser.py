@@ -12,7 +12,9 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_ROOT_DIR  扫描根目录（脚本默认 /Volumes/Untitled/pri；打包 app 默认 ~/Documents/MediaBrowser）。页眉可改路径并点「应用并扫描」
   MB_CACHE_DIR 缩略图缓存目录
   MB_PORT      端口（默认 8765）
-  MB_HOST      监听地址（默认 0.0.0.0；仅本机可设 127.0.0.1）
+  MB_HOST      监听地址（默认 127.0.0.1；局域网访问可设 0.0.0.0，并须设置 MB_ACCESS_TOKEN）
+  MB_ACCESS_TOKEN 局域网访问令牌；绑定非本机地址时必填
+  MB_MAX_BODY_BYTES JSON 请求体上限字节数（默认 1048576）
   MB_AUTO_OPEN 是否启动后自动打开浏览器（打包默认为是；脚本默认为否，设为 1 可开启）
   MB_SCAN_WORKERS   同时处理「作品」任务的线程数（默认 2；机械盘/NAS 建议 1～2）
   MB_THUMB_COUNT    每个视频条带缩略图帧数（默认 5；越大越慢、越伤盘）
@@ -46,16 +48,18 @@ import html as html_mod
 import shutil
 import uuid
 import base64
+import secrets
+import ipaddress
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -99,8 +103,16 @@ else:
         "MB_CACHE_DIR", os.path.expanduser("~/.cache/media-browser/thumbs")
     )
 
-HOST = os.environ.get("MB_HOST", "0.0.0.0")
+HOST = os.environ.get("MB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MB_PORT", "8765"))
+ACCESS_TOKEN = (os.environ.get("MB_ACCESS_TOKEN") or "").strip()
+MAX_BODY_BYTES = _int_env("MB_MAX_BODY_BYTES", 1024 * 1024, 1024, 16 * 1024 * 1024)
+PLAY_CACHE_MAX_BYTES = _int_env(
+    "MB_PLAY_CACHE_MAX_BYTES",
+    20 * 1024 * 1024 * 1024,
+    64 * 1024 * 1024,
+    1024 * 1024 * 1024 * 1024,
+)
 THUMB_WIDTH = 400
 
 # 并发默认 2（原 4）：多任务并行会对 NAS/机械盘产生大量随机寻道；SSD 可用 MB_SCAN_WORKERS=4
@@ -196,7 +208,6 @@ _SKIP_SCAN_SUBDIR_NAMES = frozenset({".Trash", ".Trashes"})
 PLAY_TRANSCODE_EXTS = frozenset({".avi", ".ts", ".mts", ".m2ts", ".wmv", ".vob", ".flv"})
 # 手机浏览器通常可直接播放（走 /file + Range）；其余格式走 /play 转码
 MOBILE_NATIVE_PLAY_EXTS = frozenset({".mp4", ".m4v", ".mov", ".3gp"})
-PLAY_CACHE_DIR = os.path.join(CACHE_DIR, "play_mp4")
 
 if getattr(sys, "frozen", False):
     os.makedirs(ROOT_DIR, exist_ok=True)
@@ -338,6 +349,33 @@ def is_path_under_root(path: str) -> bool:
     return target.startswith(root + os.sep)
 
 
+def _host_requires_access_token(host: str | None = None) -> bool:
+    value = (HOST if host is None else host).strip().lower()
+    return value not in ("127.0.0.1", "localhost", "::1")
+
+
+def _access_token_required() -> bool:
+    return bool(ACCESS_TOKEN) or _host_requires_access_token()
+
+
+def _prune_walk_dirs(dirs: list[str], current_root: str, scan_root: str, seen: set[str]) -> None:
+    """Keep walk traversal inside scan_root and avoid symlink directory loops."""
+    scan_real = os.path.realpath(scan_root)
+    kept: list[str] = []
+    for name in dirs:
+        if name in _SKIP_SCAN_SUBDIR_NAMES:
+            continue
+        real = os.path.realpath(os.path.join(current_root, name))
+        if real != scan_real and not real.startswith(scan_real + os.sep):
+            continue
+        key = os.path.normcase(real)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(name)
+    dirs[:] = kept
+
+
 # 通用占位图
 PLACEHOLDER = os.path.join(CACHE_DIR, "_placeholder.jpg")
 if not os.path.exists(PLACEHOLDER):
@@ -359,15 +397,19 @@ def _play_cache_key(source: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def play_cache_root() -> str:
+    return os.path.join(CACHE_DIR, "play_mp4")
+
+
 def play_cache_path(source: str) -> str:
     key = _play_cache_key(source)
-    return os.path.join(PLAY_CACHE_DIR, key[:2], key + ".mp4")
+    return os.path.join(play_cache_root(), key[:2], key + ".mp4")
 
 
 def is_play_cache_file(path: str) -> bool:
     try:
         rp = os.path.realpath(path)
-        base = os.path.realpath(PLAY_CACHE_DIR)
+        base = os.path.realpath(play_cache_root())
     except OSError:
         return False
     if not rp.startswith(base + os.sep):
@@ -377,6 +419,38 @@ def is_play_cache_file(path: str) -> bool:
 
 def is_servable_file_path(path: str) -> bool:
     return is_path_under_root(path) or is_play_cache_file(path)
+
+
+def prune_play_cache(max_bytes: int | None = None) -> int:
+    """Remove oldest play-ready cache files until the configured size limit is met."""
+    limit = PLAY_CACHE_MAX_BYTES if max_bytes is None else max(0, int(max_bytes))
+    root = play_cache_root()
+    files: list[tuple[float, int, str]] = []
+    total = 0
+    if not os.path.isdir(root):
+        return 0
+    for current, _dirs, names in os.walk(root):
+        for name in names:
+            if not name.endswith(".mp4"):
+                continue
+            path = os.path.join(current, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            total += st.st_size
+            files.append((st.st_mtime, st.st_size, path))
+    removed = 0
+    for _mtime, size, path in sorted(files):
+        if total <= limit:
+            break
+        try:
+            os.remove(path)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 _play_transcode_guard = threading.Lock()
@@ -545,10 +619,19 @@ def _ffmpeg_build_transcode_cmd(
     return cmd
 
 
-def _ffmpeg_run_transcode(cmd: list[str], *, timeout: int = 7200) -> None:
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or "ffmpeg failed").strip()[:500]
+def _ffmpeg_run_transcode(cmd: list[str], source: str, *, timeout: int = 7200) -> None:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _register_ffmpeg_proc(source, proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise
+    finally:
+        _unregister_ffmpeg_proc(source, proc)
+    if proc.returncode != 0:
+        err = (stderr or stdout or "ffmpeg failed").strip()[:500]
         raise RuntimeError(err or "ffmpeg failed")
 
 
@@ -567,7 +650,7 @@ def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
             for_pipe=False,
         )
         try:
-            _ffmpeg_run_transcode(cmd)
+            _ffmpeg_run_transcode(cmd, source)
             if os.path.isfile(dest) and os.path.getsize(dest) >= 512:
                 logger.info("play 转码使用 %s（%s）", active, device or "qsv")
                 return
@@ -582,7 +665,7 @@ def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
         vaapi_device=None,
         for_pipe=False,
     )
-    _ffmpeg_run_transcode(cmd)
+    _ffmpeg_run_transcode(cmd, source)
     if not os.path.isfile(dest) or os.path.getsize(dest) < 512:
         raise RuntimeError("转码输出为空或过小")
 
@@ -591,6 +674,7 @@ def _play_transcode_worker(source: str, key: str) -> None:
     out = play_cache_path(source)
     part = out + ".part"
     try:
+        prune_play_cache()
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with _play_job_lock(key):
             if os.path.isfile(out) and os.path.getsize(out) > 512:
@@ -603,6 +687,9 @@ def _play_transcode_worker(source: str, key: str) -> None:
                         pass
                 _ffmpeg_transcode_to_mp4(source, part)
                 os.replace(part, out)
+                prune_play_cache()
+                if not os.path.isfile(out):
+                    raise RuntimeError("转码文件超过 MB_PLAY_CACHE_MAX_BYTES 缓存上限")
                 st = {"status": "ready", "error": None, "finished": time.monotonic()}
         with _play_transcode_guard:
             _play_transcode_jobs[key] = st
@@ -862,6 +949,77 @@ def remove_media_thumb_cache(media_path: str) -> None:
         pass
 
 
+def remove_media_play_cache(media_path: str) -> None:
+    """Remove the current play-ready cache for a source before deleting it."""
+    try:
+        cached = play_cache_path(media_path)
+        if os.path.isfile(cached):
+            os.remove(cached)
+        parent = os.path.dirname(cached)
+        if os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+    except Exception:
+        pass
+
+
+_active_ffmpeg_procs: dict[str, set[subprocess.Popen]] = {}
+_active_ffmpeg_procs_lock = threading.Lock()
+
+
+def _media_path_key(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _register_ffmpeg_proc(path: str, proc: subprocess.Popen) -> None:
+    key = _media_path_key(path)
+    with _active_ffmpeg_procs_lock:
+        _active_ffmpeg_procs.setdefault(key, set()).add(proc)
+
+
+def _unregister_ffmpeg_proc(path: str, proc: subprocess.Popen) -> None:
+    key = _media_path_key(path)
+    with _active_ffmpeg_procs_lock:
+        procs = _active_ffmpeg_procs.get(key)
+        if not procs:
+            return
+        procs.discard(proc)
+        if not procs:
+            _active_ffmpeg_procs.pop(key, None)
+
+
+def release_media_resources(path: str) -> int:
+    """Stop live transcodes reading path so Windows can delete the media file."""
+    key = _media_path_key(path)
+    with _active_ffmpeg_procs_lock:
+        procs = list(_active_ffmpeg_procs.pop(key, set()))
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    return len(procs)
+
+
+def _safe_remove(path: str) -> None:
+    """Release active readers before remove; retry transient Windows locks."""
+    release_media_resources(path)
+    remove_media_play_cache(path)
+    delays = (0.0, 0.3, 0.5) if sys.platform == "win32" else (0.0,)
+    for idx, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.remove(path)
+            return
+        except PermissionError:
+            if idx == len(delays) - 1:
+                raise
+
+
 _delete_trash_lock = threading.Lock()
 
 
@@ -994,7 +1152,7 @@ def delete_trash_retry_all() -> dict:
             if not os.path.isfile(p) or not is_path_under_root(p):
                 continue
             try:
-                os.remove(p)
+                _safe_remove(p)
                 remove_media_thumb_cache(p)
                 deleted += 1
             except Exception as e:
@@ -1044,7 +1202,7 @@ def delete_trash_delete_selected(paths: list) -> dict:
                     items.pop(idx)
                     break
                 try:
-                    os.remove(canon)
+                    _safe_remove(canon)
                     remove_media_thumb_cache(canon)
                     deleted += 1
                     items.pop(idx)
@@ -1156,7 +1314,7 @@ def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
         if not os.path.isfile(fp):
             continue
         try:
-            os.remove(fp)
+            _safe_remove(fp)
             remove_media_thumb_cache(fp)
             deleted += 1
             deleted_paths.append(fp)
@@ -1430,12 +1588,13 @@ class MediaScanner:
         self.thread.start()
 
     def _enumerate_deep_fallback(self, candidates: list, root_flat: list) -> None:
-        """一级目录未发现媒体时沿整棵树查找（含符号链接目录），按顶层子文件夹分组。"""
+        """一级目录未发现媒体时沿整棵树查找，安全跟随根内符号链接。"""
         scan_root = os.path.realpath(get_scan_root())
         tops_found = set()
+        seen = {os.path.normcase(scan_root)}
         try:
             for wroot, dirs, files in os.walk(scan_root, followlinks=True):
-                dirs[:] = [d for d in dirs if d not in _SKIP_SCAN_SUBDIR_NAMES]
+                _prune_walk_dirs(dirs, wroot, scan_root, seen)
                 for f in files:
                     if f.startswith("._"):
                         continue
@@ -1443,6 +1602,8 @@ class MediaScanner:
                     if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
                         continue
                     fp = os.path.join(wroot, f)
+                    if not is_path_under_root(fp):
+                        continue
                     rel = os.path.relpath(fp, scan_root)
                     parts = rel.split(os.sep)
                     if len(parts) == 1:
@@ -1465,6 +1626,8 @@ class MediaScanner:
         try:
             for entry in os.scandir(get_scan_root()):
                 if entry.is_file():
+                    if not is_path_under_root(entry.path):
+                        continue
                     ext = os.path.splitext(entry.name)[1].lower()
                     if ext in VIDEO_EXTS or ext in IMAGE_EXTS:
                         root_flat.append(entry.path)
@@ -1473,9 +1636,12 @@ class MediaScanner:
                     continue
                 if entry.name in _SKIP_SCAN_SUBDIR_NAMES:
                     continue
+                if not is_path_under_root(entry.path):
+                    continue
                 has_media = False
+                seen = {os.path.normcase(os.path.realpath(entry.path))}
                 for root, dirs, files in os.walk(entry.path, followlinks=True):
-                    dirs[:] = [d for d in dirs if d not in _SKIP_SCAN_SUBDIR_NAMES]
+                    _prune_walk_dirs(dirs, root, get_scan_root(), seen)
                     for f in files:
                         ext = os.path.splitext(f)[1].lower()
                         if ext in VIDEO_EXTS or ext in IMAGE_EXTS:
@@ -1591,6 +1757,8 @@ class MediaScanner:
                 return None
             items = []
             for fpath in paths:
+                if not is_path_under_root(fpath):
+                    continue
                 f = os.path.basename(fpath)
                 if f.startswith("._"):
                     continue
@@ -1620,14 +1788,20 @@ class MediaScanner:
 
     def _process_work(self, work_path: str):
         try:
+            if not is_path_under_root(work_path):
+                return None
             items = []
+            scan_root = os.path.realpath(get_scan_root())
+            seen = {os.path.normcase(os.path.realpath(work_path))}
             for root, dirs, files in os.walk(work_path, followlinks=True):
-                dirs[:] = [d for d in dirs if d not in _SKIP_SCAN_SUBDIR_NAMES]
+                _prune_walk_dirs(dirs, root, scan_root, seen)
                 for f in files:
                     if f.startswith("._"):
                         continue
                     ext = os.path.splitext(f)[1].lower()
                     fpath = os.path.join(root, f)
+                    if not is_path_under_root(fpath):
+                        continue
                     try:
                         fsize = os.path.getsize(fpath)
                     except OSError:
@@ -2763,6 +2937,67 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _is_authorized(self) -> bool:
+        if not _access_token_required():
+            return True
+        if not ACCESS_TOKEN:
+            return False
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], ACCESS_TOKEN):
+            return True
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name == "mb_access_token":
+                return secrets.compare_digest(unquote(value), ACCESS_TOKEN)
+        return False
+
+    def _client_is_loopback(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _host_header_allowed(self) -> bool:
+        if _access_token_required() and ACCESS_TOKEN:
+            return True
+        try:
+            hostname = urlparse("//" + self.headers.get("Host", "")).hostname or ""
+            return hostname.lower() == "localhost" or ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return True
+        if origin == "null":
+            return False
+        return (urlparse(origin).netloc or "").lower() == self.headers.get("Host", "").lower()
+
+    def _require_request_security(self, *, mutating: bool = False) -> bool:
+        if not self._host_header_allowed() or (mutating and not self._origin_allowed()):
+            self._send_json({"ok": False, "error": "request origin rejected"}, 403)
+            return False
+        return self._require_authorized()
+
+    def _require_authorized(self) -> bool:
+        if self._is_authorized():
+            return True
+        self._send_json({"ok": False, "error": "access token required"}, 401)
+        return False
+
+    def _body_too_large(self) -> bool:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json({"ok": False, "error": "invalid content length"}, 400)
+            return True
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._send_json({"ok": False, "error": "request body too large"}, 413)
+            return True
+        return False
+
     def _stream_transcoded_mp4(self, fpath: str):
         has_audio = ffprobe_has_audio(fpath)
         hw = resolve_ffmpeg_hw()
@@ -2782,6 +3017,7 @@ class Handler(BaseHTTPRequestHandler):
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        _register_ffmpeg_proc(fpath, proc)
         try:
             first = proc.stdout.read(65536) if proc.stdout else b""
             if not first:
@@ -2794,7 +3030,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(first)
             while True:
@@ -2802,9 +3037,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
-        except BrokenPipeError:
+        except (BrokenPipeError, ValueError):
             pass
         finally:
+            _unregister_ffmpeg_proc(fpath, proc)
             try:
                 proc.kill()
             except Exception:
@@ -2822,7 +3058,6 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, data, code=200, no_store=False):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         if no_store:
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Pragma", "no-cache")
@@ -2864,7 +3099,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
@@ -2881,13 +3115,11 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        self.send_error(403, "cross-origin requests disabled")
 
     def _read_json_body(self) -> tuple[dict | None, str | None]:
+        if self._body_too_large():
+            return None, "response already sent"
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -2902,6 +3134,8 @@ class Handler(BaseHTTPRequestHandler):
         return data, None
 
     def do_PATCH(self):
+        if not self._require_request_security(mutating=True) or self._body_too_large():
+            return
         parsed = urlparse(self.path)
         m = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
         if not m:
@@ -2918,6 +3152,28 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if not self._host_header_allowed():
+            self._send_json({"ok": False, "error": "request origin rejected"}, 403)
+            return
+        if path == "/" and ACCESS_TOKEN and qs.get("token"):
+            supplied = qs.get("token", [""])[0]
+            if secrets.compare_digest(supplied, ACCESS_TOKEN):
+                self.send_response(303)
+                self.send_header(
+                    "Set-Cookie",
+                    f"mb_access_token={quote(ACCESS_TOKEN, safe='')}; HttpOnly; SameSite=Strict; Path=/",
+                )
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+        if path == "/health" and (
+            not _access_token_required() or self._client_is_loopback() or self._is_authorized()
+        ):
+            payload, code = build_health_payload()
+            self._send_json(payload, code=code, no_store=True)
+            return
+        if not self._require_authorized():
+            return
         if path == "/":
             presets_json = json.dumps(get_scan_presets(), ensure_ascii=False)
             page = (
@@ -2938,10 +3194,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(page.encode("utf-8"))
-
-        elif path == "/health":
-            payload, code = build_health_payload()
-            self._send_json(payload, code=code, no_store=True)
 
         elif path == "/api/progress":
             since = int(qs.get("since", ["0"])[0])
@@ -3030,11 +3282,20 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.startswith("/thumb/"):
             parts = path.split("/")
-            if len(parts) >= 4:
+            if (
+                len(parts) == 4
+                and re.fullmatch(r"[0-9a-fA-F]{16}", parts[2] or "")
+                and re.fullmatch(r"[A-Za-z0-9_.-]+", parts[3] or "")
+                and parts[3] not in (".", "..")
+            ):
                 file_hash = parts[2]
                 idx_name = parts[3]
-                thumb_path = os.path.join(CACHE_DIR, file_hash, idx_name)
-                self._send_file(thumb_path, "image/jpeg")
+                thumb_path = os.path.realpath(os.path.join(CACHE_DIR, file_hash, idx_name))
+                cache_root = os.path.realpath(CACHE_DIR)
+                if thumb_path.startswith(cache_root + os.sep):
+                    self._send_file(thumb_path, "image/jpeg")
+                else:
+                    self.send_error(403)
             else:
                 self.send_error(404)
 
@@ -3101,6 +3362,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._require_request_security(mutating=True) or self._body_too_large():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/shutdown":
             self._send_json({"ok": True})
@@ -3335,7 +3598,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "forbidden"}, 403)
             return
         try:
-            os.remove(fpath)
+            _safe_remove(fpath)
             remove_media_thumb_cache(fpath)
             self._send_json({"ok": True})
         except Exception as e:
@@ -6050,6 +6313,10 @@ async function deleteWorkAllFiles(work) {
     const folderNote = workCanRemoveEmptyFolder(work) ? '；若文件夹已空将一并移除' : '';
     if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件' + folderNote + '，不可恢复。确定？')) return;
     const paths = work.items.map(function (it) { return it.path; });
+    const modal = document.getElementById('modal');
+    if (modal && modal.classList.contains('active') && galleryState.workId === work.id) {
+        releaseGalleryVideoElement();
+    }
     try {
         const res = await fetch('/api/works/delete-all', {
             method: 'POST',
@@ -6071,7 +6338,6 @@ async function deleteWorkAllFiles(work) {
             }
         }
         hideCardCtx();
-        const modal = document.getElementById('modal');
         const inGallery = modal && modal.classList.contains('active') && galleryState.workId === work.id;
         if (work.items.length === 0) {
             const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
@@ -6846,6 +7112,8 @@ async function deleteCurrentItem() {
     if (!work) return;
     const item = work.items[galleryState.itemIdx];
     if (!item) return;
+    if (!confirm('将永久删除「' + item.name + '」，不可恢复。确定？')) return;
+    if (item.type === 'video') releaseGalleryVideoElement();
 
     let deleteOk = false;
     try {
@@ -6887,13 +7155,17 @@ async function deleteCurrentItem() {
     advanceGalleryAfterDeleteAttempt(work, true);
 }
 
-function closeModal() {
+function releaseGalleryVideoElement() {
     const v = document.getElementById('galleryVideo');
     if (v) {
         try { v.pause(); } catch (e) {}
         v.removeAttribute('src');
         try { v.load(); } catch (e2) {}
     }
+}
+
+function closeModal() {
+    releaseGalleryVideoElement();
     const modal = document.getElementById('modal');
     modal.classList.remove('active');
     setTimeout(() => { document.getElementById('modalMedia').innerHTML = ''; }, 250);
@@ -7488,6 +7760,10 @@ poll();
 
 def main():
     global _http_server
+    if _host_requires_access_token() and not ACCESS_TOKEN:
+        raise SystemExit(
+            "MB_ACCESS_TOKEN is required when MB_HOST is not localhost/127.0.0.1/::1"
+        )
     _apply_perf_profile_for_scan_root(get_scan_root())
     auto_open = os.environ.get(
         "MB_AUTO_OPEN",
@@ -7506,12 +7782,9 @@ def main():
             "MB_DISK_PROFILE=%s：已限制并发与缩略图帧数以减轻硬盘负载",
             DISK_PROFILE,
         )
-    logger.info(
-        "监听 %s:%s（本机访问 http://localhost:%s；仅本机请设 MB_HOST=127.0.0.1）",
-        HOST,
-        PORT,
-        PORT,
-    )
+    logger.info("监听 %s:%s（本机访问 http://localhost:%s）", HOST, PORT, PORT)
+    if _access_token_required():
+        logger.info("访问令牌已启用；首次访问使用 /?token=<MB_ACCESS_TOKEN>")
     logger.info("浏览器页眉可点「退出应用」停止服务")
     _oh, _om, _of, _ot = _ollama_config()
     logger.info(
@@ -7528,7 +7801,8 @@ def main():
             import webbrowser
 
             time.sleep(1.0)
-            webbrowser.open(f"http://127.0.0.1:{PORT}/")
+            suffix = f"?token={quote(ACCESS_TOKEN, safe='')}" if _access_token_required() else ""
+            webbrowser.open(f"http://127.0.0.1:{PORT}/{suffix}")
 
         threading.Thread(target=_open_browser, daemon=True).start()
 

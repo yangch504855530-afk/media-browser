@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.1**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.2**，发版前请与打包配置核对）。
 
 ---
 
@@ -53,11 +53,12 @@ docker compose up -d --build
 ```
 
 容器默认以 `uid=1000` 运行。若宿主机 UID 不同，请修改 `docker-compose.yml` 中的 `user` 行（见文件内注释）。
+局域网部署必须先设置访问令牌，例如 `export MB_ACCESS_TOKEN="$(openssl rand -hex 24)"`；首次打开使用 `http://<NAS-IP>:8765/?token=<令牌>`，浏览器会保存受限 Cookie。
 
 ### 手机访问（局域网 WiFi）
 
 1. 确保手机与 NAS **同一 WiFi**。
-2. 浏览器打开 **`http://<NAS局域网IP>:8765`**（例如 `http://192.168.1.10:8765`）。
+2. 首次浏览器打开 **`http://<NAS局域网IP>:8765/?token=<MB_ACCESS_TOKEN>`**；验证后会跳转到不含令牌的首页。
 3. **v1.3.0+** 手机播放：mp4/mov 等走 **/file 直出**（手机硬解）；avi/mkv 等走 **/api/play-ready** 异步转码缓存后再播；画廊打开时隐藏底栏、支持「关闭」按钮。
 4. **v1.3.0+ Docker NAS**：页眉 **媒体库下拉**（`MB_SCAN_PRESETS`）切换扫描根；Intel 核显 **VAAPI 硬转**（`MB_FFMPEG_HW=auto`，需 compose 挂载 `/dev/dri` + `group_add render`）。
 5. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
@@ -84,7 +85,10 @@ docker compose up -d --build
 | `MB_OLLAMA_TIMEOUT` | Ollama 单次请求超时（秒） | `300` | 同上 |
 | `MB_ANALYZE_FRAME_COUNT` | AI 分析时每视频抽帧数（2–12） | `5` | 同上 |
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
-| `MB_HOST` | 监听地址 | `0.0.0.0` | 同上 |
+| `MB_HOST` | 监听地址；非本机地址必须同时设置 `MB_ACCESS_TOKEN` | `127.0.0.1` | 同上 |
+| `MB_ACCESS_TOKEN` | 局域网访问令牌；首次浏览器访问用 `/?token=...`，API 可用 Bearer Token | 未设置 | 同上 |
+| `MB_MAX_BODY_BYTES` | JSON 请求体大小上限 | `1048576` | 同上 |
+| `MB_PLAY_CACHE_MAX_BYTES` | play-ready 转码缓存上限，超限淘汰最旧文件 | `21474836480`（20 GiB） | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |
 | `MB_SCAN_WORKERS` | 同时处理「作品」任务的线程数；默认 **2**，减少对机械盘/NAS 并发随机读 | `2`（慢速盘 profile 下更保守） | 同上 |
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；越大越慢、读盘越多 | `5`（慢速盘 profile 下更保守） | 同上 |
@@ -119,14 +123,14 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **一级子文件夹**：枚举**当前扫描根**下的一级目录；其内**任意深度**出现支持的图片/视频扩展名，即为一个「作品」。
 - **根目录平铺**：媒体文件若直接躺在扫描根下（无子文件夹），会合并为虚拟作品「**根目录内的媒体（未放入子文件夹）**」。
 - **页眉切换路径**：「扫描根目录」输入本机路径（支持 `~`，并对弯引号等做规范化）→「**应用并扫描**」→ 无需重启即可换目录并重扫。`MB_ROOT_DIR` 仅决定**启动时**默认根目录。
-- **发现能力**：目录遍历对指向文件夹的**符号链接**会跟随（`followlinks`）；一级枚举无结果时有**整树兜底**分组；跳过 `.Trash` / `.Trashes`；支持常见扩展名（含 **`.mts`** 等）。
+- **发现能力**：目录遍历会安全跟随仍位于扫描根内的**符号链接**，跳过越界链接并检测循环；一级枚举无结果时有**整树兜底**分组；跳过 `.Trash` / `.Trashes`；支持常见扩展名（含 **`.mts`** 等）。
 
 ### 列表与交互
 
 - **列表**：搜索、排序；筛选 **全部 / 有视频 / 有图片 / 待审阅 / 已审阅**（「待审阅」= 尚未标为保留；「已审阅」= 卡片标记为保留）。
 - **懒加载**：滚动追加卡片。
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
-- **删除**：`POST /delete` 删除单个文件；**`POST /api/works/delete-all`** 一次性删除**当前作品（文件夹）**内全部媒体，并在媒体删光后**尝试移除已空的作品文件夹**（根目录平铺作品不删扫描根）。路径须在扫描根下；删除**源文件成功后**会按 `sha256(abspath)` 清理 `MB_CACHE_DIR` 缩略图。失败项记入**废纸篓队列**，可在页眉「废纸篓」批量重试；画廊内单文件删除失败在提示后也会**自动切到下一文件**。
+- **删除**：画廊单文件删除与整作品删除均需确认；删除源文件时同步清理缩略图与 play-ready 转码缓存。失败项记入**废纸篓队列**，可在页眉批量重试。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
 - **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
 - **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
@@ -180,7 +184,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/` | GET | 单页 HTML |
-| `/health` | GET | 健康检查 JSON（磁盘、扫描、ffmpeg/ffprobe、ollama、缓存、`uptime_seconds`）；**异常时 HTTP 503** |
+| `/health` | GET | 健康检查 JSON；局域网 Token 模式下仅本机探针或已认证请求可访问；异常时 HTTP 503 |
 | `/api/progress?since=` | GET | 扫描进度与增量作品（含 `scan_root` 等） |
 | `/api/set-scan-root` | POST | JSON `{"path":"/绝对路径"}`，切换扫描根并重新扫描；失败时 `error` 含具体原因（如误填 `smb://`、NAS 未挂载） |
 | `/api/shutdown` | POST | 退出进程（body 可为 `{}`） |
@@ -202,7 +206,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/delete-trash/remove` | POST | JSON `{"paths":["…"]}`，仅从队列移除（不删磁盘） |
 | `/api/delete-trash/clear` | POST | 清空队列（不删磁盘） |
 
-需跨域时服务器会响应 **`OPTIONS`**。
+跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN`。
 
 ---
 
@@ -305,6 +309,7 @@ Actions 会并行构建：
 | 手机 / Docker LAN（旧） | v1.2.5：移动布局、画廊底栏删除、Docker 扫描根只读 |
 | 删本作品 | v1.2.3：`/api/works/delete-all`、画廊 ⌘⇧I |
 | 废纸篓与画廊删除 | v1.2.1–1.2.2：失败入队、删失败仍翻页 |
+| Windows 播放中删除 | v1.4.2：删除前释放浏览器视频连接与实时转码进程，文件占用时自动短暂重试 |
 | 退出 | 页眉「退出应用」、`POST /api/shutdown` |
 | 扫描性能与护盘 | `MB_SCAN_*`、`MB_THUMB_COUNT`、`MB_DISK_PROFILE`、单次 ffprobe、软链与兜底枚举等 |
 | 删除与缓存 | 删文件后同步删对应缩略图目录 |
@@ -315,7 +320,7 @@ Actions 会并行构建：
 
 ### 仍可排的 backlog（约定后再做）
 
-**P1 体验与安全**：删除前可选二次确认；删除进废纸篓；转码更细进度；默认仅监听 `127.0.0.1` 等。
+**P1 体验与安全**：删除进系统废纸篓、转码更细进度、HTTPS / 反向代理部署等。
 
 **P2 功能**：搜索增强、审阅标签导出/导入、非 macOS 打开目录、窄屏侧栏、macOS 原生浏览文件夹选根目录。
 
@@ -327,6 +332,6 @@ Actions 会并行构建：
 
 ## 注意事项
 
-- 画廊内删除**无浏览器二次确认**，请谨慎或先备份。  
+- 删除仍是永久删除，请确认后操作并提前备份。
 - 转码占 CPU。  
 - 「在文件管理器中打开」已支持 macOS / Windows / Linux。  

@@ -41,3 +41,44 @@ def test_enumerate_skips_trash_name(tmp_path, monkeypatch):
     s._enumerate()
     assert all(".Trash" not in p for p in s.pending_works)
     assert _norm(str(good.resolve())) in {_norm(p) for p in s.pending_works}
+
+
+def test_enumerate_does_not_follow_symlink_outside_root(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.jpg").write_bytes(b"x")
+    (root / "outside-link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
+
+    s = mb.MediaScanner()
+    s._enumerate()
+    assert s.pending_works == []
+    assert s._pending_root_files == []
+
+
+def test_enumerate_does_not_follow_file_symlink_outside_root(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "secret.jpg"
+    outside.write_bytes(b"x")
+    (root / "secret-link.jpg").symlink_to(outside)
+    monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
+
+    s = mb.MediaScanner()
+    s._enumerate()
+    assert s._pending_root_files == []
+
+
+def test_enumerate_symlink_loop_finishes(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    work = root / "album"
+    work.mkdir(parents=True)
+    (work / "pic.jpg").write_bytes(b"x")
+    (work / "loop").symlink_to(work, target_is_directory=True)
+    monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
+
+    s = mb.MediaScanner()
+    s._enumerate()
+    assert _norm(str(work.resolve())) in {_norm(p) for p in s.pending_works}

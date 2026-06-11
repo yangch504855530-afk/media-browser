@@ -66,6 +66,7 @@ def test_gallery_delete_success_advances_to_next_file(playwright_browser, galler
     """删除当前项成功后，画廊应显示同作品下一文件（b）。"""
     base_url, album = gallery_e2e_server
     page = playwright_browser.new_page()
+    page.on("dialog", lambda d: d.accept())
     try:
         _wait_scan_and_open_gallery(page, base_url)
         assert _current_file_name(page) == "a"
