@@ -46,9 +46,9 @@ def http_delete_port(tmp_path, monkeypatch):
         mb.replace_scan_root(safe)
 
 
-def _post_delete(port: int, path: str) -> tuple[int, dict]:
+def _post_delete(port: int, path: str, work_path: str = "") -> tuple[int, dict]:
     url = f"http://127.0.0.1:{port}/delete"
-    data = json.dumps({"path": path}).encode("utf-8")
+    data = json.dumps({"path": path, "work_path": work_path}).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=data,
@@ -82,12 +82,47 @@ def test_delete_readonly_dir_queues_trash(http_delete_port):
 def test_delete_success_removes_file_and_not_in_trash(http_delete_port):
     port, _, normal, album = http_delete_port
     album.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-    code, body = _post_delete(port, normal)
+    empty_subdir = album / "empty_subdir"
+    empty_subdir.mkdir()
+    code, body = _post_delete(port, normal, str(album))
     assert code == 200
     assert body.get("ok") is True
+    assert body.get("folder_removed") is False
     assert not os.path.isfile(normal)
+    assert not os.path.isdir(empty_subdir)
 
     url = f"http://127.0.0.1:{port}/api/delete-trash"
     with urllib.request.urlopen(url, timeout=15) as resp:
         listed = json.loads(resp.read().decode("utf-8"))
     assert listed.get("count") == 0
+
+
+def test_delete_last_file_removes_work_folder(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(mb, "CACHE_DIR", str(cache))
+
+    root = tmp_path / "library"
+    root.mkdir()
+    work = root / "only_one"
+    nested = work / "video"
+    nested.mkdir(parents=True)
+    media = nested / "clip.mp4"
+    media.write_bytes(b"video")
+    assert mb.replace_scan_root(str(root.resolve())) is True
+
+    srv = mb.HTTPServer(("127.0.0.1", 0), mb.Handler)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        code, body = _post_delete(port, str(media), str(work))
+        assert code == 200
+        assert body.get("ok") is True
+        assert body.get("folder_removed") is True
+        assert not work.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        safe = tempfile.mkdtemp()
+        mb.replace_scan_root(safe)

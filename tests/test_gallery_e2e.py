@@ -62,11 +62,50 @@ def _current_file_name(page) -> str:
     return m.group(1).lower()
 
 
+def test_gallery_switch_releases_previous_video(playwright_browser, gallery_e2e_server):
+    """Switching videos pauses and clears the previous media element."""
+    base_url, _ = gallery_e2e_server
+    page = playwright_browser.new_page()
+    try:
+        page.goto(base_url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => typeof allWorks !== 'undefined' && allWorks.length > 0",
+            timeout=90_000,
+        )
+        result = page.evaluate(
+            """() => {
+                const work = allWorks[0];
+                work.items = [
+                    { type: 'video', path: 'first.mp4', name: 'first.mp4', size: 1 },
+                    { type: 'video', path: 'second.mp4', name: 'second.mp4', size: 1 },
+                ];
+                openGallery(work.id, 0, -1, { forceItemIdx: true });
+                const oldVideo = document.getElementById('galleryVideo');
+                let pauseCalls = 0;
+                oldVideo.pause = () => { pauseCalls++; };
+                jumpToItem(1);
+                return {
+                    pauseCalls,
+                    oldSrc: oldVideo.getAttribute('src'),
+                    oldConnected: oldVideo.isConnected,
+                    currentSrc: document.getElementById('galleryVideo')?.getAttribute('src'),
+                };
+            }"""
+        )
+        assert result["pauseCalls"] == 1
+        assert result["oldSrc"] is None
+        assert result["oldConnected"] is False
+        assert "second.mp4" in result["currentSrc"]
+    finally:
+        page.close()
+
+
 def test_gallery_delete_success_advances_to_next_file(playwright_browser, gallery_e2e_server):
     """删除当前项成功后，画廊应显示同作品下一文件（b）。"""
     base_url, album = gallery_e2e_server
     page = playwright_browser.new_page()
-    page.on("dialog", lambda d: d.accept())
+    dialogs: list[str] = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
     try:
         _wait_scan_and_open_gallery(page, base_url)
         assert _current_file_name(page) == "a"
@@ -79,6 +118,75 @@ def test_gallery_delete_success_advances_to_next_file(playwright_browser, galler
         assert _current_file_name(page) == "b"
         assert not (album / "a.jpg").exists()
         assert (album / "b.jpg").exists()
+        assert dialogs == []
+    finally:
+        page.close()
+
+
+def test_gallery_delete_last_file_opens_next_work(
+    playwright_browser, gallery_two_work_e2e_server
+):
+    """Deleting the last file in a work continues into the next work."""
+    base_url, first, second = gallery_two_work_e2e_server
+    page = playwright_browser.new_page()
+    try:
+        page.goto(base_url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => typeof allWorks !== 'undefined' && allWorks.length === 2",
+            timeout=90_000,
+        )
+        expected = page.evaluate(
+            """() => {
+                const ordered = getFilteredSortedWorks();
+                openGallery(ordered[0].id, 0, -1, { forceItemIdx: true });
+                return {
+                    current: ordered[0].items[0].name,
+                    next: ordered[1].items[0].name,
+                };
+            }"""
+        )
+        assert expected["current"] in ("first.jpg", "second.jpg")
+        page.keyboard.press(f"{_delete_mod_key()}+I")
+        page.wait_for_function(
+            "(name) => (document.getElementById('modalFileInfo')?.innerText || '').includes(name)",
+            arg=expected["next"],
+            timeout=15_000,
+        )
+        assert page.locator("#modal").evaluate("el => el.classList.contains('active')")
+        deleted = first / "first.jpg" if expected["current"] == "first.jpg" else second / "second.jpg"
+        remaining = second / "second.jpg" if expected["next"] == "second.jpg" else first / "first.jpg"
+        assert not deleted.exists()
+        assert remaining.exists()
+    finally:
+        page.close()
+
+
+def test_gallery_delete_current_work_opens_next_work(
+    playwright_browser, gallery_two_work_e2e_server
+):
+    """Deleting the current work continues into the next work."""
+    base_url, _, _ = gallery_two_work_e2e_server
+    page = playwright_browser.new_page()
+    try:
+        page.goto(base_url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => typeof allWorks !== 'undefined' && allWorks.length === 2",
+            timeout=90_000,
+        )
+        next_name = page.evaluate(
+            """() => {
+                const ordered = getFilteredSortedWorks();
+                openGallery(ordered[0].id, 0, -1, { forceItemIdx: true });
+                return ordered[1].items[0].name;
+            }"""
+        )
+        page.keyboard.press(f"{_delete_mod_key()}+Shift+I")
+        page.wait_for_function(
+            "(name) => (document.getElementById('modalFileInfo')?.innerText || '').includes(name)",
+            arg=next_name,
+            timeout=15_000,
+        )
+        assert page.locator("#modal").evaluate("el => el.classList.contains('active')")
     finally:
         page.close()
 
@@ -133,7 +241,8 @@ def test_gallery_delete_work_shortcut_removes_all_media_and_folder(
     """⌘⇧I / Ctrl+Shift+I：删除本作品全部媒体并移除已空文件夹（v1.2.3）。"""
     base_url, album = gallery_e2e_server
     page = playwright_browser.new_page()
-    page.on("dialog", lambda d: d.accept())
+    dialogs: list[str] = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
     try:
         _wait_scan_and_open_gallery(page, base_url)
         mod = _delete_mod_key()
@@ -149,6 +258,7 @@ def test_gallery_delete_work_shortcut_removes_all_media_and_folder(
         assert not album.exists()
         assert not (album / "a.jpg").exists()
         assert not (album / "b.jpg").exists()
+        assert dialogs == []
     finally:
         page.close()
 

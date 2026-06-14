@@ -106,3 +106,20 @@ def test_remove_media_thumb_cache(tmp_path, monkeypatch, ffmpeg_available):
     assert os.path.isdir(thumb_dir)
     mb.remove_media_thumb_cache(str(src))
     assert not os.path.isdir(thumb_dir)
+
+
+def test_missing_video_stops_thumbnail_work(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(mb, "CACHE_DIR", str(cache))
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("ffmpeg should not run for a missing video")
+
+    monkeypatch.setattr(mb.subprocess, "run", fail_run)
+    missing = tmp_path / "already_deleted.mp4"
+
+    assert mb.generate_video_thumb_single(str(missing)) == ""
+    assert mb.generate_video_thumbs(str(missing), count=4) == []
+    assert mb.generate_image_thumb(str(tmp_path / "already_deleted.jpg")) == ""
+    assert list(cache.iterdir()) == []

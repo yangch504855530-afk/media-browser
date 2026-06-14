@@ -45,3 +45,31 @@ def gallery_e2e_server(tmp_path, monkeypatch):
         srv.server_close()
         safe = tempfile.mkdtemp()
         mb.replace_scan_root(safe)
+
+
+@pytest.fixture()
+def gallery_two_work_e2e_server(tmp_path, monkeypatch):
+    """Two ordered single-file works for automatic gallery continuation."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(mb, "CACHE_DIR", str(cache))
+
+    first = tmp_path / "album_a"
+    second = tmp_path / "album_b"
+    first.mkdir()
+    second.mkdir()
+    (first / "first.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+    (second / "second.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+    assert mb.replace_scan_root(str(tmp_path.resolve())) is True
+
+    srv = mb.HTTPServer(("127.0.0.1", 0), mb.Handler)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        yield f"http://127.0.0.1:{port}", first, second
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        safe = tempfile.mkdtemp()
+        mb.replace_scan_root(safe)

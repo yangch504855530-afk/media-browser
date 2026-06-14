@@ -58,13 +58,30 @@ def test_review_filter_kept_and_pending_labels(homepage_html: str):
     """v1.4.1：筛选区待审阅/已审阅；卡片仍用待审/保留文案。"""
     assert 'data-filter="pending"' in homepage_html
     assert 'data-filter="kept"' in homepage_html
+    assert 'data-filter="deleted"' in homepage_html
+    assert 'data-filter="invalid"' in homepage_html
     assert ">待审阅</button>" in homepage_html
     assert ">已审阅</button>" in homepage_html
     assert "if (ft === 'kept') return getWorkReviewTag(w.id) === 'kept';" in homepage_html
+    assert "if (ft === 'deleted') return getWorkReviewTag(w.id) === 'deleted';" in homepage_html
     js = _extract_main_script(homepage_html)
-    assert "const txt = kept ? '保留' : '待审';" in js
+    assert "tag === 'deleted' ? '待删除' : '待定'" in js
     assert 'id="mbGalReview"' in homepage_html
+    assert 'id="mbGalPending"' in homepage_html
+    assert 'id="mbGalQueueDelete"' in homepage_html
     assert ">保留</button>" in homepage_html
+
+
+def test_quick_review_is_deferred_and_advances(homepage_html: str):
+    js = _extract_main_script(homepage_html)
+    assert "function quickReviewCurrentWork(tag)" in js
+    assert "quickReviewCurrentWork(e.key === '1' ? 'kept'" in js
+    assert "quickReviewCurrentWork('deleted')" in js
+    assert "quickReviewCurrentWork('kept');" in js
+    assert "(e.key === 'l' || e.key === 'L')" in js
+    assert "e.metaKey || e.ctrlKey" in js
+    assert "function deleteAllMarkedWorks()" in js
+    assert "markWorkOpenedKept(workId);" not in js
 
 
 def test_embedded_js_critical_functions_present(homepage_html: str):
@@ -100,6 +117,31 @@ def test_embedded_js_parseable_with_node(homepage_html: str):
         raise AssertionError(
             (e.stderr or e.stdout or "JS syntax check failed").strip()
         ) from e
+
+
+def test_gallery_switch_releases_and_invalidates_previous_video(homepage_html: str):
+    """Switching gallery items must stop old playback and ignore stale async results."""
+    js = _extract_main_script(homepage_html)
+    assert "const videoRenderToken = releaseGalleryVideoElement();" in js
+    assert "galleryVideoRenderToken++;" in js
+    assert "renderToken !== galleryVideoRenderToken || !videoEl.isConnected" in js
+    assert "videoRenderToken !== galleryVideoRenderToken || !v.isConnected" in js
+
+
+def test_gallery_delete_shortcuts_skip_confirmation(homepage_html: str):
+    """Keyboard delete shortcuts are intentional actions and execute immediately."""
+    js = _extract_main_script(homepage_html)
+    assert "deleteCurrentWork(true);" in js
+    assert "deleteCurrentItem(true);" in js
+    assert "if (!skipConfirm && !confirm(" in js
+
+
+def test_empty_gallery_work_continues_to_next_work(homepage_html: str):
+    """An emptied work keeps the gallery open by moving to the next work."""
+    js = _extract_main_script(homepage_html)
+    assert "function nextGalleryWorkBeforeRemoval(workId)" in js
+    assert "function removeEmptyWorkAndContinue(work, nextWork)" in js
+    assert "openGallery(nextWork.id, 0, -1, { forceItemIdx: true });" in js
 
 
 def test_preset_mode_template_vars_when_presets_configured(

@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -861,8 +861,8 @@ def patch_review_state_work(work_id: str, patch: dict) -> dict:
 
     if "tag" in patch:
         tag = patch.get("tag")
-        if tag not in ("kept", "pending"):
-            return {"ok": False, "error": "tag must be kept or pending"}
+        if tag not in ("kept", "pending", "deleted"):
+            return {"ok": False, "error": "tag must be kept, pending or deleted"}
         entry["tag"] = tag
         entry["tag_updated_at"] = now
 
@@ -901,10 +901,10 @@ def import_review_tags(tags: dict) -> dict:
     works = state.setdefault("works", {})
     imported = 0
     for wid, tag in (tags or {}).items():
-        if not isinstance(wid, str) or tag not in ("kept", "pending"):
+        if not isinstance(wid, str) or tag not in ("kept", "pending", "deleted"):
             continue
         ent = dict(works.get(wid) or {})
-        if ent.get("tag") in ("kept", "pending"):
+        if ent.get("tag") in ("kept", "pending", "deleted"):
             continue
         ent["tag"] = tag
         ent["tag_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1454,6 +1454,8 @@ def fmt_duration(sec: float) -> str:
 
 
 def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str:
+    if not os.path.isfile(video_path):
+        return ""
     file_hash = sha256_str(os.path.abspath(video_path))
     thumb_dir = os.path.join(CACHE_DIR, file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
@@ -1461,6 +1463,8 @@ def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str
     if os.path.exists(dst) and os.path.getsize(dst) > 100:
         return dst
     info = video_info if video_info is not None else get_video_info(video_path)
+    if not os.path.isfile(video_path):
+        return ""
     ss = "00:00:01"
     if info["duration"] > 3:
         ss = str(info["duration"] / 3)
@@ -1481,6 +1485,8 @@ def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str
 def generate_video_thumbs(video_path: str, count: int = None, video_info: dict = None) -> list:
     if count is None:
         count = THUMB_COUNT
+    if not os.path.isfile(video_path):
+        return []
     file_hash = sha256_str(os.path.abspath(video_path))
     thumb_dir = os.path.join(CACHE_DIR, file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
@@ -1493,6 +1499,8 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
     duration = info["duration"]
 
     for i in range(count):
+        if not os.path.isfile(video_path):
+            return [p for p in expected if os.path.exists(p) and os.path.getsize(p) > 100]
         dst = expected[i]
         if os.path.exists(dst) and os.path.getsize(dst) > 100:
             continue
@@ -1529,6 +1537,8 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
 
 
 def generate_image_thumb(image_path: str) -> str:
+    if not os.path.isfile(image_path):
+        return ""
     file_hash = sha256_str(os.path.abspath(image_path))
     thumb_dir = os.path.join(CACHE_DIR, file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
@@ -1701,8 +1711,11 @@ class MediaScanner:
         items.sort(key=lambda x: (0 if x["type"] == "video" else 1, x["name"]))
         video_items = []
         image_items = []
+        valid_items = []
         mtime = 0
         for it in items:
+            if not os.path.isfile(it["path"]):
+                continue
             try:
                 mtime = max(mtime, os.path.getmtime(it["path"]))
             except Exception:
@@ -1715,6 +1728,10 @@ class MediaScanner:
                 it["codec"] = info.get("codec", "")
                 it["bitrate"] = info.get("bitrate", 0)
                 it["fps"] = info.get("fps", 0.0)
+                if not info["duration"] or not info["width"] or not info["height"]:
+                    it["invalid_reason"] = "无法读取视频信息"
+                elif info["duration"] < 3:
+                    it["invalid_reason"] = "视频时长不足 3 秒"
                 # 只 ffprobe 一次；此前每条视频会 probe 最多 3 次，NAS/机械盘上极慢且重复读头
                 it["thumb"] = generate_video_thumb_single(it["path"], info)
                 it["thumbs"] = generate_video_thumbs(
@@ -1725,6 +1742,11 @@ class MediaScanner:
                 it["thumb"] = generate_image_thumb(it["path"])
                 it["thumbs"] = [it["thumb"]]
                 image_items.append(it)
+            valid_items.append(it)
+
+        items = valid_items
+        if not items:
+            return None
 
         main_video = max(video_items, key=lambda x: x["size"]) if video_items else None
         main_duration = main_video.get("duration", 0) if main_video else 0
@@ -1732,6 +1754,7 @@ class MediaScanner:
         work_id = sha256_str(id_seed)
         total_size = sum(it["size"] for it in items)
         total_duration = sum(it.get("duration", 0) for it in video_items)
+        invalid_count = sum(1 for it in video_items if it.get("invalid_reason"))
         if display_name_override:
             display_name = display_name_override
         else:
@@ -1748,6 +1771,8 @@ class MediaScanner:
             "total_duration": total_duration,
             "main_duration": main_duration,
             "mtime": mtime,
+            "invalid_count": invalid_count,
+            "all_invalid": bool(video_items) and invalid_count == len(video_items) and not image_items,
         }
 
     def _process_root_flat(self):
@@ -3588,6 +3613,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "invalid json"}, 400)
             return
         fpath = data.get("path", "")
+        work_path = data.get("work_path", "")
         if not isinstance(fpath, str) or not fpath:
             self._send_json({"ok": False, "error": "missing path"}, 400)
             return
@@ -3597,10 +3623,26 @@ class Handler(BaseHTTPRequestHandler):
         if not is_path_under_root(fpath):
             self._send_json({"ok": False, "error": "forbidden"}, 403)
             return
+        cleanup_work_path = ""
+        if isinstance(work_path, str) and work_path.strip():
+            try:
+                candidate = os.path.realpath(
+                    os.path.abspath(os.path.expanduser(work_path.strip()))
+                )
+                if (
+                    _can_remove_work_folder_dir(candidate)
+                    and _path_under_work_dir(fpath, candidate)
+                ):
+                    cleanup_work_path = candidate
+            except OSError:
+                pass
         try:
             _safe_remove(fpath)
             remove_media_thumb_cache(fpath)
-            self._send_json({"ok": True})
+            folder_removed = False
+            if cleanup_work_path:
+                folder_removed = try_remove_empty_work_folder(cleanup_work_path)
+            self._send_json({"ok": True, "folder_removed": folder_removed})
         except Exception as e:
             err = str(e)
             trash_n = 0
@@ -3989,6 +4031,21 @@ header select:focus { outline: none; border-color: #0a84ff; }
 }
 .review-tag.pending { background: #333; color: #aaa; }
 .review-tag.kept { background: #1e3d2a; color: #8fd9a8; }
+.review-tag.deleted { background: #4a2020; color: #ff9b9b; }
+.review-tag.invalid { background: #4a3618; color: #ffd089; }
+.review-actions { display: flex; gap: 5px; margin-left: auto; }
+.review-actions button {
+    font-size: 10px;
+    padding: 3px 7px;
+    border-radius: 4px;
+    border: 1px solid #444;
+    background: #181818;
+    color: #aaa;
+    cursor: pointer;
+}
+.review-actions button:hover { color: #fff; border-color: #777; }
+.review-actions button[data-review-tag="kept"] { color: #8fd9a8; }
+.review-actions button[data-review-tag="deleted"] { color: #ff9b9b; }
 .review-to-pending {
     font-size: 11px;
     padding: 3px 10px;
@@ -4012,6 +4069,7 @@ header select:focus { outline: none; border-color: #0a84ff; }
 .gallery-review-btn:hover { border-color: #888; color: #fff; }
 .gallery-review-btn.kept { background: #1e3d2a; border-color: #2f5e42; color: #8fd9a8; }
 .gallery-review-btn.pending { background: #333; border-color: #555; color: #aaa; }
+.gallery-review-btn.deleted { background: #4a2020; border-color: #743434; color: #ff9b9b; }
 .progress-bar {
     width: 100%;
     height: 3px;
@@ -4884,9 +4942,12 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button data-filter="image">有图片</button>
         <button data-filter="pending" title="尚未标记为保留的作品">待审阅</button>
         <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
+        <button data-filter="deleted" title="已标记、尚未永久删除的作品">待删除</button>
+        <button data-filter="invalid" title="包含无法读取或时长过短视频的作品">疑似无效</button>
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
+    <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的作品">永久删除待删除作品</button>
     <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
@@ -4918,6 +4979,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button data-filter="image">有图片</button>
             <button data-filter="pending" title="尚未标记为保留的作品">待审阅</button>
             <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
+            <button data-filter="deleted">待删除</button>
+            <button data-filter="invalid">疑似无效</button>
         </div>
         <div id="mbDrawerScanRootBlock" class="mb-drawer-scan-root" style="display:none">
             <label for="scanRootPresetDrawer">媒体库</label>
@@ -5033,6 +5096,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button onclick="clearSelection()">取消勾选</button>
     <button class="primary" onclick="batchMarkReview('kept')">标为保留</button>
     <button onclick="batchMarkReview('pending')">标为待审</button>
+    <button onclick="batchMarkReview('deleted')">标为待删除</button>
     <button onclick="batchOpenFinder()">在 Finder 中打开</button>
 </div>
 
@@ -5065,7 +5129,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
             <div class="file-info" id="modalFileInfo"></div>
-            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · ⌘I 删当前 · ⌘⇧I 删本作品 · ⌘← / ⌘→ 上/下一作品（列表与画廊）</div>
+            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · Ctrl+Shift+L 保留并下一作品 · Ctrl+I 删当前 · Ctrl+Shift+I 删本作品</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
             <div class="modal-sidebar-top">
@@ -5080,8 +5144,10 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
         <button type="button" id="mbGalClose" title="关闭">关闭</button>
         <button type="button" id="mbGalPrev" title="上一个">◀</button>
-        <button type="button" id="mbGalReview" class="mb-primary">保留</button>
-        <button type="button" id="mbGalDelete" class="mb-danger">删除</button>
+        <button type="button" id="mbGalReview" class="mb-primary" title="保留并进入下一作品（1）">保留</button>
+        <button type="button" id="mbGalPending" title="待定并进入下一作品（2）">待定</button>
+        <button type="button" id="mbGalQueueDelete" class="mb-danger" title="加入待删除并进入下一作品（3）">待删除</button>
+        <button type="button" id="mbGalDelete" class="mb-danger">删当前文件</button>
         <button type="button" id="mbGalDeleteWork" class="mb-danger">删作品</button>
         <button type="button" id="mbGalNext" title="下一个">▶</button>
     </nav>
@@ -5165,6 +5231,7 @@ let displayedIds = new Set();
 let renderOffset = 0;
 
 let galleryState = { workId: null, itemIdx: 0 };
+let galleryVideoRenderToken = 0;
 let sidebarOffset = 0;
 let sidebarLimit = 40;
 let lastEnumError = null;
@@ -5418,14 +5485,16 @@ function videoNeedsTranscodePlay(filePath) {
     if (mbMobile && !MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return true;
     return false;
 }
-async function prepareGalleryVideo(filePath, videoEl, overlayEl) {
+async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken) {
     if (!videoEl || !overlayEl) return;
     overlayEl.style.display = 'flex';
     const t0 = Date.now();
     for (;;) {
+        if (renderToken !== galleryVideoRenderToken || !videoEl.isConnected) return;
         try {
             const res = await fetch('/api/play-ready?path=' + encodeURIComponent(filePath), { cache: 'no-store' });
             const data = await res.json();
+            if (renderToken !== galleryVideoRenderToken || !videoEl.isConnected) return;
             if (data.ready && data.url) {
                 videoEl.src = data.url;
                 return;
@@ -5470,7 +5539,7 @@ window.insightRowThumbError = function(ev) {
 function getWorkReviewTag(workId) {
     if (mbReviewState && mbReviewState.works && mbReviewState.works[workId]) {
         const t = mbReviewState.works[workId].tag;
-        if (t === 'kept' || t === 'pending') return t;
+        if (t === 'kept' || t === 'pending' || t === 'deleted') return t;
     }
     return 'pending';
 }
@@ -5586,30 +5655,38 @@ async function mbLoadReviewState() {
     mbUpdateContinueReviewUi();
     if (allWorks.length) sortAndRenderAll();
 }
-function buildReviewStripHtml(workId) {
-    const kept = getWorkReviewTag(workId) === 'kept';
-    const btn = kept ? '<button type="button" class="review-to-pending" data-work-id="' + escapeHtml(workId) + '">标为待审</button>' : '';
-    const cls = kept ? 'kept' : 'pending';
-    const txt = kept ? '保留' : '待审';
-    return '<div class="review-strip"><span class="review-tag ' + cls + '">' + txt + '</span>' + btn + '</div>';
+function buildReviewStripHtml(workId, work) {
+    const tag = getWorkReviewTag(workId);
+    const txt = tag === 'kept' ? '保留' : (tag === 'deleted' ? '待删除' : '待定');
+    const invalid = work && work.invalid_count
+        ? '<span class="review-tag invalid">疑似无效 ' + work.invalid_count + '</span>'
+        : '';
+    return '<div class="review-strip"><span class="review-tag ' + tag + '">' + txt + '</span>' + invalid
+        + '<span class="review-actions">'
+        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="kept">保留</button>'
+        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="pending">待定</button>'
+        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="deleted">待删除</button>'
+        + '</span></div>';
 }
 function setWorkReviewTag(workId, tag) {
     mbPatchReviewWork(workId, { tag: tag, update_global: false }, false);
     const card = document.querySelector('.work-card[data-id="' + CSS.escape(workId) + '"]');
     if (card) {
         const strip = card.querySelector('.review-strip');
-        if (strip) strip.outerHTML = buildReviewStripHtml(workId);
+        const work = allWorks.find(function (w) { return w.id === workId; });
+        if (strip) strip.outerHTML = buildReviewStripHtml(workId, work);
     }
     // 如果画廊正打开该作品，同步更新画廊按钮
     if (galleryState.workId === workId) {
         updateGalleryReviewBtn(workId);
     }
+    sortAndRenderAll();
 }
 function setWorkReviewPending(workId) {
     setWorkReviewTag(workId, 'pending');
 }
 function markWorkOpenedKept(workId) {
-    setWorkReviewTag(workId, 'kept');
+    return workId;
 }
 function toggleWorkReview(workId) {
     const current = getWorkReviewTag(workId);
@@ -5618,14 +5695,14 @@ function toggleWorkReview(workId) {
 function updateGalleryReviewBtn(workId) {
     const btn = document.getElementById('galleryReviewBtn');
     if (!btn) return;
-    const kept = getWorkReviewTag(workId) === 'kept';
-    btn.textContent = kept ? '保留' : '待审';
-    btn.className = 'gallery-review-btn ' + (kept ? 'kept' : 'pending');
-    btn.title = kept ? '点击标为待审' : '点击标为保留';
+    const tag = getWorkReviewTag(workId);
+    btn.textContent = tag === 'kept' ? '保留' : (tag === 'deleted' ? '待删除' : '待定');
+    btn.className = 'gallery-review-btn ' + tag;
+    btn.title = '当前作品审阅状态';
     const galBtn = document.getElementById('mbGalReview');
     if (galBtn) {
-        galBtn.textContent = kept ? '标待审' : '保留';
-        galBtn.className = 'mb-primary' + (kept ? ' kept' : '');
+        galBtn.textContent = '保留';
+        galBtn.className = 'mb-primary' + (tag === 'kept' ? ' kept' : '');
     }
 }
 async function resetAllReviewTags() {
@@ -6135,6 +6212,29 @@ async function batchMarkReview(state) {
     clearSelection();
     sortAndRenderAll();
 }
+async function deleteAllMarkedWorks() {
+    const marked = allWorks.filter(function (w) { return getWorkReviewTag(w.id) === 'deleted'; });
+    if (!marked.length) {
+        alert('当前没有标记为待删除的作品。');
+        return;
+    }
+    const fileCount = marked.reduce(function (n, w) { return n + w.items.length; }, 0);
+    if (!confirm('将永久删除 ' + marked.length + ' 个待删除作品中的 ' + fileCount + ' 个媒体文件，不可恢复。确定？')) return;
+    closeModal();
+    let deletedWorks = 0;
+    let failedWorks = 0;
+    for (const work of marked.slice()) {
+        const before = work.items.length;
+        await deleteWorkAllFiles(work, true);
+        if (!allWorks.some(function (w) { return w.id === work.id; })) {
+            deletedWorks++;
+            await mbPatchReviewWork(work.id, { tag: 'pending', update_global: false }, false);
+        }
+        else if (work.items.length === before) failedWorks++;
+    }
+    alert('已删除 ' + deletedWorks + ' 个作品' + (failedWorks ? '；' + failedWorks + ' 个作品删除失败或未完全删除。' : '。'));
+    mbRefreshTrashBadge(true);
+}
 async function batchOpenFinder() {
     const list = Array.from(selectedIds);
     for (const id of list) {
@@ -6150,13 +6250,17 @@ function workMatchesFilter(w, ft) {
     if (ft === 'all') return true;
     if (ft === 'video') return w.video_count > 0;
     if (ft === 'image') return w.image_count > 0;
-    if (ft === 'pending') return getWorkReviewTag(w.id) !== 'kept';
+    if (ft === 'pending') return getWorkReviewTag(w.id) === 'pending';
     if (ft === 'kept') return getWorkReviewTag(w.id) === 'kept';
+    if (ft === 'deleted') return getWorkReviewTag(w.id) === 'deleted';
+    if (ft === 'invalid') return Number(w.invalid_count || 0) > 0;
     return true;
 }
 function mbFilterReviewLabel() {
     if (filterType === 'pending') return ' · 待审阅';
     if (filterType === 'kept') return ' · 已审阅';
+    if (filterType === 'deleted') return ' · 待删除';
+    if (filterType === 'invalid') return ' · 疑似无效';
     return '';
 }
 function mbBuildWorksStatusText(listLen, narrowed) {
@@ -6303,17 +6407,19 @@ function workCanRemoveEmptyFolder(work) {
     return mbNormPath(work.path) !== mbNormPath(root);
 }
 
-function deleteCurrentWork() {
+function deleteCurrentWork(skipConfirm) {
     const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
-    if (work) deleteWorkAllFiles(work);
+    if (work) deleteWorkAllFiles(work, skipConfirm);
 }
 
-async function deleteWorkAllFiles(work) {
+async function deleteWorkAllFiles(work, skipConfirm) {
     if (!work || !work.items.length) return;
     const folderNote = workCanRemoveEmptyFolder(work) ? '；若文件夹已空将一并移除' : '';
-    if (!confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件' + folderNote + '，不可恢复。确定？')) return;
+    if (!skipConfirm && !confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件' + folderNote + '，不可恢复。确定？')) return;
     const paths = work.items.map(function (it) { return it.path; });
     const modal = document.getElementById('modal');
+    const inGallery = modal && modal.classList.contains('active') && galleryState.workId === work.id;
+    const nextWork = inGallery ? nextGalleryWorkBeforeRemoval(work.id) : null;
     if (modal && modal.classList.contains('active') && galleryState.workId === work.id) {
         releaseGalleryVideoElement();
     }
@@ -6338,12 +6444,13 @@ async function deleteWorkAllFiles(work) {
             }
         }
         hideCardCtx();
-        const inGallery = modal && modal.classList.contains('active') && galleryState.workId === work.id;
         if (work.items.length === 0) {
-            const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
-            if (idx >= 0) allWorks.splice(idx, 1);
-            closeModal();
-            sortAndRenderAll();
+            if (inGallery) removeEmptyWorkAndContinue(work, nextWork);
+            else {
+                const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
+                if (idx >= 0) allWorks.splice(idx, 1);
+                sortAndRenderAll();
+            }
         } else {
             sortAndRenderAll();
             if (data.errors && data.errors.length) {
@@ -6470,11 +6577,12 @@ function createWorkCard(work, virtualIndex) {
 
     const title = escapeHtml(work.name);
     const durText = work.main_duration ? `⏱ ${fmtDuration(work.main_duration)} · ` : '';
-    const meta = `${durText}${work.video_count}视频 · ${work.image_count}图片 · ${fmtSize(work.total_size)}`;
+    const invalidText = work.invalid_count ? ` · 疑似无效 ${work.invalid_count}` : '';
+    const meta = `${durText}${work.video_count}视频 · ${work.image_count}图片 · ${fmtSize(work.total_size)}${invalidText}`;
 
     const info = document.createElement('div');
     info.className = 'info';
-    const reviewTop = buildReviewStripHtml(work.id);
+    const reviewTop = buildReviewStripHtml(work.id, work);
     info.innerHTML = reviewTop + `<div class="title-row">
         <div class="title" title="${title}" onclick="event.stopPropagation(); openGallery(${JSON.stringify(work.id)}, 0, -1)">${title}</div>
     </div>
@@ -6587,6 +6695,11 @@ function resetFilters() {
 
 function sortAndRenderAll() {
     const list = getFilteredSortedWorks();
+    const deleteMarkedBtn = document.getElementById('mbDeleteMarkedBtn');
+    if (deleteMarkedBtn) {
+        const markedCount = allWorks.filter(function (w) { return getWorkReviewTag(w.id) === 'deleted'; }).length;
+        deleteMarkedBtn.textContent = '永久删除待删除作品' + (markedCount ? ' (' + markedCount + ')' : '');
+    }
     container.innerHTML = '';
     displayedIds.clear();
     renderOffset = 0;
@@ -6835,7 +6948,6 @@ function openGallery(workId, itemIdx, thumbIdx, opts) {
             resolvedIdx = mbResolveItemIndex(work, ent.last_item_path, ent.last_item_idx);
         }
     }
-    markWorkOpenedKept(workId);
     galleryState = {
         workId,
         itemIdx: Math.max(0, Math.min(resolvedIdx, work.items.length - 1)),
@@ -6855,6 +6967,7 @@ function renderGallery() {
     const item = work.items[galleryState.itemIdx];
     if (!item) return;
 
+    const videoRenderToken = releaseGalleryVideoElement();
     const mediaDiv = document.getElementById('modalMedia');
     const infoDiv = document.getElementById('modalFileInfo');
     const sidebarTitle = document.getElementById('sidebarTitle');
@@ -6875,17 +6988,19 @@ function renderGallery() {
             v.addEventListener('canplay', hideOv, { once: true });
             v.addEventListener('error', () => { showGalleryVideoError(ov); }, { once: true });
             if (needsTc) {
-                prepareGalleryVideo(item.path, v, ov);
+                prepareGalleryVideo(item.path, v, ov, videoRenderToken);
             } else {
                 v.src = buildVideoPlayUrl(item.path);
             }
         }
         if (v) {
             v.onended = () => {
+                if (videoRenderToken !== galleryVideoRenderToken || !v.isConnected) return;
                 const work2 = allWorks.find(w => w.id === galleryState.workId);
                 if (work2 && galleryState.itemIdx < work2.items.length - 1) navigate(1);
             };
             v.addEventListener('loadedmetadata', () => {
+                if (videoRenderToken !== galleryVideoRenderToken || !v.isConnected) return;
                 const ti = galleryState.thumbIdx;
                 if (ti !== undefined && ti >= 0 && item.duration) {
                     v.currentTime = item.duration * (ti + 1) / (THUMB_COUNT + 1);
@@ -6909,8 +7024,9 @@ function renderGallery() {
     const fps = item.fps ? `${item.fps}fps · ` : '';
     const delBtn = `<span onclick="event.stopPropagation(); deleteCurrentItem();" style="cursor:pointer;color:#ff4444;margin-left:12px;font-size:12px;" title="删除当前：⌘I / Ctrl+I">🗑 删除</span>`;
     const delWorkBtn = `<span onclick="event.stopPropagation(); deleteCurrentWork();" style="cursor:pointer;color:#ff6666;margin-left:10px;font-size:12px;" title="删除本作品全部媒体：⌘⇧I / Ctrl+Shift+I">🗑 删本作品</span>`;
+    const invalid = item.invalid_reason ? `<span class="review-tag invalid" title="${escapeHtml(item.invalid_reason)}">疑似无效：${escapeHtml(item.invalid_reason)}</span>` : '';
     const reviewBtn = `<button type="button" id="galleryReviewBtn" class="gallery-review-btn" data-work-id="${escapeHtml(work.id)}">标记</button>`;
-    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${delBtn}${delWorkBtn}${reviewBtn}`;
+    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${invalid}${delBtn}${delWorkBtn}${reviewBtn}`;
     updateGalleryReviewBtn(work.id);
     const sh = document.getElementById('shortcutHint');
     if (sh) {
@@ -7011,6 +7127,39 @@ function galleryWorkNavListAndIndex() {
 }
 
 /** 画廊内：切换到上一/下一作品；dir=+1 打开下一作品首个文件，dir=-1 打开上一作品最后一个文件 */
+function nextGalleryWorkBeforeRemoval(workId) {
+    const nav = galleryWorkNavListAndIndex();
+    if (nav.wi < 0 || nav.wi >= nav.list.length - 1) return null;
+    const next = nav.list[nav.wi + 1];
+    return next && next.id !== workId ? next : null;
+}
+
+async function quickReviewCurrentWork(tag) {
+    const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
+    if (!work) return;
+    const nextWork = nextGalleryWorkBeforeRemoval(work.id);
+    await mbPatchReviewWork(work.id, { tag: tag, update_global: false }, false);
+    sortAndRenderAll();
+    if (nextWork && allWorks.some(function (w) { return w.id === nextWork.id; })) {
+        openGallery(nextWork.id, 0, -1, { forceItemIdx: true });
+        ensureWorkCardInDomAndScroll(nextWork.id);
+        return;
+    }
+    closeModal();
+}
+
+function removeEmptyWorkAndContinue(work, nextWork) {
+    const idx = allWorks.findIndex(function (w) { return w.id === work.id; });
+    if (idx >= 0) allWorks.splice(idx, 1);
+    sortAndRenderAll();
+    if (nextWork && allWorks.some(function (w) { return w.id === nextWork.id; }) && nextWork.items.length) {
+        openGallery(nextWork.id, 0, -1, { forceItemIdx: true });
+        ensureWorkCardInDomAndScroll(nextWork.id);
+        return;
+    }
+    closeModal();
+}
+
 function openAdjacentWorkFromGallery(dir) {
     const { list, wi } = galleryWorkNavListAndIndex();
     if (!list.length || wi < 0) return;
@@ -7107,12 +7256,13 @@ function advanceGalleryAfterDeleteAttempt(work, itemRemoved) {
     renderGallery();
 }
 
-async function deleteCurrentItem() {
+async function deleteCurrentItem(skipConfirm) {
     const work = allWorks.find(w => w.id === galleryState.workId);
     if (!work) return;
     const item = work.items[galleryState.itemIdx];
     if (!item) return;
-    if (!confirm('将永久删除「' + item.name + '」，不可恢复。确定？')) return;
+    const nextWork = work.items.length === 1 ? nextGalleryWorkBeforeRemoval(work.id) : null;
+    if (!skipConfirm && !confirm('将永久删除「' + item.name + '」，不可恢复。确定？')) return;
     if (item.type === 'video') releaseGalleryVideoElement();
 
     let deleteOk = false;
@@ -7120,7 +7270,7 @@ async function deleteCurrentItem() {
         const res = await fetch('/delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json; charset=utf-8' },
-            body: JSON.stringify({ path: item.path }),
+            body: JSON.stringify({ path: item.path, work_path: work.path }),
         });
         const data = await res.json();
         if (!data.ok) {
@@ -7145,10 +7295,7 @@ async function deleteCurrentItem() {
     else work.image_count--;
 
     if (work.items.length === 0) {
-        const idx = allWorks.findIndex(w => w.id === work.id);
-        if (idx >= 0) allWorks.splice(idx, 1);
-        closeModal();
-        sortAndRenderAll();
+        removeEmptyWorkAndContinue(work, nextWork);
         return;
     }
 
@@ -7156,12 +7303,14 @@ async function deleteCurrentItem() {
 }
 
 function releaseGalleryVideoElement() {
+    galleryVideoRenderToken++;
     const v = document.getElementById('galleryVideo');
     if (v) {
         try { v.pause(); } catch (e) {}
         v.removeAttribute('src');
         try { v.load(); } catch (e2) {}
     }
+    return galleryVideoRenderToken;
 }
 
 function closeModal() {
@@ -7274,6 +7423,12 @@ function toggleGalleryFullscreen() {
 
 // 事件委托：卡片列表中的"标为待审"按钮
 document.addEventListener('click', (e) => {
+    const reviewAction = e.target.closest('[data-review-tag][data-work-id]');
+    if (reviewAction) {
+        e.stopPropagation();
+        setWorkReviewTag(reviewAction.dataset.workId, reviewAction.dataset.reviewTag);
+        return;
+    }
     const pendingBtn = e.target.closest('.review-to-pending');
     if (pendingBtn) {
         e.stopPropagation();
@@ -7285,8 +7440,6 @@ document.addEventListener('click', (e) => {
     const reviewBtn = e.target.closest('#galleryReviewBtn');
     if (reviewBtn) {
         e.stopPropagation();
-        const workId = reviewBtn.dataset.workId;
-        if (workId) toggleWorkReview(workId);
         return;
     }
 });
@@ -7314,14 +7467,24 @@ document.addEventListener('keydown', (e) => {
 
     // 全局
     if (e.key === 'Escape') { closeModal(); return; }
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === '1' || e.key === '2' || e.key === '3')) {
+        e.preventDefault();
+        quickReviewCurrentWork(e.key === '1' ? 'kept' : (e.key === '2' ? 'pending' : 'deleted'));
+        return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        quickReviewCurrentWork('kept');
+        return;
+    }
     if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey) && e.shiftKey) {
         e.preventDefault();
-        deleteCurrentWork();
+        deleteCurrentWork(true);
         return;
     }
     if ((e.key === 'i' || e.key === 'I') && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
         e.preventDefault();
-        deleteCurrentItem();
+        deleteCurrentItem(true);
         return;
     }
     // ⌘/Ctrl + 左右：切换作品（不进视频快进/图片翻张）
@@ -7575,17 +7738,18 @@ async function mbApplyScanRootSwitch() {
     const mbGalDelete = document.getElementById('mbGalDelete');
     const mbGalDeleteWork = document.getElementById('mbGalDeleteWork');
     const mbGalReview = document.getElementById('mbGalReview');
+    const mbGalPending = document.getElementById('mbGalPending');
+    const mbGalQueueDelete = document.getElementById('mbGalQueueDelete');
+    const mbDeleteMarkedBtn = document.getElementById('mbDeleteMarkedBtn');
     if (mbGalClose) mbGalClose.addEventListener('click', () => closeModal());
     if (mbGalPrev) mbGalPrev.addEventListener('click', () => navigate(-1));
     if (mbGalNext) mbGalNext.addEventListener('click', () => navigate(1));
     if (mbGalDelete) mbGalDelete.addEventListener('click', () => deleteCurrentItem());
     if (mbGalDeleteWork) mbGalDeleteWork.addEventListener('click', () => deleteCurrentWork());
-    if (mbGalReview) {
-        mbGalReview.addEventListener('click', () => {
-            const work = allWorks.find(w => w.id === galleryState.workId);
-            if (work) toggleWorkReview(work.id);
-        });
-    }
+    if (mbGalReview) mbGalReview.addEventListener('click', () => quickReviewCurrentWork('kept'));
+    if (mbGalPending) mbGalPending.addEventListener('click', () => quickReviewCurrentWork('pending'));
+    if (mbGalQueueDelete) mbGalQueueDelete.addEventListener('click', () => quickReviewCurrentWork('deleted'));
+    if (mbDeleteMarkedBtn) mbDeleteMarkedBtn.addEventListener('click', deleteAllMarkedWorks);
     const tc = document.getElementById('worksColToggle');
     const wc = document.getElementById('worksColumn');
     if (tc && wc) {

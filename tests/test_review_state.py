@@ -51,6 +51,20 @@ def test_review_state_roundtrip(tmp_path, monkeypatch):
     assert state["works"][wid]["last_item_path"] == "/scan/foo.mp4"
 
 
+def test_review_state_supports_deferred_delete_tag(tmp_path, monkeypatch):
+    monkeypatch.setattr(mb, "CACHE_DIR", str(tmp_path / "cache"))
+    (tmp_path / "cache").mkdir()
+    assert mb.replace_scan_root(str(tmp_path.resolve())) is True
+
+    ret = mb.patch_review_state_work(
+        "delete-later",
+        {"tag": "deleted", "update_global": False},
+    )
+
+    assert ret["ok"] is True
+    assert mb.load_review_state()["works"]["delete-later"]["tag"] == "deleted"
+
+
 def test_review_state_http_get_and_patch(review_server):
     port = review_server
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/review-state", timeout=10) as resp:
