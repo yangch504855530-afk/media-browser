@@ -17,7 +17,7 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_MAX_BODY_BYTES JSON 请求体上限字节数（默认 1048576）
   MB_AUTO_OPEN 是否启动后自动打开浏览器（打包默认为是；脚本默认为否，设为 1 可开启）
   MB_SCAN_WORKERS   同时处理「作品」任务的线程数（默认 2；机械盘/NAS 建议 1～2）
-  MB_THUMB_COUNT    每个视频条带缩略图帧数（默认 5；越大越慢、越伤盘）
+  MB_THUMB_COUNT    每个视频条带缩略图帧数（默认 8；越大越慢、越伤盘）
   MB_DISK_PROFILE   设为 slow / nas / hdd / mechanical 时自动收紧并发与缩略图，减轻随机读
   MB_OLLAMA_HOST  本地 Ollama 地址，默认 http://127.0.0.1:11434（数据不出本机）
   MB_OLLAMA_MODEL 视觉模型名，默认 llava（须 ollama pull 过；也可用 moondream、llava-phi3 等）
@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.5"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -121,16 +121,14 @@ _DISK_PROFILE_ENV_SET = bool(DISK_PROFILE)
 _SCAN_WORKERS_ENV_SET = os.environ.get("MB_SCAN_WORKERS") not in (None, "")
 _THUMB_COUNT_ENV_SET = os.environ.get("MB_THUMB_COUNT") not in (None, "")
 _MAX_DEFAULT = 2
-_THUMB_DEFAULT = 5
+_THUMB_DEFAULT = 8
 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
     _MAX_DEFAULT = 1
-    _THUMB_DEFAULT = 2
 
 MAX_WORKERS = _int_env("MB_SCAN_WORKERS", _MAX_DEFAULT, 1, 16)
 THUMB_COUNT = _int_env("MB_THUMB_COUNT", _THUMB_DEFAULT, 1, 30)
 if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
     MAX_WORKERS = min(MAX_WORKERS, 2)
-    THUMB_COUNT = min(THUMB_COUNT, 3)
 
 
 def _ollama_config() -> tuple:
@@ -187,10 +185,9 @@ def _apply_perf_profile_for_scan_root(scan_root: str) -> str:
     if _THUMB_COUNT_ENV_SET:
         THUMB_COUNT = _int_env("MB_THUMB_COUNT", THUMB_COUNT, 1, 30)
     else:
-        THUMB_COUNT = 2 if profile in ("slow", "nas", "hdd", "mechanical") else 4
+        THUMB_COUNT = 8
     if profile in ("slow", "nas", "hdd", "mechanical"):
         MAX_WORKERS = min(MAX_WORKERS, 2)
-        THUMB_COUNT = min(THUMB_COUNT, 3)
     return profile
 
 FFMPEG_BIN = _tool_path("ffmpeg")
@@ -4736,6 +4733,56 @@ body.batch-open #backToTop.show { bottom: 118px; }
     transform-origin: center center;
     user-select: none;
 }
+.image-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+    padding: 12px;
+    box-sizing: border-box;
+}
+.image-grid-cell {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 8px;
+    background: #080808;
+}
+.image-grid-cell img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+#modal:fullscreen .modal-sidebar,
+#modal.image-grid-mode .modal-sidebar,
+#modal:fullscreen .file-info,
+#modal.image-grid-mode .file-info,
+#modal:fullscreen .shortcut-hint,
+#modal.image-grid-mode .shortcut-hint {
+    display: none;
+}
+#modal:fullscreen .modal-main,
+#modal.image-grid-mode .modal-main {
+    padding: 0;
+}
+#modal:fullscreen #modalMedia,
+#modal.image-grid-mode #modalMedia {
+    width: 100%;
+    height: 100%;
+}
+#modal:fullscreen .modal-close,
+#modal.image-grid-mode .modal-close {
+    right: 12px;
+}
+#modal:fullscreen .modal-fs,
+#modal.image-grid-mode .modal-fs {
+    right: 60px;
+}
 
 @media (max-width: 900px) {
     .modal-body {
@@ -5232,6 +5279,7 @@ let renderOffset = 0;
 
 let galleryState = { workId: null, itemIdx: 0 };
 let galleryVideoRenderToken = 0;
+let imageGridMode = false;
 let sidebarOffset = 0;
 let sidebarLimit = 40;
 let lastEnumError = null;
@@ -7012,6 +7060,8 @@ function renderGallery() {
             v.focus();
         }
         setupGalleryVideoPinch();
+    } else if (imageGridMode) {
+        renderFullscreenImageGrid(mediaDiv, work);
     } else {
         mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" loading="lazy" decoding="async" draggable="false" style="cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
         setupImageZoom();
@@ -7204,6 +7254,10 @@ function ensureWorkCardInDomAndScroll(workId) {
 function navigate(dir) {
     const work = allWorks.find(w => w.id === galleryState.workId);
     if (!work) return;
+    if (imageGridMode) {
+        navigateImageGrid(work, dir);
+        return;
+    }
     const newIdx = galleryState.itemIdx + dir;
     if (newIdx >= 0 && newIdx < work.items.length) {
         galleryState.itemIdx = newIdx;
@@ -7316,6 +7370,11 @@ function releaseGalleryVideoElement() {
 function closeModal() {
     releaseGalleryVideoElement();
     const modal = document.getElementById('modal');
+    imageGridMode = false;
+    modal.classList.remove('image-grid-mode');
+    if (document.fullscreenElement === modal) {
+        document.exitFullscreen().catch(() => {});
+    }
     modal.classList.remove('active');
     setTimeout(() => { document.getElementById('modalMedia').innerHTML = ''; }, 250);
     document.body.style.overflow = '';
@@ -7413,13 +7472,68 @@ function setupImageZoom() {
     }, { passive: true });
 }
 
+function imageGridEntries(work) {
+    return work.items
+        .map(function (item, idx) { return { item: item, idx: idx }; })
+        .filter(function (entry) { return entry.item.type === 'image'; });
+}
+
+function renderFullscreenImageGrid(mediaDiv, work) {
+    const images = imageGridEntries(work);
+    const currentPos = Math.max(0, images.findIndex(function (entry) {
+        return entry.idx === galleryState.itemIdx;
+    }));
+    const start = Math.floor(currentPos / 4) * 4;
+    const page = images.slice(start, start + 4);
+    mediaDiv.innerHTML = '<div class="image-grid" id="galleryImageGrid">'
+        + page.map(function (entry) {
+            return '<div class="image-grid-cell"><img src="' + buildFileUrl(entry.item.path)
+                + '" loading="eager" decoding="async" draggable="false" alt="'
+                + escapeHtml(entry.item.name) + '"></div>';
+        }).join('')
+        + '</div>';
+}
+
+function navigateImageGrid(work, dir) {
+    const images = imageGridEntries(work);
+    if (!images.length) return;
+    const currentPos = Math.max(0, images.findIndex(function (entry) {
+        return entry.idx === galleryState.itemIdx;
+    }));
+    const start = Math.floor(currentPos / 4) * 4;
+    const nextStart = start + (dir > 0 ? 4 : -4);
+    if (nextStart < 0 || nextStart >= images.length) return;
+    galleryState.itemIdx = images[nextStart].idx;
+    galleryState.thumbIdx = -1;
+    renderGallery();
+}
+
 function toggleGalleryFullscreen() {
     if (document.fullscreenElement) {
         document.exitFullscreen();
     } else {
-        document.getElementById('modal').requestFullscreen();
+        const work = allWorks.find(w => w.id === galleryState.workId);
+        const item = work && work.items[galleryState.itemIdx];
+        imageGridMode = !!(item && item.type === 'image');
+        document.getElementById('modal').classList.toggle('image-grid-mode', imageGridMode);
+        if (imageGridMode) renderGallery();
+        const req = document.getElementById('modal').requestFullscreen();
+        if (req && req.catch) {
+            req.catch(() => {
+                imageGridMode = false;
+                document.getElementById('modal').classList.remove('image-grid-mode');
+                renderGallery();
+            });
+        }
     }
 }
+
+document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement || !imageGridMode) return;
+    imageGridMode = false;
+    document.getElementById('modal').classList.remove('image-grid-mode');
+    renderGallery();
+});
 
 // 事件委托：卡片列表中的"标为待审"按钮
 document.addEventListener('click', (e) => {
@@ -7565,7 +7679,12 @@ document.addEventListener('keydown', (e) => {
     }
 
     // 图片键盘控制（左右翻页）
-    if (img) {
+    if (img || imageGridMode) {
+        if (e.key === 'f' || e.key === 'F') {
+            e.preventDefault();
+            toggleGalleryFullscreen();
+            return;
+        }
         if (e.key === 'ArrowLeft') { navigate(-1); return; }
         if (e.key === 'ArrowRight') { navigate(1); return; }
     }

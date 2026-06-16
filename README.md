@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.3**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.5**，发版前请与打包配置核对）。
 
 ---
 
@@ -91,7 +91,7 @@ docker compose up -d --build
 | `MB_PLAY_CACHE_MAX_BYTES` | play-ready 转码缓存上限，超限淘汰最旧文件 | `21474836480`（20 GiB） | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |
 | `MB_SCAN_WORKERS` | 同时处理「作品」任务的线程数；默认 **2**，减少对机械盘/NAS 并发随机读 | `2`（慢速盘 profile 下更保守） | 同上 |
-| `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；越大越慢、读盘越多 | `5`（慢速盘 profile 下更保守） | 同上 |
+| `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；默认每个视频生成 8 张，可显式覆盖 | `8` | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
 | `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
 | `MB_SCAN_PRESETS` | 媒体库白名单：`路径\|标签;路径\|标签`；设后页眉为下拉切换，默认不自动扫描 | 未设置 | 同上 |

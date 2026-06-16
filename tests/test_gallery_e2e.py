@@ -100,6 +100,61 @@ def test_gallery_switch_releases_previous_video(playwright_browser, gallery_e2e_
         page.close()
 
 
+def test_fullscreen_image_grid_shows_and_pages_four_images(
+    playwright_browser, gallery_e2e_server
+):
+    """Image grid renders four images per page and advances by four."""
+    base_url, _ = gallery_e2e_server
+    page = playwright_browser.new_page()
+    try:
+        page.goto(base_url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => typeof openGallery === 'function' && typeof renderGallery === 'function'",
+            timeout=15_000,
+        )
+        page.evaluate(
+            """() => {
+                allWorks = [{
+                    id: 'grid-work',
+                    name: 'grid-work',
+                    path: 'grid-work',
+                    video_count: 0,
+                    image_count: 5,
+                    total_size: 5,
+                    items: Array.from({ length: 5 }, (_, i) => ({
+                        type: 'image',
+                        path: 'grid-' + i + '.jpg',
+                        name: 'image-' + i + '.jpg',
+                        size: 1,
+                        thumb: '',
+                        thumbs: [],
+                    })),
+                }];
+                openGallery('grid-work', 0, -1, { forceItemIdx: true });
+            }"""
+        )
+        page.wait_for_selector("#modal.active", timeout=15_000)
+        result = page.evaluate(
+            """() => {
+                const work = allWorks.find(w => w.id === galleryState.workId);
+                galleryState.itemIdx = 0;
+                imageGridMode = true;
+                document.getElementById('modal').classList.add('image-grid-mode');
+                renderGallery();
+                const firstCount = document.querySelectorAll('#galleryImageGrid img').length;
+                navigateImageGrid(work, 1);
+                return {
+                    firstCount,
+                    secondCount: document.querySelectorAll('#galleryImageGrid img').length,
+                    itemIdx: galleryState.itemIdx,
+                };
+            }"""
+        )
+        assert result == {"firstCount": 4, "secondCount": 1, "itemIdx": 4}
+    finally:
+        page.close()
+
+
 def test_gallery_delete_success_advances_to_next_file(playwright_browser, gallery_e2e_server):
     """删除当前项成功后，画廊应显示同作品下一文件（b）。"""
     base_url, album = gallery_e2e_server

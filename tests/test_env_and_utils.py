@@ -19,6 +19,17 @@ def test_int_env_default_and_bounds(monkeypatch):
     assert mb._int_env("MB_TEST_INT", 3, 1, 10) == 3
 
 
+def test_thumbnail_count_defaults_to_eight_even_for_slow_disks(monkeypatch, tmp_path):
+    monkeypatch.setattr(mb, "_DISK_PROFILE_ENV_SET", True)
+    monkeypatch.setattr(mb, "_THUMB_COUNT_ENV_SET", False)
+    monkeypatch.setattr(mb, "DISK_PROFILE", "nas")
+    monkeypatch.setattr(mb, "THUMB_COUNT", 3)
+
+    mb._apply_perf_profile_for_scan_root(str(tmp_path))
+
+    assert mb.THUMB_COUNT == 8
+
+
 def test_normalize_scan_path_input():
     assert mb._normalize_scan_path_input("  /tmp/foo  ") == "/tmp/foo"
     s = mb._normalize_scan_path_input("\u201c/path/with/curly\u201d")
