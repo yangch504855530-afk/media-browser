@@ -144,15 +144,17 @@ def test_empty_gallery_work_continues_to_next_work(homepage_html: str):
     assert "openGallery(nextWork.id, 0, -1, { forceItemIdx: true });" in js
 
 
-def test_fullscreen_image_grid_contract(homepage_html: str):
-    """Fullscreen image viewing renders four images and pages in groups of four."""
+def test_image_grid_contract(homepage_html: str):
+    """Image viewing renders grouped grids and can delete the visible group."""
     js = _extract_main_script(homepage_html)
     assert "let imageGridMode = false;" in js
-    assert "function renderFullscreenImageGrid(mediaDiv, work)" in js
-    assert "const page = images.slice(start, start + 4);" in js
+    assert "mb_image_grid_size" in js
+    assert "function renderImageGrid(mediaDiv, work)" in js
+    assert "data-image-grid-size=\"6\"" in js
+    assert "function deleteCurrentImageGridGroup(skipConfirm)" in js
     assert "function navigateImageGrid(work, dir)" in js
-    assert "const nextStart = start + (dir > 0 ? 4 : -4);" in js
-    assert 'class="image-grid"' in js
+    assert "const nextStart = start + (dir > 0 ? imageGridSize : -imageGridSize);" in js
+    assert 'class="image-grid size-' in js
 
 
 def test_preset_mode_template_vars_when_presets_configured(

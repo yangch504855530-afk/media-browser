@@ -100,10 +100,10 @@ def test_gallery_switch_releases_previous_video(playwright_browser, gallery_e2e_
         page.close()
 
 
-def test_fullscreen_image_grid_shows_and_pages_four_images(
+def test_image_grid_shows_pages_and_deletes_visible_group(
     playwright_browser, gallery_e2e_server
 ):
-    """Image grid renders four images per page and advances by four."""
+    """Image grid renders 4/6 images per page and deletes the visible group."""
     base_url, _ = gallery_e2e_server
     page = playwright_browser.new_page()
     try:
@@ -119,9 +119,9 @@ def test_fullscreen_image_grid_shows_and_pages_four_images(
                     name: 'grid-work',
                     path: 'grid-work',
                     video_count: 0,
-                    image_count: 5,
-                    total_size: 5,
-                    items: Array.from({ length: 5 }, (_, i) => ({
+                    image_count: 8,
+                    total_size: 8,
+                    items: Array.from({ length: 8 }, (_, i) => ({
                         type: 'image',
                         path: 'grid-' + i + '.jpg',
                         name: 'image-' + i + '.jpg',
@@ -138,25 +138,54 @@ def test_fullscreen_image_grid_shows_and_pages_four_images(
             """() => {
                 const work = allWorks.find(w => w.id === galleryState.workId);
                 galleryState.itemIdx = 0;
-                imageGridMode = true;
-                document.getElementById('modal').classList.add('image-grid-mode');
                 renderGallery();
                 const firstCount = document.querySelectorAll('#galleryImageGrid img').length;
+                setImageGridSize(6);
+                const sixCount = document.querySelectorAll('#galleryImageGrid img').length;
                 navigateImageGrid(work, 1);
                 return {
                     firstCount,
                     secondCount: document.querySelectorAll('#galleryImageGrid img').length,
                     itemIdx: galleryState.itemIdx,
+                    sixCount,
                 };
             }"""
         )
-        assert result == {"firstCount": 4, "secondCount": 1, "itemIdx": 4}
+        assert result == {"firstCount": 4, "sixCount": 6, "secondCount": 2, "itemIdx": 6}
+        deleted = page.evaluate(
+            """async () => {
+                const originalFetch = window.fetch;
+                window.fetch = async (url, opts) => {
+                    if (String(url) === '/api/works/delete-all') {
+                        const body = JSON.parse(opts.body);
+                        return { json: async () => ({ ok: true, deleted_paths: body.paths }) };
+                    }
+                    return originalFetch(url, opts);
+                };
+                const work = allWorks.find(w => w.id === galleryState.workId);
+                imageGridSize = 4;
+                galleryState.itemIdx = 0;
+                renderGallery();
+                await deleteCurrentItem(true);
+                window.fetch = originalFetch;
+                return {
+                    count: work.items.length,
+                    names: work.items.map(it => it.name),
+                    rendered: document.querySelectorAll('#galleryImageGrid img').length,
+                };
+            }"""
+        )
+        assert deleted == {
+            "count": 4,
+            "names": ["image-4.jpg", "image-5.jpg", "image-6.jpg", "image-7.jpg"],
+            "rendered": 4,
+        }
     finally:
         page.close()
 
 
-def test_gallery_delete_success_advances_to_next_file(playwright_browser, gallery_e2e_server):
-    """删除当前项成功后，画廊应显示同作品下一文件（b）。"""
+def test_gallery_delete_shortcut_removes_visible_image_group(playwright_browser, gallery_e2e_server):
+    """Ctrl+I in image grid deletes the currently visible image group."""
     base_url, album = gallery_e2e_server
     page = playwright_browser.new_page()
     dialogs: list[str] = []
@@ -166,13 +195,11 @@ def test_gallery_delete_success_advances_to_next_file(playwright_browser, galler
         assert _current_file_name(page) == "a"
         page.keyboard.press(f"{_delete_mod_key()}+I")
         page.wait_for_function(
-            "() => { const t = document.getElementById('modalFileInfo')?.innerText || '';"
-            " return t.includes('b.jpg') || t.includes('b.JPG'); }",
+            "() => !document.getElementById('modal')?.classList.contains('active')",
             timeout=15_000,
         )
-        assert _current_file_name(page) == "b"
         assert not (album / "a.jpg").exists()
-        assert (album / "b.jpg").exists()
+        assert not (album / "b.jpg").exists()
         assert dialogs == []
     finally:
         page.close()

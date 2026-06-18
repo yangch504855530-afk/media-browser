@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -4740,8 +4740,49 @@ body.batch-open #backToTop.show { bottom: 118px; }
     gap: 10px;
     width: 100%;
     height: 100%;
+    flex: 1;
+    min-height: 0;
     padding: 12px;
     box-sizing: border-box;
+}
+.image-grid-wrap {
+    width: var(--mb-gallery-stage-maxw);
+    height: var(--mb-gallery-stage-maxh);
+    max-width: 100%;
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.image-grid-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: #888;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+.image-grid-toolbar button {
+    background: #181818;
+    border: 1px solid #333;
+    color: #aaa;
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+}
+.image-grid-toolbar button.active {
+    background: #0a84ff;
+    border-color: #0a84ff;
+    color: #fff;
+}
+.image-grid-toolbar button.danger {
+    color: #ff9b9b;
+    border-color: #4a2020;
+}
+.image-grid.size-6 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
 }
 .image-grid-cell {
     min-width: 0;
@@ -4756,31 +4797,28 @@ body.batch-open #backToTop.show { bottom: 118px; }
 .image-grid-cell img {
     width: 100%;
     height: 100%;
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
+    box-shadow: none;
+    border-radius: 6px;
 }
 #modal:fullscreen .modal-sidebar,
-#modal.image-grid-mode .modal-sidebar,
 #modal:fullscreen .file-info,
-#modal.image-grid-mode .file-info,
-#modal:fullscreen .shortcut-hint,
-#modal.image-grid-mode .shortcut-hint {
+#modal:fullscreen .shortcut-hint {
     display: none;
 }
-#modal:fullscreen .modal-main,
-#modal.image-grid-mode .modal-main {
+#modal:fullscreen .modal-main {
     padding: 0;
 }
-#modal:fullscreen #modalMedia,
-#modal.image-grid-mode #modalMedia {
+#modal:fullscreen #modalMedia {
     width: 100%;
     height: 100%;
 }
-#modal:fullscreen .modal-close,
-#modal.image-grid-mode .modal-close {
+#modal:fullscreen .modal-close {
     right: 12px;
 }
-#modal:fullscreen .modal-fs,
-#modal.image-grid-mode .modal-fs {
+#modal:fullscreen .modal-fs {
     right: 60px;
 }
 
@@ -5280,6 +5318,7 @@ let renderOffset = 0;
 let galleryState = { workId: null, itemIdx: 0 };
 let galleryVideoRenderToken = 0;
 let imageGridMode = false;
+let imageGridSize = Number(localStorage.getItem('mb_image_grid_size') || 4) === 6 ? 6 : 4;
 let sidebarOffset = 0;
 let sidebarLimit = 40;
 let lastEnumError = null;
@@ -7023,6 +7062,8 @@ function renderGallery() {
     const url = item.type === 'video' ? buildVideoPlayUrl(item.path) : buildFileUrl(item.path);
 
     if (item.type === 'video') {
+        imageGridMode = false;
+        document.getElementById('modal').classList.remove('image-grid-mode');
         const needsTc = videoNeedsTranscodePlay(item.path);
         const overlayHtml = needsTc
             ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在转码，请稍候…') + '</div>'
@@ -7060,11 +7101,10 @@ function renderGallery() {
             v.focus();
         }
         setupGalleryVideoPinch();
-    } else if (imageGridMode) {
-        renderFullscreenImageGrid(mediaDiv, work);
     } else {
-        mediaDiv.innerHTML = `<div class="img-wrap" id="imgWrap"><img id="galleryImage" src="${url}" loading="lazy" decoding="async" draggable="false" style="cursor:zoom-in;-webkit-user-drag:none;user-select:none;" /></div>`;
-        setupImageZoom();
+        imageGridMode = true;
+        document.getElementById('modal').classList.add('image-grid-mode');
+        renderImageGrid(mediaDiv, work);
     }
 
     const dur = item.duration ? `⏱ ${fmtDuration(item.duration)} · ` : '';
@@ -7315,6 +7355,10 @@ async function deleteCurrentItem(skipConfirm) {
     if (!work) return;
     const item = work.items[galleryState.itemIdx];
     if (!item) return;
+    if (imageGridMode && item.type === 'image') {
+        await deleteCurrentImageGridGroup(skipConfirm);
+        return;
+    }
     const nextWork = work.items.length === 1 ? nextGalleryWorkBeforeRemoval(work.id) : null;
     if (!skipConfirm && !confirm('将永久删除「' + item.name + '」，不可恢复。确定？')) return;
     if (item.type === 'video') releaseGalleryVideoElement();
@@ -7478,20 +7522,92 @@ function imageGridEntries(work) {
         .filter(function (entry) { return entry.item.type === 'image'; });
 }
 
-function renderFullscreenImageGrid(mediaDiv, work) {
+function currentImageGridPage(work) {
     const images = imageGridEntries(work);
+    if (!images.length) return { images: [], start: 0, page: [] };
     const currentPos = Math.max(0, images.findIndex(function (entry) {
         return entry.idx === galleryState.itemIdx;
     }));
-    const start = Math.floor(currentPos / 4) * 4;
-    const page = images.slice(start, start + 4);
-    mediaDiv.innerHTML = '<div class="image-grid" id="galleryImageGrid">'
-        + page.map(function (entry) {
-            return '<div class="image-grid-cell"><img src="' + buildFileUrl(entry.item.path)
+    const start = Math.floor(currentPos / imageGridSize) * imageGridSize;
+    return {
+        images: images,
+        start: start,
+        page: images.slice(start, start + imageGridSize),
+    };
+}
+
+function renderImageGrid(mediaDiv, work) {
+    const group = currentImageGridPage(work);
+    const end = Math.min(group.start + group.page.length, group.images.length);
+    mediaDiv.innerHTML = '<div class="image-grid-wrap">'
+        + '<div class="image-grid-toolbar">'
+        + '<button type="button" data-image-grid-size="4" class="' + (imageGridSize === 4 ? 'active' : '') + '">4张</button>'
+        + '<button type="button" data-image-grid-size="6" class="' + (imageGridSize === 6 ? 'active' : '') + '">6张</button>'
+        + '<span>第 ' + (group.images.length ? (group.start + 1) : 0) + '-' + end + ' / ' + group.images.length + ' 张</span>'
+        + '<button type="button" class="danger" data-image-grid-delete="1">删本组</button>'
+        + '</div>'
+        + '<div class="image-grid size-' + imageGridSize + '" id="galleryImageGrid">'
+        + group.page.map(function (entry) {
+            return '<div class="image-grid-cell" data-image-idx="' + entry.idx + '"><img src="' + buildFileUrl(entry.item.path)
                 + '" loading="eager" decoding="async" draggable="false" alt="'
                 + escapeHtml(entry.item.name) + '"></div>';
         }).join('')
-        + '</div>';
+        + '</div></div>';
+}
+
+function setImageGridSize(size) {
+    imageGridSize = size === 6 ? 6 : 4;
+    localStorage.setItem('mb_image_grid_size', String(imageGridSize));
+    const work = allWorks.find(w => w.id === galleryState.workId);
+    if (work) renderGallery();
+}
+
+async function deleteCurrentImageGridGroup(skipConfirm) {
+    const work = allWorks.find(w => w.id === galleryState.workId);
+    if (!work) return;
+    const group = currentImageGridPage(work);
+    const paths = group.page.map(function (entry) { return entry.item.path; });
+    if (!paths.length) return;
+    if (!skipConfirm && !confirm('将永久删除当前可见的 ' + paths.length + ' 张图片，不可恢复。确定？')) return;
+    const nextWork = paths.length >= work.items.length ? nextGalleryWorkBeforeRemoval(work.id) : null;
+    try {
+        const res = await fetch('/api/works/delete-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ work_path: work.path, paths: paths }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            alert('删除失败: ' + (data.error || '未知错误'));
+            return;
+        }
+        const deletedSet = new Set(data.deleted_paths || []);
+        for (let i = work.items.length - 1; i >= 0; i--) {
+            if (deletedSet.has(work.items[i].path)) {
+                const it = work.items[i];
+                if (it.type === 'video') work.video_count--;
+                else work.image_count--;
+                work.items.splice(i, 1);
+            }
+        }
+        if (work.items.length === 0) {
+            removeEmptyWorkAndContinue(work, nextWork);
+            return;
+        }
+        const remainingImages = imageGridEntries(work);
+        if (remainingImages.length) {
+            const nextStart = Math.min(group.start, Math.max(0, remainingImages.length - 1));
+            galleryState.itemIdx = remainingImages[nextStart].idx;
+        } else {
+            galleryState.itemIdx = Math.max(0, Math.min(galleryState.itemIdx, work.items.length - 1));
+        }
+        galleryState.thumbIdx = -1;
+        sortAndRenderAll();
+        renderGallery();
+        mbRefreshTrashBadge(true);
+    } catch (e) {
+        alert('删除失败: ' + (e.message || String(e)));
+    }
 }
 
 function navigateImageGrid(work, dir) {
@@ -7500,8 +7616,8 @@ function navigateImageGrid(work, dir) {
     const currentPos = Math.max(0, images.findIndex(function (entry) {
         return entry.idx === galleryState.itemIdx;
     }));
-    const start = Math.floor(currentPos / 4) * 4;
-    const nextStart = start + (dir > 0 ? 4 : -4);
+    const start = Math.floor(currentPos / imageGridSize) * imageGridSize;
+    const nextStart = start + (dir > 0 ? imageGridSize : -imageGridSize);
     if (nextStart < 0 || nextStart >= images.length) return;
     galleryState.itemIdx = images[nextStart].idx;
     galleryState.thumbIdx = -1;
@@ -7537,6 +7653,18 @@ document.addEventListener('fullscreenchange', () => {
 
 // 事件委托：卡片列表中的"标为待审"按钮
 document.addEventListener('click', (e) => {
+    const gridSizeBtn = e.target.closest('[data-image-grid-size]');
+    if (gridSizeBtn) {
+        e.stopPropagation();
+        setImageGridSize(Number(gridSizeBtn.dataset.imageGridSize));
+        return;
+    }
+    const gridDeleteBtn = e.target.closest('[data-image-grid-delete]');
+    if (gridDeleteBtn) {
+        e.stopPropagation();
+        deleteCurrentImageGridGroup(false);
+        return;
+    }
     const reviewAction = e.target.closest('[data-review-tag][data-work-id]');
     if (reviewAction) {
         e.stopPropagation();
