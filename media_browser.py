@@ -10,7 +10,7 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
 
 环境变量:
   MB_ROOT_DIR  扫描根目录（脚本默认 /Volumes/Untitled/pri；打包 app 默认 ~/Documents/MediaBrowser）。页眉可改路径并点「应用并扫描」
-  MB_CACHE_DIR 缩略图缓存目录
+  MB_CACHE_DIR 缩略图/播放转码/审阅账本等缓存目录
   MB_PORT      端口（默认 8765）
   MB_HOST      监听地址（默认 127.0.0.1；局域网访问可设 0.0.0.0，并须设置 MB_ACCESS_TOKEN）
   MB_ACCESS_TOKEN 局域网访问令牌；绑定非本机地址时必填
@@ -59,7 +59,65 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
+
+
+def _default_settings_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming")
+        return os.path.join(base, "Media Browser")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Media Browser")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "media-browser")
+
+
+SETTINGS_DIR = os.environ.get("MB_CONFIG_DIR") or _default_settings_dir()
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+
+
+def _load_persistent_settings() -> dict:
+    try:
+        if not os.path.isfile(SETTINGS_PATH):
+            return {}
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_persistent_settings(settings: dict) -> None:
+    os.makedirs(SETTINGS_DIR, exist_ok=True)
+    path = SETTINGS_PATH
+    part = path + ".part"
+    payload = dict(settings or {})
+    with open(part, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(part, path)
+
+
+_PERSISTENT_SETTINGS = _load_persistent_settings()
+
+
+def _configured_cache_dir(default: str) -> str:
+    env_value = (os.environ.get("MB_CACHE_DIR") or "").strip()
+    if env_value:
+        return os.path.abspath(os.path.expanduser(env_value))
+    saved = _PERSISTENT_SETTINGS.get("cache_dir")
+    if isinstance(saved, str) and saved.strip():
+        return os.path.abspath(os.path.expanduser(saved.strip()))
+    return default
+
+
+def _default_cache_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+        return os.path.join(base, "Media Browser", "thumbs")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Media Browser/thumbs")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "media-browser", "thumbs")
 
 
 def _int_env(name: str, default: int, lo: int, hi: int) -> int:
@@ -89,9 +147,8 @@ def _tool_path(name: str) -> str:
 
 if getattr(sys, "frozen", False):
     _dr = os.path.expanduser("~/Documents/MediaBrowser")
-    _dc = os.path.expanduser("~/Library/Application Support/Media Browser/thumbs")
     ROOT_DIR = os.environ.get("MB_ROOT_DIR") or _dr
-    CACHE_DIR = os.environ.get("MB_CACHE_DIR") or _dc
+    CACHE_DIR = _configured_cache_dir(_default_cache_dir())
 else:
     if sys.platform == "darwin":
         _default_root = "/Volumes/Untitled/pri"
@@ -99,9 +156,7 @@ else:
         # Windows / Linux 默认使用用户目录下的 MediaBrowser 文件夹，避免指向不存在的卷
         _default_root = os.path.expanduser("~/MediaBrowser")
     ROOT_DIR = os.environ.get("MB_ROOT_DIR", _default_root)
-    CACHE_DIR = os.environ.get(
-        "MB_CACHE_DIR", os.path.expanduser("~/.cache/media-browser/thumbs")
-    )
+    CACHE_DIR = _configured_cache_dir(_default_cache_dir())
 
 HOST = os.environ.get("MB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MB_PORT", "8765"))
@@ -375,12 +430,21 @@ def _prune_walk_dirs(dirs: list[str], current_root: str, scan_root: str, seen: s
 
 # 通用占位图
 PLACEHOLDER = os.path.join(CACHE_DIR, "_placeholder.jpg")
-if not os.path.exists(PLACEHOLDER):
-    subprocess.run([
-        FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=#1a1a1a:s=400x300",
-        "-frames:v", "1", "-q:v", "3", PLACEHOLDER
-    ], capture_output=True)
+
+
+def _ensure_cache_dir_ready() -> None:
+    global PLACEHOLDER
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    PLACEHOLDER = os.path.join(CACHE_DIR, "_placeholder.jpg")
+    if not os.path.exists(PLACEHOLDER):
+        subprocess.run([
+            FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=#1a1a1a:s=400x300",
+            "-frames:v", "1", "-q:v", "3", PLACEHOLDER
+        ], capture_output=True)
+
+
+_ensure_cache_dir_ready()
 
 # ===================== 工具函数 =====================
 def sha256_str(s: str) -> str:
@@ -1979,6 +2043,75 @@ def resolve_scan_root_path(raw: str) -> tuple[str | None, str | None]:
     return None, last_err or "路径不存在或不是文件夹"
 
 
+def resolve_cache_dir_path(raw: str) -> tuple[str | None, str | None]:
+    t = _normalize_scan_path_input(raw)
+    if not t:
+        return None, "请输入缓存目录路径"
+    if t.startswith("file://"):
+        try:
+            from urllib.parse import unquote, urlparse
+
+            t = unquote(urlparse(t).path)
+        except Exception:
+            return None, "无法解析 file:// 路径"
+    if os.sep == "/" and "\\" in t and not re.match(r"^[A-Za-z]:\\", t):
+        t = t.replace("\\", "/")
+    t = os.path.expanduser(t)
+    if not os.path.isabs(t):
+        t = os.path.abspath(t)
+    try:
+        p = os.path.realpath(os.path.abspath(t))
+    except OSError:
+        p = os.path.abspath(t)
+    if os.path.lexists(p) and not os.path.isdir(p):
+        return None, "缓存路径必须是文件夹，不能是单个文件"
+    try:
+        os.makedirs(p, exist_ok=True)
+        probe = os.path.join(p, f".mb_cache_write_test_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+    except Exception as e:
+        return None, f"缓存目录不可写: {e}"
+    return p, None
+
+
+def cache_settings_payload() -> dict:
+    return {
+        "ok": True,
+        "cache_dir": CACHE_DIR,
+        "settings_path": SETTINGS_PATH,
+        "env_override": bool((os.environ.get("MB_CACHE_DIR") or "").strip()),
+        "cache": _cache_dir_stats(CACHE_DIR),
+    }
+
+
+def replace_cache_dir(new_dir: str) -> tuple[bool, dict]:
+    global CACHE_DIR, scanner
+    p, err = resolve_cache_dir_path(new_dir)
+    if not p:
+        return False, {"ok": False, "error": err or "缓存目录无效"}
+    old_cache = CACHE_DIR
+    CACHE_DIR = p
+    _ensure_cache_dir_ready()
+    _PERSISTENT_SETTINGS["cache_dir"] = p
+    try:
+        _save_persistent_settings(_PERSISTENT_SETTINGS)
+    except Exception as e:
+        CACHE_DIR = old_cache
+        _ensure_cache_dir_ready()
+        return False, {"ok": False, "error": f"保存设置失败: {e}"}
+    logger.info("缓存目录切换为: %s", CACHE_DIR)
+    old = scanner
+    scanner = MediaScanner()
+    scanner.start()
+    try:
+        old._executor.shutdown(wait=False)
+    except Exception:
+        pass
+    return True, cache_settings_payload()
+
+
 def replace_scan_root(new_root: str) -> bool:
     """切换扫描根目录并启动新扫描任务。返回是否成功。"""
     global _scan_root, scanner
@@ -3200,6 +3333,8 @@ class Handler(BaseHTTPRequestHandler):
             presets_json = json.dumps(get_scan_presets(), ensure_ascii=False)
             page = (
                 HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(get_scan_root()))
+                .replace("__MB_CACHE_DIR__", html_mod.escape(CACHE_DIR))
+                .replace("__MB_CACHE_DIR_JSON__", json.dumps(CACHE_DIR, ensure_ascii=False))
                 .replace("__THUMB_COUNT__", str(THUMB_COUNT))
                 .replace("__APP_VERSION__", html_mod.escape(APP_VERSION))
                 .replace(
@@ -3223,6 +3358,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(prog)
         elif path == "/api/tasks":
             self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
+
+        elif path == "/api/settings":
+            self._send_json(cache_settings_payload(), no_store=True)
 
         elif path == "/api/works":
             with scanner.lock:
@@ -3517,6 +3655,24 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                 )
             return
+        if parsed.path == "/api/set-cache-dir":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid json"}, 400)
+                return
+            p = data.get("path", "")
+            if not isinstance(p, str) or not p.strip():
+                self._send_json({"ok": False, "error": "missing path"}, 400)
+                return
+            ok, payload = replace_cache_dir(p)
+            self._send_json(payload, 200 if ok else 400)
+            return
         if parsed.path == "/api/delete-trash/remove":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -3709,7 +3865,8 @@ header {
 }
 header .brand { display: flex; flex-direction: column; gap: 4px; margin-right: auto; min-width: 0; max-width: min(560px, 58vw); }
 header h1 { font-size: 18px; color: #fff; letter-spacing: 0.5px; }
-header .scan-root-row {
+header .scan-root-row,
+header .cache-root-row {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -3718,7 +3875,8 @@ header .scan-root-row {
     color: #888;
     line-height: 1.35;
 }
-header .scan-root-row label { flex-shrink: 0; }
+header .scan-root-row label,
+header .cache-root-row label { flex-shrink: 0; }
 header .scan-root-row.mb-scan-hidden { display: none !important; }
 header .mb-scan-root-hint {
     font-size: 11px;
@@ -3726,7 +3884,8 @@ header .mb-scan-root-hint {
     line-height: 1.35;
     margin-top: 2px;
 }
-header #scanRootInput {
+header #scanRootInput,
+header #cacheDirInput {
     flex: 1;
     min-width: 140px;
     max-width: min(420px, 42vw);
@@ -3749,7 +3908,8 @@ header #scanRootPreset {
 header #scanRootPreset.mb-hidden { display: none !important; }
 header #scanRootPreset:not(.mb-hidden) { display: block; }
 header #scanRootPreset:focus { outline: none; border-color: #0a84ff; }
-header #applyScanRoot {
+header #applyScanRoot,
+header #applyCacheDir {
     flex-shrink: 0;
     font-size: 12px;
     padding: 6px 12px;
@@ -3759,7 +3919,13 @@ header #applyScanRoot {
     color: #0a84ff;
     cursor: pointer;
 }
-header #applyScanRoot:hover { background: rgba(10, 132, 255, 0.28); }
+header #applyScanRoot:hover,
+header #applyCacheDir:hover { background: rgba(10, 132, 255, 0.28); }
+header .mb-cache-status {
+    color: #777;
+    font-size: 11px;
+    min-width: 90px;
+}
 header #exitApp {
     font-size: 12px;
     padding: 6px 12px;
@@ -4919,6 +5085,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
     header .scan-root-row:not(.mb-scan-hidden) { width: 100%; }
     header .scan-root-row:not(.mb-scan-hidden) #scanRootInput { max-width: 100%; font-size: 12px; }
     header .scan-root-row:not(.mb-scan-hidden) #scanRootPreset { max-width: 100%; font-size: 12px; }
+    header .cache-root-row { width: 100%; }
+    header .cache-root-row #cacheDirInput { max-width: 100%; font-size: 12px; }
     header #search { display: none; width: 100%; flex: 1 1 100%; order: 20; }
     body.mb-mobile-search-open header #search { display: block; }
     header #sortSelect,
@@ -5007,6 +5175,12 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <input type="text" id="scanRootInput" value="__MB_ROOT_DIR__" spellcheck="false" autocomplete="off" title="NAS 请先用 Finder（⌘K）挂载，再填 /Volumes/共享名/子路径；不要填 smb:// 地址" placeholder="/Volumes/你的NAS/文件夹" />
             <select id="scanRootPreset" class="mb-hidden" aria-hidden="true" title="在 docker-compose 配置的媒体库之间切换"></select>
             <button type="button" id="applyScanRoot">应用并扫描</button>
+        </div>
+        <div class="cache-root-row" id="cacheDirRow" title="缩略图、播放转码、审阅账本等缓存会放在这里；建议放到空间充足的磁盘，例如 D:\MediaBrowserCache。">
+            <label for="cacheDirInput">缓存目录</label>
+            <input type="text" id="cacheDirInput" value="__MB_CACHE_DIR__" spellcheck="false" autocomplete="off" placeholder="D:\MediaBrowserCache" />
+            <button type="button" id="applyCacheDir">应用缓存目录</button>
+            <span id="cacheDirStatus" class="mb-cache-status"></span>
         </div>
     </div>
     <div class="app-tabs" aria-label="一级菜单">
@@ -5243,6 +5417,7 @@ const THUMB_COUNT = __THUMB_COUNT__;
 const MB_SCAN_READONLY = (__MB_SCAN_READONLY__ === true || String(__MB_SCAN_READONLY__) === 'true');
 const MB_SCAN_PRESET_MODE = (__MB_SCAN_PRESET_MODE__ === true || String(__MB_SCAN_PRESET_MODE__) === 'true');
 const MB_SCAN_PRESETS = __MB_SCAN_PRESETS_JSON__;
+let MB_CACHE_DIR = __MB_CACHE_DIR_JSON__;
 function mbDetectMobile() {
     return window.matchMedia('(max-width: 767px)').matches
         || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
@@ -7863,6 +8038,31 @@ function mbSyncScanRootUi(path) {
     if (drawerSel && document.activeElement !== drawerSel) drawerSel.value = path;
 }
 
+function mbSyncCacheDirUi(path, statusText) {
+    MB_CACHE_DIR = path || MB_CACHE_DIR;
+    const inp = document.getElementById('cacheDirInput');
+    const status = document.getElementById('cacheDirStatus');
+    if (inp && document.activeElement !== inp) inp.value = MB_CACHE_DIR;
+    if (status) status.textContent = statusText || '';
+}
+
+function mbRestartScanUi(statusText) {
+    pollGen++;
+    since = 0;
+    allWorks = [];
+    scanPollDone = false;
+    scanIdle = false;
+    lastEnumError = null;
+    selectedIds.clear();
+    progressFill.style.width = '0%';
+    progressFill.style.background = '';
+    if (statusText) statusEl.textContent = statusText;
+    sortAndRenderAll();
+    poll();
+    mbLoadReviewState();
+    mbRefreshTrashBadge(true);
+}
+
 function mbFillScanPresetSelect(selectEl, currentPath) {
     if (!selectEl || !MB_SCAN_PRESETS || !MB_SCAN_PRESETS.length) return;
     selectEl.innerHTML = '';
@@ -7929,8 +8129,57 @@ async function mbApplyScanRootSwitch() {
     }
 }
 
+async function mbLoadCacheSettings() {
+    try {
+        const res = await fetch('/api/settings', { cache: 'no-store' });
+        const data = await res.json();
+        if (data.ok && data.cache_dir) {
+            mbSyncCacheDirUi(data.cache_dir, '');
+        }
+    } catch (e) {
+        // 非关键路径：页面仍可继续使用注入的缓存目录。
+    }
+}
+
+async function mbApplyCacheDirSwitch() {
+    const inp = document.getElementById('cacheDirInput');
+    const path = inp ? inp.value.trim() : '';
+    if (!path) { alert('请输入缓存目录'); return; }
+    const btn = document.getElementById('applyCacheDir');
+    const oldText = btn ? btn.textContent : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '应用中...';
+    }
+    mbSyncCacheDirUi(path, '检查中...');
+    try {
+        const res = await fetch('/api/set-cache-dir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            mbSyncCacheDirUi(MB_CACHE_DIR, '设置失败');
+            alert(data.error || '设置失败');
+            return;
+        }
+        mbSyncCacheDirUi(data.cache_dir, '已应用，正在重建缩略图');
+        mbRestartScanUi('缓存目录已切换，正在重新扫描并生成缩略图...');
+    } catch (e) {
+        mbSyncCacheDirUi(MB_CACHE_DIR, '设置失败');
+        alert(e.message || String(e));
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = oldText || '应用缓存目录';
+        }
+    }
+}
+
 (function mbInitShell() {
     mbInitScanPresetUi();
+    mbLoadCacheSettings();
     if (MB_SCAN_READONLY && !MB_SCAN_PRESET_MODE) {
         const row = document.getElementById('scanRootRow');
         const scanRootInput = document.getElementById('scanRootInput');
@@ -8084,6 +8333,8 @@ async function mbApplyScanRootSwitch() {
     }
     const applyScanRoot = document.getElementById('applyScanRoot');
     const scanRootInput = document.getElementById('scanRootInput');
+    const applyCacheDir = document.getElementById('applyCacheDir');
+    const cacheDirInput = document.getElementById('cacheDirInput');
     const exitAppBtn = document.getElementById('exitApp');
     if (exitAppBtn) {
         exitAppBtn.addEventListener('click', async () => {
@@ -8100,6 +8351,15 @@ async function mbApplyScanRootSwitch() {
     }
     if (applyScanRoot && scanRootInput) {
         applyScanRoot.addEventListener('click', () => { mbApplyScanRootSwitch(); });
+    }
+    if (applyCacheDir && cacheDirInput) {
+        applyCacheDir.addEventListener('click', () => { mbApplyCacheDirSwitch(); });
+        cacheDirInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                mbApplyCacheDirSwitch();
+            }
+        });
     }
     const applyScanRootDrawer = document.getElementById('applyScanRootDrawer');
     if (applyScanRootDrawer) {

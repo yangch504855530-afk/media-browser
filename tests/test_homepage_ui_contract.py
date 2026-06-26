@@ -17,6 +17,8 @@ def _build_homepage_text() -> str:
     presets_json = json.dumps(mb.get_scan_presets(), ensure_ascii=False)
     return (
         mb.HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(mb.get_scan_root()))
+        .replace("__MB_CACHE_DIR__", html_mod.escape(mb.CACHE_DIR))
+        .replace("__MB_CACHE_DIR_JSON__", json.dumps(mb.CACHE_DIR, ensure_ascii=False))
         .replace("__THUMB_COUNT__", str(mb.THUMB_COUNT))
         .replace("__APP_VERSION__", html_mod.escape(mb.APP_VERSION))
         .replace("__MB_SCAN_READONLY__", "true" if mb.scan_root_readonly() else "false")
@@ -52,6 +54,26 @@ def test_scan_root_dom_markers_unchanged(homepage_html: str):
         'id="applyScanRootDrawer"',
     ):
         assert marker in homepage_html, marker
+
+
+def test_cache_dir_ui_contract(homepage_html: str):
+    js = _extract_main_script(homepage_html)
+    for marker in (
+        'id="cacheDirRow"',
+        'id="cacheDirInput"',
+        'id="applyCacheDir"',
+        'id="cacheDirStatus"',
+        "__MB_CACHE_DIR__",
+    ):
+        if marker == "__MB_CACHE_DIR__":
+            assert marker not in homepage_html
+        else:
+            assert marker in homepage_html, marker
+    assert "let MB_CACHE_DIR =" in js
+    assert "function mbApplyCacheDirSwitch()" in js
+    assert "fetch('/api/set-cache-dir'" in js
+    assert "function mbRestartScanUi(statusText)" in js
+    assert "mbRestartScanUi('缓存目录已切换" in js
 
 
 def test_review_filter_kept_and_pending_labels(homepage_html: str):

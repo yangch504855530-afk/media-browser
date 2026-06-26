@@ -41,6 +41,8 @@ def _build_homepage_bytes() -> bytes:
     presets_json = json.dumps(mb.get_scan_presets(), ensure_ascii=False)
     page = (
         mb.HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(mb.get_scan_root()))
+        .replace("__MB_CACHE_DIR__", html_mod.escape(mb.CACHE_DIR))
+        .replace("__MB_CACHE_DIR_JSON__", json.dumps(mb.CACHE_DIR, ensure_ascii=False))
         .replace("__THUMB_COUNT__", str(mb.THUMB_COUNT))
         .replace("__APP_VERSION__", html_mod.escape(mb.APP_VERSION))
         .replace("__MB_SCAN_READONLY__", "true" if mb.scan_root_readonly() else "false")

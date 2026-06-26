@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.5**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.7**，发版前请与打包配置核对）。
 
 ---
 
@@ -79,7 +79,7 @@ docker compose up -d --build
 | 变量 | 含义 | 默认（脚本） | 默认（打包 .app） |
 |------|------|----------------|-------------------|
 | `MB_ROOT_DIR` | 启动时的扫描根目录；运行中可在**页眉**改路径并「应用并扫描」 | macOS: `/Volumes/Untitled/pri`<br>Win/Linux: `~/MediaBrowser` | `~/Documents/MediaBrowser` |
-| `MB_CACHE_DIR` | 缩略图缓存目录 | `~/.cache/media-browser/thumbs` | `~/Library/Application Support/Media Browser/thumbs` |
+| `MB_CACHE_DIR` | 缩略图/播放转码/审阅账本等缓存目录；也可在页面顶部「缓存目录」中修改 | `~/.cache/media-browser/thumbs` | `~/Library/Application Support/Media Browser/thumbs` |
 | `MB_OLLAMA_HOST` | 本地 Ollama 地址（AI 视频分析） | `http://127.0.0.1:11434` | 同上 |
 | `MB_OLLAMA_MODEL` | 视觉模型名（如 `llava`、`moondream`） | `llava` | 同上 |
 | `MB_OLLAMA_TIMEOUT` | Ollama 单次请求超时（秒） | `300` | 同上 |
