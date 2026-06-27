@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.8"
 
 
 def _default_settings_dir() -> str:

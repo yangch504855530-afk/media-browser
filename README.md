@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.7**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.8**，发版前请与打包配置核对）。
 
 ---
 
@@ -274,6 +274,25 @@ powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 **典型产出**：`dist/MediaBrowser-v<VERSION>-windows.zip`
 
 解压后运行 `MediaBrowser.exe` 即可。
+
+### Windows SmartScreen / 发布者验证
+
+GitHub Actions 生成的 Windows 包如果没有代码签名证书，Windows 可能提示“无法验证发布者”或“无法运行不安全应用”。这是 SmartScreen 对“互联网下载 + 未签名 exe”的拦截，并不等同于程序崩溃。
+
+临时运行方式：
+
+```powershell
+Unblock-File .\MediaBrowser-v1.4.8-windows.zip
+```
+
+先对 zip 执行上面的解除阻止，再解压运行。也可以右键 zip → 属性 → 勾选“解除锁定/解除阻止” → 确定后再解压。Windows zip 内也会附带 `README-WINDOWS.txt`，方便离线查看这一步。
+
+正式分发建议配置 Windows 代码签名证书。GitHub Actions 支持以下仓库 Secrets：
+
+- `WINDOWS_CODE_SIGN_CERT_BASE64`：PFX 证书文件的 Base64 内容
+- `WINDOWS_CODE_SIGN_CERT_PASSWORD`：PFX 证书密码
+
+配置后，发布流程会在打包 zip 前自动签名 `MediaBrowser.exe` 并校验签名。只有使用受信任证书签名后，Windows 才能显示明确发布者；SmartScreen 信誉仍可能需要随下载量逐步建立。
 
 ---
 

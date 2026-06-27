@@ -88,6 +88,31 @@ jobs:
         run: |
           Copy-Item ffmpeg.exe dist\MediaBrowser\
           Copy-Item ffprobe.exe dist\MediaBrowser\
+          (Get-Content packaging\README-WINDOWS.txt -Raw).Replace("VERSION", "${{ env.VERSION }}") |
+            Set-Content -Path dist\MediaBrowser\README-WINDOWS.txt -Encoding UTF8
+        shell: pwsh
+
+      - name: Sign Windows app if certificate is configured
+        env:
+          WINDOWS_CODE_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGN_CERT_BASE64 }}
+          WINDOWS_CODE_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGN_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGN_CERT_BASE64)) {
+            Write-Host "WINDOWS_CODE_SIGN_CERT_BASE64 is not configured; Windows artifact will be unsigned."
+            exit 0
+          }
+          $certPath = Join-Path $env:RUNNER_TEMP "media-browser-signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODE_SIGN_CERT_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found on runner" }
+          $exe = "dist\MediaBrowser\MediaBrowser.exe"
+          & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certPath /p $env:WINDOWS_CODE_SIGN_CERT_PASSWORD $exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          & $signtool.FullName verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { throw "signature verification failed with exit code $LASTEXITCODE" }
         shell: pwsh
 
       - name: Create ZIP

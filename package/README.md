@@ -38,3 +38,5 @@ pytest tests/ -q                            # 全量（含 E2E）
 ## GitHub Release
 
 打 `v*` 标签并 `git push origin v*` 后，`.github/workflows/release.yml` 会构建 macOS / Windows 并上传 Release 资源。
+
+Windows 包若未配置代码签名证书，解压运行时可能被 SmartScreen 提示“无法验证发布者”。临时处理：先对下载的 zip 执行 `Unblock-File .\MediaBrowser-v版本-windows.zip`，或右键 zip → 属性 → 解除阻止，再解压。正式发布可在仓库 Secrets 配置 `WINDOWS_CODE_SIGN_CERT_BASE64` 和 `WINDOWS_CODE_SIGN_CERT_PASSWORD`，Actions 会自动签名 `MediaBrowser.exe`。

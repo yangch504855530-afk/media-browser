@@ -47,6 +47,12 @@ if (-not (Test-Path $DIST)) {
     exit 1
 }
 
+$notice = Join-Path $ROOT "packaging" "README-WINDOWS.txt"
+if (Test-Path $notice) {
+    $noticeOut = Join-Path $DIST "README-WINDOWS.txt"
+    (Get-Content $notice -Raw).Replace("VERSION", $VERSION) | Set-Content -Path $noticeOut -Encoding UTF8
+}
+
 Write-Host "==> Create ZIP archive"
 $ZIP_NAME = "MediaBrowser-v${VERSION}-windows.zip"
 $ZIP_OUT = Join-Path $ROOT "dist" $ZIP_NAME
