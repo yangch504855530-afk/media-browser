@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.8**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.9**，发版前请与打包配置核对）。
 
 ---
 
@@ -96,7 +96,7 @@ docker compose up -d --build
 | `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
 | `MB_SCAN_PRESETS` | 媒体库白名单：`路径\|标签;路径\|标签`；设后页眉为下拉切换，默认不自动扫描 | 未设置 | 同上 |
 | `MB_AUTO_SCAN` | 启动时是否立即扫描（设 `MB_SCAN_PRESETS` 时默认 `0`） | 见说明 | 同上 |
-| `MB_FFMPEG_HW` | 播放转码硬件加速：`off` / `auto` / `vaapi` / `qsv`（Docker 可设 `auto`） | `off` | 同上 |
+| `MB_FFMPEG_HW` | 播放转码硬件加速：`off` / `auto` / `vaapi` / `qsv` / `nvenc` / `amf`。Windows 默认自动尝试 Intel 核显 QSV、NVIDIA NVENC、AMD AMF；失败会回退 CPU | `auto` | 同上 |
 | `MB_FFMPEG_VAAPI_DEVICE` | VAAPI 设备路径 | `/dev/dri/renderD128` 或首个 `renderD*` | 同上 |
 | `MB_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | 同上 |
 | `MB_LOG_FORMAT` | `text`（默认；终端下彩色）或 `json`（单行 JSON，便于采集） | `text` | 同上 |
@@ -176,6 +176,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 
 - 每个视频入库时 **`ffprobe` 仅一次**，结果供元数据与缩略图共用（避免对外置盘/NAS 重复读文件头）。
 - 通过 `MB_SCAN_WORKERS`、`MB_THUMB_COUNT`、`MB_DISK_PROFILE` 控制并发与条带抽帧，减轻机械盘与 NAS 寻道。
+- CPU 占用高通常来自两类任务：扫描时批量生成视频缩略图、播放浏览器不支持的格式时转码。`MB_FFMPEG_HW=auto` 会优先尝试硬件编码；缩略图抽帧也会尝试硬件解码，失败则自动回退 CPU。可在 `/health` 的 `ffmpeg.hw.active` 查看当前实际使用 `qsv`、`nvenc`、`amf`、`vaapi` 还是 `off`。
 
 ---
 
@@ -282,7 +283,7 @@ GitHub Actions 生成的 Windows 包如果没有代码签名证书，Windows 可
 临时运行方式：
 
 ```powershell
-Unblock-File .\MediaBrowser-v1.4.8-windows.zip
+Unblock-File .\MediaBrowser-v1.4.9-windows.zip
 ```
 
 先对 zip 执行上面的解除阻止，再解压运行。也可以右键 zip → 属性 → 勾选“解除锁定/解除阻止” → 确定后再解压。Windows zip 内也会附带 `README-WINDOWS.txt`，方便离线查看这一步。

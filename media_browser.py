@@ -27,7 +27,7 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_SCAN_ROOT_READONLY  页眉扫描根只读（Docker 可与 MB_SCAN_PRESETS 配合）
   MB_SCAN_PRESETS  媒体库白名单，格式 path|标签;path|标签（设此后页眉为下拉切换；默认不自动扫描，MB_AUTO_SCAN=1 可恢复）
   MB_AUTO_SCAN  启动时是否立即扫描（默认：未设 preset 时为是；设了 MB_SCAN_PRESETS 时为否）
-  MB_FFMPEG_HW  播放转码硬件加速：off | auto | vaapi | qsv（默认 off；Docker 可设 auto）
+  MB_FFMPEG_HW  播放转码硬件加速：off | auto | vaapi | qsv | nvenc | amf（默认 auto）
   MB_FFMPEG_VAAPI_DEVICE  VAAPI 设备路径（默认 /dev/dri/renderD128 或 renderD*）
 
 完整说明（功能、环境变量、打包、路线图）见项目根目录 README.md。
@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.8"
+APP_VERSION = "1.4.9"
 
 
 def _default_settings_dir() -> str:
@@ -528,15 +528,18 @@ def _play_job_lock(key: str) -> threading.Lock:
 
 _ffmpeg_hw_lock = threading.Lock()
 _ffmpeg_hw_cached: dict | None = None
+_ffmpeg_encoder_usable_cache: dict[str, bool] = {}
 
 
 def _ffmpeg_hw_configured() -> str:
-    raw = (os.environ.get("MB_FFMPEG_HW") or "off").strip().lower()
+    raw = (os.environ.get("MB_FFMPEG_HW") or "auto").strip().lower()
     if raw in ("off", "0", "false", "no"):
         return "off"
-    if raw in ("auto", "vaapi", "qsv"):
+    if raw in ("1", "true", "yes", "on"):
+        return "auto"
+    if raw in ("auto", "vaapi", "qsv", "nvenc", "amf"):
         return raw
-    return "off"
+    return "auto"
 
 
 def _ffmpeg_vaapi_device_path() -> str | None:
@@ -570,10 +573,64 @@ def _ffmpeg_has_encoder(encoder: str) -> bool:
         return False
 
 
+def _ffmpeg_null_output() -> str:
+    return "NUL" if os.name == "nt" else "/dev/null"
+
+
+def _ffmpeg_encoder_test_args(mode: str) -> list[str]:
+    encoder = {
+        "qsv": "h264_qsv",
+        "nvenc": "h264_nvenc",
+        "amf": "h264_amf",
+    }.get(mode)
+    if not encoder:
+        return []
+    args = [
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=1",
+        "-frames:v", "1",
+        "-c:v", encoder,
+    ]
+    if mode == "nvenc":
+        args += ["-preset", "fast"]
+    elif mode == "amf":
+        args += ["-quality", "speed"]
+    elif mode == "qsv":
+        args += ["-preset", "veryfast"]
+    args += ["-f", "null", _ffmpeg_null_output()]
+    return args
+
+
+def _ffmpeg_encoder_runtime_usable(mode: str) -> bool:
+    """Return whether the hardware encoder can actually run on this machine."""
+    if mode in _ffmpeg_encoder_usable_cache:
+        return _ffmpeg_encoder_usable_cache[mode]
+    encoder = {
+        "qsv": "h264_qsv",
+        "nvenc": "h264_nvenc",
+        "amf": "h264_amf",
+    }.get(mode)
+    ok = False
+    if encoder and _ffmpeg_has_encoder(encoder):
+        try:
+            r = subprocess.run(
+                _ffmpeg_encoder_test_args(mode),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            ok = r.returncode == 0
+        except Exception:
+            ok = False
+    _ffmpeg_encoder_usable_cache[mode] = ok
+    return ok
+
+
 def _invalidate_ffmpeg_hw_cache() -> None:
-    global _ffmpeg_hw_cached
+    global _ffmpeg_hw_cached, _ffmpeg_encoder_usable_cache
     with _ffmpeg_hw_lock:
         _ffmpeg_hw_cached = None
+        _ffmpeg_encoder_usable_cache = {}
 
 
 def resolve_ffmpeg_hw() -> dict:
@@ -586,9 +643,10 @@ def resolve_ffmpeg_hw() -> dict:
         device = _ffmpeg_vaapi_device_path()
         active = "off"
         error: str | None = None
+        details: list[str] = []
         if configured == "off":
             pass
-        elif configured in ("auto", "vaapi"):
+        elif configured == "vaapi":
             if not device:
                 error = "未找到 /dev/dri/renderD*（Docker 需挂载 devices 与 group_add render）"
             elif not os.access(device, os.R_OK | os.W_OK):
@@ -602,6 +660,48 @@ def resolve_ffmpeg_hw() -> dict:
                 error = "ffmpeg 无 h264_qsv 编码器"
             else:
                 active = "qsv"
+            if active == "qsv" and not _ffmpeg_encoder_runtime_usable("qsv"):
+                active = "off"
+                error = "h264_qsv 无法在当前机器运行（可能没有 Intel 核显/驱动）"
+        elif configured == "nvenc":
+            if not _ffmpeg_has_encoder("h264_nvenc"):
+                error = "ffmpeg 无 h264_nvenc 编码器"
+            elif not _ffmpeg_encoder_runtime_usable("nvenc"):
+                error = "h264_nvenc 无法在当前机器运行（可能没有 NVIDIA 显卡/驱动）"
+            else:
+                active = "nvenc"
+        elif configured == "amf":
+            if not _ffmpeg_has_encoder("h264_amf"):
+                error = "ffmpeg 无 h264_amf 编码器"
+            elif not _ffmpeg_encoder_runtime_usable("amf"):
+                error = "h264_amf 无法在当前机器运行（可能没有 AMD 显卡/驱动）"
+            else:
+                active = "amf"
+        elif configured == "auto":
+            candidates = ["qsv", "nvenc", "amf"] if os.name == "nt" else ["vaapi", "qsv", "nvenc", "amf"]
+            for mode in candidates:
+                why = None
+                if mode == "vaapi":
+                    if not device:
+                        why = "未找到 /dev/dri/renderD*"
+                    elif not os.access(device, os.R_OK | os.W_OK):
+                        why = f"无法访问 VAAPI 设备 {device}"
+                    elif not _ffmpeg_has_encoder("h264_vaapi"):
+                        why = "ffmpeg 无 h264_vaapi 编码器"
+                    else:
+                        active = "vaapi"
+                else:
+                    encoder = {"qsv": "h264_qsv", "nvenc": "h264_nvenc", "amf": "h264_amf"}[mode]
+                    if not _ffmpeg_has_encoder(encoder):
+                        why = f"ffmpeg 无 {encoder} 编码器"
+                    elif not _ffmpeg_encoder_runtime_usable(mode):
+                        why = f"{encoder} 无法在当前机器运行"
+                    else:
+                        active = mode
+                if active != "off":
+                    break
+                if why:
+                    details.append(f"{mode}: {why}")
         if configured == "auto" and active == "off" and error:
             error = None
         _ffmpeg_hw_cached = {
@@ -610,6 +710,7 @@ def resolve_ffmpeg_hw() -> dict:
             "device": device if active == "vaapi" else None,
             "available": active != "off",
             "error": error,
+            "details": details,
         }
         return dict(_ffmpeg_hw_cached)
 
@@ -624,6 +725,14 @@ def _ffmpeg_sw_video_encode_args(preset: str) -> list[str]:
         "-profile:v", "baseline", "-level", "3.1",
         "-pix_fmt", "yuv420p",
     ]
+
+
+def _ffmpeg_thumb_hwaccel_args() -> list[str]:
+    hw = resolve_ffmpeg_hw()
+    active = hw.get("active") or "off"
+    if active in ("vaapi", "qsv", "nvenc", "amf"):
+        return ["-hwaccel", "auto"]
+    return []
 
 
 def _ffmpeg_build_transcode_cmd(
@@ -661,6 +770,28 @@ def _ffmpeg_build_transcode_cmd(
             "-map", "0:v:0",
             "-c:v", "h264_qsv", "-preset", "veryfast",
             "-profile:v", "baseline", "-level", "3.1",
+        ]
+    elif hw_mode == "nvenc":
+        cmd += [
+            "-hwaccel", "auto",
+            "-fflags", "+genpts", "-err_detect", "ignore_err",
+            "-i", source,
+            "-map", "0:v:0",
+            "-c:v", "h264_nvenc", "-preset", "fast",
+            "-profile:v", "main", "-level", "3.1",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
+        ]
+    elif hw_mode == "amf":
+        cmd += [
+            "-hwaccel", "auto",
+            "-fflags", "+genpts", "-err_detect", "ignore_err",
+            "-i", source,
+            "-map", "0:v:0",
+            "-c:v", "h264_amf", "-quality", "speed",
+            "-profile:v", "main", "-level", "3.1",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
         ]
     else:
         cmd += [
@@ -701,7 +832,7 @@ def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
     hw = resolve_ffmpeg_hw()
     active = hw.get("active") or "off"
     device = hw.get("device")
-    if active in ("vaapi", "qsv"):
+    if active in ("vaapi", "qsv", "nvenc", "amf"):
         cmd = _ffmpeg_build_transcode_cmd(
             source,
             dest,
@@ -713,7 +844,7 @@ def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
         try:
             _ffmpeg_run_transcode(cmd, source)
             if os.path.isfile(dest) and os.path.getsize(dest) >= 512:
-                logger.info("play 转码使用 %s（%s）", active, device or "qsv")
+                logger.info("play 转码使用 %s（%s）", active, device or active)
                 return
             raise RuntimeError("转码输出为空或过小")
         except Exception as e:
@@ -1529,14 +1660,23 @@ def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str
     ss = "00:00:01"
     if info["duration"] > 3:
         ss = str(info["duration"] / 3)
+    hwaccel = _ffmpeg_thumb_hwaccel_args()
     cmd = [
         FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-        "-threads", "1", "-an", "-dn", "-sn",
+        "-threads", "1", *hwaccel, "-an", "-dn", "-sn",
         "-ss", ss, "-i", video_path,
         "-frames:v", "1", "-vf", f"scale={THUMB_WIDTH}:-1", "-q:v", "3", dst
     ]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0 and hwaccel:
+            cmd = [
+                FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                "-threads", "1", "-an", "-dn", "-sn",
+                "-ss", ss, "-i", video_path,
+                "-frames:v", "1", "-vf", f"scale={THUMB_WIDTH}:-1", "-q:v", "3", dst
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=60)
     except Exception:
         pass
     ensure_placeholder(dst)
@@ -1571,9 +1711,10 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
         else:
             ss = 1
 
+        hwaccel = _ffmpeg_thumb_hwaccel_args()
         cmd = [
             FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", "1", "-an", "-dn", "-sn",
+            "-threads", "1", *hwaccel, "-an", "-dn", "-sn",
             "-ss", str(ss), "-i", video_path,
             "-frames:v", "1", "-vf", f"scale={THUMB_WIDTH}:-1",
             "-c:v", "mjpeg", "-strict", "unofficial",
@@ -1581,6 +1722,16 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=60)
+            if result.returncode != 0 and hwaccel:
+                cmd = [
+                    FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+                    "-threads", "1", "-an", "-dn", "-sn",
+                    "-ss", str(ss), "-i", video_path,
+                    "-frames:v", "1", "-vf", f"scale={THUMB_WIDTH}:-1",
+                    "-c:v", "mjpeg", "-strict", "unofficial",
+                    "-q:v", "3", dst
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=60)
             if result.returncode != 0:
                 err = result.stderr.decode()[:200] if result.stderr else "unknown"
                 logger.warning("ffmpeg thumb error %s @ %.1fs: %s", video_path, ss, err)
@@ -3158,11 +3309,12 @@ class Handler(BaseHTTPRequestHandler):
         hw = resolve_ffmpeg_hw()
         active = hw.get("active") or "off"
         device = hw.get("device")
+        using_hw = active in ("vaapi", "qsv", "nvenc", "amf")
         cmd = _ffmpeg_build_transcode_cmd(
             fpath,
             "pipe:1",
             has_audio=has_audio,
-            hw_mode=active if active in ("vaapi", "qsv") else "off",
+            hw_mode=active if using_hw else "off",
             vaapi_device=device,
             for_pipe=True,
         )
@@ -3179,9 +3331,41 @@ class Handler(BaseHTTPRequestHandler):
                 err = (proc.stderr.read(800) if proc.stderr else b"").decode(
                     "utf-8", errors="replace"
                 ).strip()
-                logger.warning("转码无输出 %s: %s", fpath, err or "empty stdout")
-                self.send_error(502, "transcode failed")
-                return
+                if using_hw:
+                    logger.warning("实时转码 %s 失败，回退 CPU: %s", active, err or "empty stdout")
+                    _unregister_ffmpeg_proc(fpath, proc)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    cmd = _ffmpeg_build_transcode_cmd(
+                        fpath,
+                        "pipe:1",
+                        has_audio=has_audio,
+                        hw_mode="off",
+                        vaapi_device=None,
+                        for_pipe=True,
+                    )
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        bufsize=0,
+                    )
+                    _register_ffmpeg_proc(fpath, proc)
+                    first = proc.stdout.read(65536) if proc.stdout else b""
+                    using_hw = False
+                if not first:
+                    err = (proc.stderr.read(800) if proc.stderr else b"").decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    logger.warning("转码无输出 %s: %s", fpath, err or "empty stdout")
+                    self.send_error(502, "transcode failed")
+                    return
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Cache-Control", "no-store")
@@ -8447,6 +8631,13 @@ def main():
         "扫描并发=%s，每视频条带缩略图=%s（可用 MB_SCAN_WORKERS / MB_THUMB_COUNT / MB_DISK_PROFILE 调整）",
         MAX_WORKERS,
         THUMB_COUNT,
+    )
+    hw = resolve_ffmpeg_hw()
+    logger.info(
+        "FFmpeg 硬件加速: configured=%s, active=%s, available=%s",
+        hw.get("configured"),
+        hw.get("active"),
+        hw.get("available"),
     )
     if DISK_PROFILE in ("slow", "nas", "hdd", "mechanical"):
         logger.info(

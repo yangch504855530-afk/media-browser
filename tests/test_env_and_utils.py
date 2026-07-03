@@ -77,13 +77,19 @@ def test_tags_to_chinese_sentence():
 
 def test_ffmpeg_hw_configured(monkeypatch):
     monkeypatch.delenv("MB_FFMPEG_HW", raising=False)
-    assert mb._ffmpeg_hw_configured() == "off"
+    assert mb._ffmpeg_hw_configured() == "auto"
     monkeypatch.setenv("MB_FFMPEG_HW", "auto")
     mb._invalidate_ffmpeg_hw_cache()
     assert mb._ffmpeg_hw_configured() == "auto"
+    monkeypatch.setenv("MB_FFMPEG_HW", "nvenc")
+    mb._invalidate_ffmpeg_hw_cache()
+    assert mb._ffmpeg_hw_configured() == "nvenc"
+    monkeypatch.setenv("MB_FFMPEG_HW", "amf")
+    mb._invalidate_ffmpeg_hw_cache()
+    assert mb._ffmpeg_hw_configured() == "amf"
     monkeypatch.setenv("MB_FFMPEG_HW", "bogus")
     mb._invalidate_ffmpeg_hw_cache()
-    assert mb._ffmpeg_hw_configured() == "off"
+    assert mb._ffmpeg_hw_configured() == "auto"
 
 
 def test_resolve_ffmpeg_hw_off(monkeypatch):
@@ -97,13 +103,29 @@ def test_resolve_ffmpeg_hw_off(monkeypatch):
 
 def test_resolve_ffmpeg_hw_auto_without_device(monkeypatch):
     monkeypatch.setenv("MB_FFMPEG_HW", "auto")
+    monkeypatch.setattr(mb.os, "name", "posix")
     monkeypatch.setattr(mb, "_ffmpeg_vaapi_device_path", lambda: None)
     monkeypatch.setattr(mb, "_ffmpeg_has_encoder", lambda _e: True)
+    monkeypatch.setattr(mb, "_ffmpeg_encoder_runtime_usable", lambda _mode: False)
     mb._invalidate_ffmpeg_hw_cache()
     hw = mb.resolve_ffmpeg_hw()
     assert hw["active"] == "off"
     assert hw["available"] is False
     assert hw["error"] is None
+    assert "details" in hw
+
+
+def test_resolve_ffmpeg_hw_auto_prefers_windows_qsv(monkeypatch):
+    monkeypatch.setenv("MB_FFMPEG_HW", "auto")
+    monkeypatch.setattr(mb.os, "name", "nt")
+    monkeypatch.setattr(mb, "_ffmpeg_vaapi_device_path", lambda: None)
+    monkeypatch.setattr(mb, "_ffmpeg_has_encoder", lambda _e: True)
+    monkeypatch.setattr(mb, "_ffmpeg_encoder_runtime_usable", lambda mode: mode == "qsv")
+    mb._invalidate_ffmpeg_hw_cache()
+    hw = mb.resolve_ffmpeg_hw()
+    assert hw["configured"] == "auto"
+    assert hw["active"] == "qsv"
+    assert hw["available"] is True
 
 
 def test_ffmpeg_build_transcode_cmd_vaapi():
@@ -118,3 +140,26 @@ def test_ffmpeg_build_transcode_cmd_vaapi():
     assert "-vaapi_device" in cmd
     assert "h264_vaapi" in cmd
     assert cmd[-1] == "/out.mp4"
+
+
+def test_ffmpeg_build_transcode_cmd_nvenc_and_amf():
+    nv = mb._ffmpeg_build_transcode_cmd(
+        "/src.avi",
+        "/out.mp4",
+        has_audio=False,
+        hw_mode="nvenc",
+        vaapi_device=None,
+        for_pipe=False,
+    )
+    assert "h264_nvenc" in nv
+    assert "-hwaccel" in nv
+    amf = mb._ffmpeg_build_transcode_cmd(
+        "/src.avi",
+        "pipe:1",
+        has_audio=True,
+        hw_mode="amf",
+        vaapi_device=None,
+        for_pipe=True,
+    )
+    assert "h264_amf" in amf
+    assert "pipe:1" == amf[-1]
