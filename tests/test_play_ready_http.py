@@ -13,6 +13,31 @@ import pytest
 import media_browser as mb
 
 
+def test_play_ready_mp4_direct_by_default_but_can_force_transcode(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    work = root / "album"
+    work.mkdir(parents=True)
+    mp4 = work / "clip.mp4"
+    mp4.write_bytes(b"fake mp4 body")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(mb, "CACHE_DIR", str(cache))
+    old_root = mb.get_scan_root()
+    try:
+        assert mb.replace_scan_root(str(root.resolve())) is True
+        direct = mb.play_ready_payload(str(mp4))
+        assert direct["ok"] is True
+        assert direct["ready"] is True
+        assert direct["url"].startswith("/file?path=")
+
+        monkeypatch.setattr(mb, "_tool_version_ok", lambda _bin: (False, "forced missing"))
+        forced = mb.play_ready_payload(str(mp4), force_transcode=True)
+        assert forced["ok"] is False
+        assert "ffmpeg" in forced["error"].lower()
+    finally:
+        mb.replace_scan_root(old_root)
+
+
 @pytest.fixture()
 def avi_server(tmp_path, monkeypatch):
     work = tmp_path / "album"

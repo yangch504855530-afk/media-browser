@@ -16,6 +16,16 @@ def test_mobile_native_mp4_uses_file_only():
     assert mb.video_should_use_play_endpoint("/a/b/c.mp4", mobile=False) is False
 
 
+def test_mp4_prefers_direct_even_for_browser_unfriendly_codecs():
+    for codec in ("hevc", "h265", "hvc1", "hev1", "mpeg4", "prores", "av1"):
+        assert mb.video_codec_needs_transcoded_play("/a/b/c.mp4", codec=codec) is True
+        assert mb.video_should_use_play_endpoint("/a/b/c.mp4", codec=codec) is False
+        assert mb.video_should_use_play_endpoint("/a/b/c.mov", codec=codec) is False
+    for codec in ("h264", "avc1", "AVC"):
+        assert mb.video_codec_needs_transcoded_play("/a/b/c.mp4", codec=codec) is False
+        assert mb.video_should_use_play_endpoint("/a/b/c.mp4", codec=codec) is False
+
+
 def test_mobile_mkv_webm_need_transcode():
     for ext in (".mkv", ".webm", ".mpg", ".mpeg"):
         assert ext in mb.VIDEO_EXTS

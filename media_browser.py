@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.4.9"
+APP_VERSION = "1.5.0"
 
 
 def _default_settings_dir() -> str:
@@ -260,6 +260,10 @@ _SKIP_SCAN_SUBDIR_NAMES = frozenset({".Trash", ".Trashes"})
 PLAY_TRANSCODE_EXTS = frozenset({".avi", ".ts", ".mts", ".m2ts", ".wmv", ".vob", ".flv"})
 # 手机浏览器通常可直接播放（走 /file + Range）；其余格式走 /play 转码
 MOBILE_NATIVE_PLAY_EXTS = frozenset({".mp4", ".m4v", ".mov", ".3gp"})
+# MP4/MOV are containers: browser playback is reliable for AVC/H.264, while
+# HEVC/H.265, MPEG-4 Part 2, ProRes, etc. need the /play transcode path.
+MP4_BROWSER_NATIVE_CODECS = frozenset({"h264", "avc1"})
+WEBM_BROWSER_NATIVE_CODECS = frozenset({"vp8", "vp9", "av1"})
 
 if getattr(sys, "frozen", False):
     os.makedirs(ROOT_DIR, exist_ok=True)
@@ -373,16 +377,41 @@ def video_needs_transcoded_play(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in PLAY_TRANSCODE_EXTS
 
 
-def video_play_needs_transcode(path: str, mobile: bool = False) -> bool:
-    return video_should_use_play_endpoint(path, mobile=mobile)
+def normalize_video_codec(codec) -> str:
+    c = re.sub(r"[^a-z0-9]+", "", str(codec or "").strip().lower())
+    if c in ("avc", "avc1", "h264", "x264"):
+        return "h264"
+    if c in ("hevc", "h265", "hvc1", "hev1", "x265"):
+        return "hevc"
+    return c
 
 
-def video_should_use_play_endpoint(path: str, mobile: bool = False) -> bool:
+def video_codec_needs_transcoded_play(path: str, codec=None) -> bool:
+    c = normalize_video_codec(codec)
+    if not c:
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    if ext in MOBILE_NATIVE_PLAY_EXTS:
+        return c not in MP4_BROWSER_NATIVE_CODECS
+    if ext == ".webm":
+        return c not in WEBM_BROWSER_NATIVE_CODECS
+    return False
+
+
+def video_play_needs_transcode(path: str, mobile: bool = False, codec=None) -> bool:
+    return video_should_use_play_endpoint(path, mobile=mobile, codec=codec)
+
+
+def video_should_use_play_endpoint(path: str, mobile: bool = False, codec=None) -> bool:
     """是否应走 GET /play（实时转 H.264）。手机端 mp4/mov 等优先 /file 直出。"""
     ext = os.path.splitext(path)[1].lower()
     if ext not in VIDEO_EXTS:
         return False
     if ext in PLAY_TRANSCODE_EXTS:
+        return True
+    if ext in MOBILE_NATIVE_PLAY_EXTS:
+        return False
+    if video_codec_needs_transcoded_play(path, codec):
         return True
     if mobile and ext not in MOBILE_NATIVE_PLAY_EXTS:
         return True
@@ -900,7 +929,7 @@ def _play_transcode_worker(source: str, key: str) -> None:
             }
 
 
-def play_ready_payload(source: str) -> dict:
+def play_ready_payload(source: str, force_transcode: bool = False) -> dict:
     """GET /api/play-ready — 异步转码到 play_mp4 缓存，完成后用 /file Range 播放。"""
     try:
         rp = os.path.realpath(source)
@@ -911,7 +940,7 @@ def play_ready_payload(source: str) -> dict:
     ext = os.path.splitext(rp)[1].lower()
     if ext not in VIDEO_EXTS:
         return {"ok": False, "ready": False, "status": "error", "error": "不是支持的视频格式"}
-    if not video_should_use_play_endpoint(rp, mobile=True):
+    if not force_transcode and not video_should_use_play_endpoint(rp, mobile=True):
         from urllib.parse import quote
 
         return {
@@ -3646,7 +3675,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/play-ready":
             fpath = qs.get("path", [""])[0]
             fpath = unquote(fpath)
-            self._send_json(play_ready_payload(fpath), no_store=True)
+            force_transcode = (qs.get("force", [""])[0] or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            self._send_json(play_ready_payload(fpath, force_transcode=force_transcode), no_store=True)
 
         elif path == "/api/review-state":
             self._send_json(review_state_get_payload(), no_store=True)
@@ -4833,8 +4868,10 @@ body.batch-open #backToTop.show { bottom: 118px; }
     transform: scale(0.96);
     transition: opacity 0.25s ease, transform 0.25s ease;
     --mb-gallery-sidebar: min(460px, 44vw);
-    --mb-gallery-stage-maxw: min(52vw, calc(100vw - var(--mb-gallery-sidebar) - 96px));
-    --mb-gallery-stage-maxh: min(56vh, calc(100vh - 190px));
+    --mb-gallery-main-pad-x: 16px;
+    --mb-gallery-main-pad-y: 12px;
+    --mb-gallery-stage-maxw: calc(100vw - var(--mb-gallery-sidebar) - (var(--mb-gallery-main-pad-x) * 2));
+    --mb-gallery-stage-maxh: calc(100vh - 86px);
 }
 .modal.active .modal-body {
     opacity: 1;
@@ -4847,17 +4884,41 @@ body.batch-open #backToTop.show { bottom: 118px; }
     align-items: center;
     justify-content: center;
     position: relative;
-    padding: 20px;
+    padding: var(--mb-gallery-main-pad-y) var(--mb-gallery-main-pad-x);
+    min-width: 0;
+    min-height: 0;
+}
+#modalMedia {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    width: 100%;
+    max-width: var(--mb-gallery-stage-maxw);
+    max-height: var(--mb-gallery-stage-maxh);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 46px;
+    box-sizing: border-box;
 }
 .modal-main .video-wrap,
 .modal-main #galleryVideoWrap {
-    max-width: var(--mb-gallery-stage-maxw);
-    max-height: var(--mb-gallery-stage-maxh);
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
 }
 .modal-main .video-wrap video,
 .modal-main #galleryVideoWrap video {
+    width: 100%;
+    height: 100%;
     max-width: 100%;
-    max-height: var(--mb-gallery-stage-maxh);
+    max-height: 100%;
+    object-fit: contain;
 }
 .modal-main .transcode-overlay {
     position: absolute;
@@ -4877,8 +4938,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
 }
 .modal-main video,
 .modal-main img {
-    max-width: min(100%, var(--mb-gallery-stage-maxw));
-    max-height: var(--mb-gallery-stage-maxh);
+    max-width: 100%;
+    max-height: 100%;
     border-radius: 8px;
     box-shadow: 0 10px 40px rgba(0,0,0,0.5);
 }
@@ -4887,15 +4948,17 @@ body.batch-open #backToTop.show { bottom: 118px; }
     font-size: 13px;
     color: #aaa;
     text-align: center;
-    max-width: 80%;
+    max-width: calc(100% - 40px);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    flex-shrink: 0;
 }
 .modal-main .shortcut-hint {
     margin-top: 8px;
     font-size: 11px;
     color: #666;
+    flex-shrink: 0;
 }
 .modal-nav {
     position: absolute;
@@ -5073,12 +5136,15 @@ body.batch-open #backToTop.show { bottom: 118px; }
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    max-width: var(--mb-gallery-stage-maxw);
-    max-height: var(--mb-gallery-stage-maxh);
-    width: auto;
-    height: auto;
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 100%;
 }
 .img-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
     transition: transform 0.1s ease-out;
     transform-origin: center center;
     user-select: none;
@@ -5096,8 +5162,8 @@ body.batch-open #backToTop.show { bottom: 118px; }
     box-sizing: border-box;
 }
 .image-grid-wrap {
-    width: var(--mb-gallery-stage-maxw);
-    height: var(--mb-gallery-stage-maxh);
+    width: 100%;
+    height: 100%;
     max-width: 100%;
     max-height: 100%;
     display: flex;
@@ -5164,6 +5230,9 @@ body.batch-open #backToTop.show { bottom: 118px; }
 #modal:fullscreen #modalMedia {
     width: 100%;
     height: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    padding: 0;
 }
 #modal:fullscreen .modal-close {
     right: 12px;
@@ -5175,9 +5244,12 @@ body.batch-open #backToTop.show { bottom: 118px; }
 @media (max-width: 900px) {
     .modal-body {
         --mb-gallery-sidebar: 0px;
-        --mb-gallery-stage-maxw: min(92vw, calc(100vw - 20px));
-        --mb-gallery-stage-maxh: min(58vh, calc(100vh - 180px));
+        --mb-gallery-main-pad-x: 10px;
+        --mb-gallery-main-pad-y: 10px;
+        --mb-gallery-stage-maxw: calc(100vw - 20px);
+        --mb-gallery-stage-maxh: calc(100vh - 128px);
     }
+    #modalMedia { padding: 0 34px; }
     .modal-sidebar { display: none; }
     .modal-close { right: 12px; }
     .modal-fs { right: 60px; }
@@ -5916,10 +5988,10 @@ async function mbTrashRetryAllAction() {
 const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob','.flv']);
 /** 手机可原生播放的封装 → /file Range 直出（iOS 对 /play pipe fMP4 极不稳定） */
 const MOBILE_NATIVE_VIDEO_EXTS = new Set(['.mp4','.m4v','.mov','.3gp']);
-function buildVideoPlayUrl(filePath) {
-    const i = filePath.lastIndexOf('.');
-    const ext = i >= 0 ? filePath.slice(i).toLowerCase() : '';
-    if (videoNeedsTranscodePlay(filePath)) {
+const MP4_NATIVE_VIDEO_CODECS = new Set(['h264','avc1']);
+const WEBM_NATIVE_VIDEO_CODECS = new Set(['vp8','vp9','av1']);
+function buildVideoPlayUrl(filePath, item) {
+    if (videoItemNeedsTranscodePlay(item || { path: filePath })) {
         return '/play?path=' + encodeURIComponent(filePath);
     }
     return '/file?path=' + encodeURIComponent(filePath);
@@ -5931,14 +6003,34 @@ function videoNeedsTranscodePlay(filePath) {
     if (mbMobile && !MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return true;
     return false;
 }
-async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken) {
+function normalizeVideoCodec(codec) {
+    const c = String(codec || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (['avc','avc1','h264','x264'].includes(c)) return 'h264';
+    if (['hevc','h265','hvc1','hev1','x265'].includes(c)) return 'hevc';
+    return c;
+}
+function videoCodecNeedsTranscodePlay(filePath, codec) {
+    const c = normalizeVideoCodec(codec);
+    if (!c) return false;
+    const i = filePath.lastIndexOf('.');
+    const ext = i >= 0 ? filePath.slice(i).toLowerCase() : '';
+    if (MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return !MP4_NATIVE_VIDEO_CODECS.has(c);
+    if (ext === '.webm') return !WEBM_NATIVE_VIDEO_CODECS.has(c);
+    return false;
+}
+function videoItemNeedsTranscodePlay(item) {
+    if (!item) return false;
+    return videoNeedsTranscodePlay(item.path || '');
+}
+async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, forceTranscode) {
     if (!videoEl || !overlayEl) return;
     overlayEl.style.display = 'flex';
     const t0 = Date.now();
     for (;;) {
         if (renderToken !== galleryVideoRenderToken || !videoEl.isConnected) return;
         try {
-            const res = await fetch('/api/play-ready?path=' + encodeURIComponent(filePath), { cache: 'no-store' });
+            const url = '/api/play-ready?path=' + encodeURIComponent(filePath) + (forceTranscode ? '&force=1' : '');
+            const res = await fetch(url, { cache: 'no-store' });
             const data = await res.json();
             if (renderToken !== galleryVideoRenderToken || !videoEl.isConnected) return;
             if (data.ready && data.url) {
@@ -5958,6 +6050,53 @@ async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken) {
         }
         await new Promise(function (r) { setTimeout(r, 1500); });
     }
+}
+function videoDirectPlayShouldBeWatched(item) {
+    if (!item || !item.path) return false;
+    const i = item.path.lastIndexOf('.');
+    const ext = i >= 0 ? item.path.slice(i).toLowerCase() : '';
+    if (!MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return false;
+    return !item.codec || videoCodecNeedsTranscodePlay(item.path || '', item.codec);
+}
+function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderToken, reason) {
+    if (renderToken !== galleryVideoRenderToken || !videoEl || !videoEl.isConnected) return;
+    if (!overlayEl) return;
+    try {
+        videoEl.pause();
+        videoEl.removeAttribute('src');
+        videoEl.load();
+    } catch (e) {}
+    overlayEl.textContent = reason || 'MP4 直放失败，正在转码...';
+    overlayEl.style.display = 'flex';
+    const hideOverlay = () => { overlayEl.style.display = 'none'; };
+    videoEl.addEventListener('playing', hideOverlay, { once: true });
+    videoEl.addEventListener('canplay', hideOverlay, { once: true });
+    prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, true);
+}
+function watchDirectVideoFrames(item, videoEl, overlayEl, renderToken, onFallback) {
+    if (!videoDirectPlayShouldBeWatched(item)) return;
+    if (!videoEl || typeof videoEl.requestVideoFrameCallback !== 'function') return;
+    let gotFrame = false;
+    let scheduled = false;
+    function scheduleCheck() {
+        if (scheduled) return;
+        scheduled = true;
+        gotFrame = false;
+        try {
+            videoEl.requestVideoFrameCallback(function () { gotFrame = true; });
+        } catch (e) {
+            return;
+        }
+        setTimeout(function () {
+            if (renderToken !== galleryVideoRenderToken || !videoEl.isConnected || gotFrame) return;
+            if (videoEl.paused && videoEl.currentTime < 0.2) return;
+            if (videoEl.readyState >= 2 || videoEl.currentTime > 0.2) {
+                onFallback('MP4 直放没有输出画面，正在转码...');
+            }
+        }, 3500);
+    }
+    videoEl.addEventListener('playing', scheduleCheck, { once: true });
+    videoEl.addEventListener('timeupdate', scheduleCheck, { once: true });
 }
 function showGalleryVideoError(ov) {
     if (!ov) return;
@@ -7418,12 +7557,12 @@ function renderGallery() {
     const infoDiv = document.getElementById('modalFileInfo');
     const sidebarTitle = document.getElementById('sidebarTitle');
     const fileList = document.getElementById('fileList');
-    const url = item.type === 'video' ? buildVideoPlayUrl(item.path) : buildFileUrl(item.path);
+    const url = item.type === 'video' ? buildVideoPlayUrl(item.path, item) : buildFileUrl(item.path);
 
     if (item.type === 'video') {
         imageGridMode = false;
         document.getElementById('modal').classList.remove('image-grid-mode');
-        const needsTc = videoNeedsTranscodePlay(item.path);
+        const needsTc = videoItemNeedsTranscodePlay(item);
         const overlayHtml = needsTc
             ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在转码，请稍候…') + '</div>'
             : '<div id="transcodeOverlay" class="transcode-overlay" style="display:none"></div>';
@@ -7431,14 +7570,27 @@ function renderGallery() {
         const v = document.getElementById('galleryVideo');
         const ov = document.getElementById('transcodeOverlay');
         if (v && ov) {
+            let fallbackStarted = false;
+            const startFallback = (reason) => {
+                if (fallbackStarted) return;
+                fallbackStarted = true;
+                fallbackGalleryVideoToTranscode(item.path, v, ov, videoRenderToken, reason);
+            };
             const hideOv = () => { ov.style.display = 'none'; };
             v.addEventListener('playing', hideOv, { once: true });
             v.addEventListener('canplay', hideOv, { once: true });
-            v.addEventListener('error', () => { showGalleryVideoError(ov); }, { once: true });
+            v.addEventListener('error', () => {
+                if (!needsTc && videoDirectPlayShouldBeWatched(item)) {
+                    startFallback('MP4 直放失败，正在转码...');
+                } else {
+                    showGalleryVideoError(ov);
+                }
+            }, { once: true });
             if (needsTc) {
                 prepareGalleryVideo(item.path, v, ov, videoRenderToken);
             } else {
-                v.src = buildVideoPlayUrl(item.path);
+                v.src = buildVideoPlayUrl(item.path, item);
+                watchDirectVideoFrames(item, v, ov, videoRenderToken, startFallback);
             }
         }
         if (v) {

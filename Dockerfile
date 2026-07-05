@@ -1,11 +1,11 @@
 # Media Browser — Python + ffmpeg/ffprobe（与 media_browser.py 要求一致）
-# 发版时请与仓库内 APP_VERSION（当前 v1.4.2）对齐；镜像 tag 建议 media-browser:1.4.2
+# 发版时请与仓库内 APP_VERSION（当前 v1.5.0）对齐；镜像 tag 建议 media-browser:1.5.0
 FROM python:3.12-slim-bookworm
 
 # NAS / 国内网络构建时 apt 拉 deb.debian.org 易超时，导致「Unable to locate package ffmpeg」。
 # docker compose 默认传 mirrors.aliyun.com；海外直连可：docker compose build --build-arg APT_MIRROR=
 ARG APT_MIRROR=mirrors.aliyun.com
-ARG APP_VERSION=1.4.2
+ARG APP_VERSION=1.5.0
 LABEL org.opencontainers.image.title="Media Browser" \
       org.opencontainers.image.version="${APP_VERSION}"
 

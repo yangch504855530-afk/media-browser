@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.4.9**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.5.0**，发版前请与打包配置核对）。
 
 ---
 
@@ -252,7 +252,7 @@ chmod +x packaging/build_dmg.sh
 | 自动开浏览器 | 默认关，`MB_AUTO_OPEN=1` 可开 | 默认开，`MB_AUTO_OPEN=0` 可关 |
 | 控制台 | 当前终端 | 双击常为控制台窗口（可在 spec 改 `console=False`） |
 
-> **注意：** macOS 版本为 **Apple Silicon (M1/M2/M3/M4)** 专用。Intel Mac 用户请使用脚本直接运行。
+> **注意：** GitHub Release 会分别产出 **macOS Intel** 与 **macOS Apple Silicon (M1/M2/M3/M4)** 的 DMG；本地手动执行脚本时会按当前机器架构构建。
 
 正式分发需自行 **codesign / notarize**（此处不展开）。
 
@@ -283,7 +283,7 @@ GitHub Actions 生成的 Windows 包如果没有代码签名证书，Windows 可
 临时运行方式：
 
 ```powershell
-Unblock-File .\MediaBrowser-v1.4.9-windows.zip
+Unblock-File .\MediaBrowser-v1.5.0-windows.zip
 ```
 
 先对 zip 执行上面的解除阻止，再解压运行。也可以右键 zip → 属性 → 勾选“解除锁定/解除阻止” → 确定后再解压。Windows zip 内也会附带 `README-WINDOWS.txt`，方便离线查看这一步。

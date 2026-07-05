@@ -65,7 +65,12 @@ cp -R "$DISTDIR/" "$ROOT/dist/"
 APP="$ROOT/dist/Media Browser.app"
 strip_appledouble "$APP"
 
-DMG_NAME="Media Browser v${VERSION}.dmg"
+DMG_SUFFIX="${MB_DMG_FLAVOR:-}"
+if [[ -n "$DMG_SUFFIX" ]]; then
+  DMG_NAME="Media Browser v${VERSION}-${DMG_SUFFIX}.dmg"
+else
+  DMG_NAME="Media Browser v${VERSION}.dmg"
+fi
 DMG_TMP="${TMPDIR:-/tmp}/${DMG_NAME}"
 DMG_OUT="$ROOT/dist/$DMG_NAME"
 

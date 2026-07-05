@@ -129,6 +129,7 @@ def test_embedded_js_parseable_with_node(homepage_html: str):
             ["node", "--check"],
             input=js,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             timeout=30,
             check=True,
@@ -148,6 +149,19 @@ def test_gallery_switch_releases_and_invalidates_previous_video(homepage_html: s
     assert "galleryVideoRenderToken++;" in js
     assert "renderToken !== galleryVideoRenderToken || !videoEl.isConnected" in js
     assert "videoRenderToken !== galleryVideoRenderToken || !v.isConnected" in js
+
+
+def test_gallery_video_mp4_direct_first_with_fallback(homepage_html: str):
+    """MP4 containers direct-play first, then force transcode only if playback fails."""
+    js = _extract_main_script(homepage_html)
+    assert "const MP4_NATIVE_VIDEO_CODECS = new Set(['h264','avc1']);" in js
+    assert "function videoCodecNeedsTranscodePlay(filePath, codec)" in js
+    assert "function videoItemNeedsTranscodePlay(item)" in js
+    assert "return videoNeedsTranscodePlay(item.path || '');" in js
+    assert "function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderToken, reason)" in js
+    assert "function watchDirectVideoFrames(item, videoEl, overlayEl, renderToken, onFallback)" in js
+    assert "force=1" in js
+    assert "buildVideoPlayUrl(item.path, item)" in js
 
 
 def test_gallery_delete_shortcuts_skip_confirmation(homepage_html: str):
@@ -177,6 +191,18 @@ def test_image_grid_contract(homepage_html: str):
     assert "function navigateImageGrid(work, dir)" in js
     assert "const nextStart = start + (dir > 0 ? imageGridSize : -imageGridSize);" in js
     assert 'class="image-grid size-' in js
+
+
+def test_gallery_media_stage_uses_available_space(homepage_html: str):
+    """Gallery media should fill the left viewing stage instead of being capped to a small viewport."""
+    assert "--mb-gallery-stage-maxw: calc(100vw - var(--mb-gallery-sidebar)" in homepage_html
+    assert "--mb-gallery-stage-maxh: calc(100vh - 86px);" in homepage_html
+    assert "#modalMedia {" in homepage_html
+    assert "flex: 1;" in homepage_html
+    assert ".modal-main #galleryVideoWrap video" in homepage_html
+    assert "object-fit: contain;" in homepage_html
+    assert ".image-grid-wrap" in homepage_html
+    assert "height: 100%;" in homepage_html
 
 
 def test_preset_mode_template_vars_when_presets_configured(
