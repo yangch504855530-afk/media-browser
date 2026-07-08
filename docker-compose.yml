@@ -1,12 +1,23 @@
+# Media Browser — Docker 部署
+#
 # 项目目录（本机路径）：/vol1/1000/handle-pri/media-browser
 # 内含：media_browser.py、Dockerfile、docker-compose.yml；缩略图缓存在同级的 cache/ 子目录。
 # 在此目录执行：docker compose up -d --build
 #
 # 扫描根在容器内固定为 /scan；MB_SCAN_PRESETS 列出页内可切换的媒体库。
 #
-# 首次建议执行：
+# ★ 宿主机路径与渲染组 GID 已改为环境变量（见下方 volumes / group_add），
+#   默认值即作者当前 NAS 布局，可直接使用；换机器时复制 .env.example 为 .env 再按需修改，
+#   或命令行临时注入，例如：
+#     MB_CACHE_HOST_DIR=/your/cache \
+#     MB_TMP_HOST_DIR=/your/tmp \
+#     MB_TORRENT_HOST_DIR=/your/torrent \
+#     MB_RENDER_GID=103 \
+#     MB_ACCESS_TOKEN='...' \
+#     docker compose up -d --build
+#
+# 首次建议先创建宿主机缓存目录：
 #   mkdir -p "/vol1/1000/handle-pri/media-browser/cache"
-#   mkdir -p "/vol3/1000/handle-3T-cun3/torrent/auto-down"
 #
 # 权限说明：
 #   容器默认以 uid=1000 运行。如果宿主机你的用户 UID 不是 1000，
@@ -30,7 +41,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      - "105"
+      - "${MB_RENDER_GID:-105}"
     ports:
       - "8765:8765"
     environment:
@@ -63,6 +74,6 @@ services:
       retries: 3
       start_period: 60s
     volumes:
-      - /vol1/1000/handle-pri/media-browser/cache:/cache
-      - /vol3/1000/handle-3T-cun3/tmp:/scan/tmp
-      - /vol3/1000/handle-3T-cun3/torrent/auto-down:/scan/torrent
+      - "${MB_CACHE_HOST_DIR:-/vol1/1000/handle-pri/media-browser/cache}:/cache"
+      - "${MB_TMP_HOST_DIR:-/vol3/1000/handle-3T-cun3/tmp}:/scan/tmp"
+      - "${MB_TORRENT_HOST_DIR:-/vol3/1000/handle-3T-cun3/torrent/auto-down}:/scan/torrent"

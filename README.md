@@ -302,8 +302,8 @@ Unblock-File .\MediaBrowser-v1.5.0-windows.zip
 项目已配置 GitHub Actions，推送 `v*` 标签时自动构建并发布：
 
 ```bash
-git tag v1.0.13
-git push origin v1.0.13
+git tag v1.5.0
+git push origin v1.5.0
 ```
 
 Actions 会并行构建：
