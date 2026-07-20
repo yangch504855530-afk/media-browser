@@ -94,10 +94,51 @@ def test_review_filter_kept_and_pending_labels(homepage_html: str):
     assert ">保留</button>" in homepage_html
 
 
+def test_v2_personal_asset_ui_contract(homepage_html: str):
+    js = _extract_main_script(homepage_html)
+    assert 'id="preferenceSummary"' in homepage_html
+    assert 'id="refreshPreferenceSummary"' in homepage_html
+    assert "function mbPatchReviewVideo(item, patch)" in js
+    assert "function getVideoReviewTag(item)" in js
+    assert "function loadPreferenceSummary()" in js
+    assert "fetch('/api/preferences/summary'" in js
+    assert 'data-current-video-rating="' in js
+    assert "function setCurrentVideoRating(rating)" in js
+    assert "function advanceToNextVideoAfterDecision()" in js
+    assert "advanceToNextVideoAfterDecision();" in js
+    assert "firstVideoIdx" in js
+    assert "/^[0-5]$/.test(e.key)" in js
+    assert "setCurrentVideoRating(Number(e.key));" in js
+    assert "mb-video-rating-row" in homepage_html
+    assert "flex: 0 0 30px" in homepage_html
+    assert "0 待删除" in homepage_html
+    assert "自动分类" in js
+    assert "editWorkProfile" not in js
+
+
+def test_analysis_uses_exception_review_dashboard(homepage_html: str):
+    js = _extract_main_script(homepage_html)
+    for marker in (
+        'id="analysisReviewSummary"',
+        'id="analysisReviewList"',
+        'id="analysisBulkAccept"',
+        'id="analysisBulkRetry"',
+        'id="analysisBulkExclude"',
+        'id="analysisAdvancedDetails"',
+        "function loadAnalysisReview(silent)",
+        "function analysisReviewAction(action, videoIds)",
+        "fetch('/api/analysis-review'",
+        "fetch('/api/analysis-review/action'",
+    ):
+        assert marker in homepage_html or marker in js, marker
+    assert "高置信度且分类完整的视频会自动接受" in homepage_html
+    assert "演员姓名仍是候选，不影响其他分类自动生效" in js
+
+
 def test_quick_review_is_deferred_and_advances(homepage_html: str):
     js = _extract_main_script(homepage_html)
     assert "function quickReviewCurrentWork(tag)" in js
-    assert "quickReviewCurrentWork(e.key === '1' ? 'kept'" in js
+    assert "quickReviewCurrentWork(e.key === '1' ? 'kept'" not in js
     assert "quickReviewCurrentWork('deleted')" in js
     assert "quickReviewCurrentWork('kept');" in js
     assert "(e.key === 'l' || e.key === 'L')" in js

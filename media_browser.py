@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0.0"
 
 
 def _default_settings_dir() -> str:
@@ -157,6 +157,11 @@ else:
         _default_root = os.path.expanduser("~/MediaBrowser")
     ROOT_DIR = os.environ.get("MB_ROOT_DIR", _default_root)
     CACHE_DIR = _configured_cache_dir(_default_cache_dir())
+
+if not (os.environ.get("MB_ROOT_DIR") or "").strip():
+    _saved_scan_root = _PERSISTENT_SETTINGS.get("scan_root")
+    if isinstance(_saved_scan_root, str) and _saved_scan_root.strip():
+        ROOT_DIR = _saved_scan_root.strip()
 
 HOST = os.environ.get("MB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MB_PORT", "8765"))
@@ -1007,7 +1012,7 @@ def _review_state_store_path(scan_root: str | None = None) -> str:
 def empty_review_state(scan_root: str | None = None) -> dict:
     root = os.path.realpath(scan_root or get_scan_root())
     return {
-        "version": 1,
+        "version": 2,
         "scan_root": root,
         "updated_at": None,
         "global": {
@@ -1016,6 +1021,7 @@ def empty_review_state(scan_root: str | None = None) -> dict:
             "last_opened_at": None,
         },
         "works": {},
+        "videos": {},
     }
 
 
@@ -1031,13 +1037,19 @@ def load_review_state(scan_root: str | None = None) -> dict:
             return empty_review_state(scan_root)
         if not isinstance(data, dict):
             return empty_review_state(scan_root)
-        data.setdefault("version", 1)
+        # v2 keeps the JSON ledger portable while extending each work with
+        # rating/features/categories and optional AI suggestions.  Old v1
+        # ledgers are upgraded lazily and written as v2 on the next change.
+        data["version"] = 2
         data.setdefault("global", {})
         data.setdefault("works", {})
+        data.setdefault("videos", {})
         if not isinstance(data["global"], dict):
             data["global"] = {}
         if not isinstance(data["works"], dict):
             data["works"] = {}
+        if not isinstance(data["videos"], dict):
+            data["videos"] = {}
         data["global"].setdefault("last_work_id", None)
         data["global"].setdefault("last_item_path", None)
         data["global"].setdefault("last_opened_at", None)
@@ -1048,11 +1060,12 @@ def save_review_state(state: dict, scan_root: str | None = None) -> None:
     path = _review_state_store_path(scan_root)
     root = os.path.realpath(scan_root or get_scan_root())
     payload = dict(state)
-    payload["version"] = 1
+    payload["version"] = 2
     payload["scan_root"] = root
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload.setdefault("global", {})
     payload.setdefault("works", {})
+    payload.setdefault("videos", {})
     os.makedirs(os.path.dirname(path), exist_ok=True)
     part = path + ".part"
     with _review_state_lock:
@@ -1107,6 +1120,368 @@ def patch_review_state_work(work_id: str, patch: dict) -> dict:
 
     save_review_state(state)
     return {"ok": True, "work_id": work_id, "work": entry, "global": gl}
+
+
+def video_asset_id(path: str) -> str:
+    return sha256_str(os.path.normcase(os.path.realpath(path)))
+
+
+def patch_review_state_video(video_id: str, patch: dict) -> dict:
+    if not video_id or not re.fullmatch(r"[0-9a-fA-F]{16}", video_id):
+        return {"ok": False, "error": "invalid video_id"}
+    if not isinstance(patch, dict):
+        return {"ok": False, "error": "invalid patch"}
+    state = load_review_state()
+    videos = state.setdefault("videos", {})
+    entry = dict(videos.get(video_id) or {})
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if "path" in patch:
+        path = patch.get("path")
+        if not isinstance(path, str) or video_asset_id(path) != video_id:
+            return {"ok": False, "error": "path does not match video_id"}
+        entry["path"] = os.path.realpath(path)
+    if "tag" in patch:
+        tag = patch.get("tag")
+        if tag not in ("kept", "pending", "deleted"):
+            return {"ok": False, "error": "tag must be kept, pending or deleted"}
+        entry["tag"] = tag
+        entry["tag_updated_at"] = now
+    if "rating" in patch:
+        raw_rating = patch.get("rating")
+        if raw_rating is None:
+            entry.pop("rating", None)
+            entry["tag"] = "pending"
+        else:
+            try:
+                rating = int(raw_rating)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "rating must be an integer from 0 to 5 or null"}
+            if not 0 <= rating <= 5:
+                return {"ok": False, "error": "rating must be an integer from 0 to 5 or null"}
+            entry["rating"] = rating
+            entry["tag"] = "deleted" if rating == 0 else "kept"
+            existing_ai = entry.get("ai_analysis") if isinstance(entry.get("ai_analysis"), dict) else {}
+            if existing_ai.get("status") != "done":
+                entry["ai_analysis"] = dict(existing_ai, status="queued", queued_at=now)
+        entry["rating_updated_at"] = now
+        entry["tag_updated_at"] = now
+    # These fields are machine-owned: the UI never asks the user to author them.
+    if "ai_analysis" in patch:
+        value = patch.get("ai_analysis")
+        if not isinstance(value, dict):
+            return {"ok": False, "error": "ai_analysis must be an object"}
+        entry["ai_analysis"] = value
+        entry["ai_analysis_updated_at"] = now
+    if "features" in patch:
+        value = patch.get("features")
+        if not isinstance(value, dict):
+            return {"ok": False, "error": "features must be an object"}
+        entry["features"] = value
+        entry["features_updated_at"] = now
+    if "categories" in patch:
+        value = patch.get("categories")
+        if not isinstance(value, list):
+            return {"ok": False, "error": "categories must be an array"}
+        entry["categories"] = list(dict.fromkeys(str(x).strip()[:80] for x in value if str(x).strip()))[:30]
+        entry["categories_updated_at"] = now
+    videos[video_id] = entry
+    save_review_state(state)
+    return {"ok": True, "video_id": video_id, "video": entry}
+
+
+def save_automatic_video_analysis(path: str, insight: dict, provider: str, model: str) -> dict:
+    """Persist model output as video-owned features/categories."""
+    vid = video_asset_id(path)
+    tags = insight.get("tags") or []
+    if isinstance(tags, str):
+        tags = [x.strip() for x in re.split(r"[,，;；|/]", tags) if x.strip()]
+    dimensions = [
+        ("人数", insight.get("people_count")),
+        ("场景", insight.get("scene_type")),
+        ("制作", insight.get("production_type")),
+        ("镜头", insight.get("camera_style")),
+        ("叙事", insight.get("story_level")),
+        ("语言", insight.get("audio_language")),
+        ("地区", insight.get("content_region")),
+    ]
+    unavailable = {"不确定", "无音轨", "无可识别语音"}
+    categories = [f"{name}:{value}" for name, value in dimensions if value and value not in unavailable]
+    categories.extend(str(x).strip() for x in (insight.get("distinctive_features") or []) if str(x).strip())
+    categories.extend(f"演员:{name}" for name in (insight.get("performers") or []) if str(name).strip())
+    if insight.get("studio"):
+        categories.append(f"制作方:{insight['studio']}")
+    if insight.get("title_code"):
+        categories.append(f"编号:{insight['title_code']}")
+    if not categories:
+        categories.extend(str(x).strip() for x in tags if str(x).strip())
+    categories = list(dict.fromkeys(categories))[:30]
+    features = {
+        "时间": insight.get("time_guess") or "",
+        "地点": insight.get("place_guess") or "",
+        "事件": insight.get("event_guess") or "",
+        "内容描述": insight.get("phrase") or "",
+        "人物数量": insight.get("people_count") or "",
+        "场景类型": insight.get("scene_type") or "",
+        "制作类型": insight.get("production_type") or "",
+        "镜头风格": insight.get("camera_style") or "",
+        "叙事程度": insight.get("story_level") or "",
+        "置信度": insight.get("confidence") if insight.get("confidence") is not None else "",
+        "演员": "、".join(insight.get("performers") or []),
+        "候选演员": "、".join(insight.get("performer_candidates") or []),
+        "身份依据": json.dumps(insight.get("performer_evidence") or {}, ensure_ascii=False),
+        "制作方": insight.get("studio") or "",
+        "作品编号": insight.get("title_code") or "",
+        "身份置信度": insight.get("identity_confidence") if insight.get("identity_confidence") is not None else "",
+        "音频语言": insight.get("audio_language") or "",
+        "音频语言代码": insight.get("audio_language_code") or "",
+        "语言置信度": insight.get("audio_language_confidence") if insight.get("audio_language_confidence") is not None else "",
+        "地区来源": insight.get("content_region") or "",
+        "地区置信度": insight.get("region_confidence") if insight.get("region_confidence") is not None else "",
+        "地区依据": "；".join(str(x) for x in (insight.get("region_evidence") or []) if str(x).strip()),
+    }
+    features = {k: v for k, v in features.items() if v}
+    return patch_review_state_video(vid, {
+        "path": path,
+        "categories": categories,
+        "features": features,
+        "ai_analysis": {"provider": provider, "model": model, "status": "done", "schema_version": 4, "raw": insight},
+    })
+
+
+def preference_summary_payload() -> dict:
+    """Derive transparent classification evidence from the user's own labels."""
+    state = load_review_state()
+    videos = state.get("videos") or {}
+    tag_counts = {"kept": 0, "pending": 0, "deleted": 0}
+    rating_counts = {str(i): 0 for i in range(1, 6)}
+    categories: dict[str, dict] = {}
+    features: dict[str, dict[str, int]] = {}
+    rated = 0
+    for entry in videos.values():
+        if not isinstance(entry, dict):
+            continue
+        tag = entry.get("tag", "pending")
+        if tag in tag_counts:
+            tag_counts[tag] += 1
+        rating = entry.get("rating", 0)
+        if isinstance(rating, int) and 1 <= rating <= 5:
+            rating_counts[str(rating)] += 1
+            rated += 1
+        for label in entry.get("categories") or []:
+            if not isinstance(label, str) or not label.strip():
+                continue
+            row = categories.setdefault(label.strip(), {"total": 0, "kept": 0, "deleted": 0})
+            row["total"] += 1
+            if tag in ("kept", "deleted"):
+                row[tag] += 1
+        for key, value in (entry.get("features") or {}).items():
+            if not isinstance(key, str) or isinstance(value, (dict, list)):
+                continue
+            val = str(value).strip()
+            if val:
+                bucket = features.setdefault(key.strip(), {})
+                bucket[val] = bucket.get(val, 0) + 1
+    category_rows = [dict(name=name, **counts) for name, counts in categories.items()]
+    category_rows.sort(key=lambda row: (-row["total"], row["name"].lower()))
+    feature_rows = []
+    for name, values in features.items():
+        top_values = sorted(values.items(), key=lambda pair: (-pair[1], pair[0].lower()))[:10]
+        feature_rows.append({"name": name, "values": [{"value": v, "count": n} for v, n in top_values]})
+    feature_rows.sort(key=lambda row: row["name"].lower())
+    return {
+        "ok": True,
+        "ledger_version": 2,
+        "reviewed": tag_counts["kept"] + tag_counts["deleted"],
+        "rated": rated,
+        "tag_counts": tag_counts,
+        "rating_counts": rating_counts,
+        "categories": category_rows,
+        "features": feature_rows,
+    }
+
+
+ANALYSIS_AUTO_ACCEPT_CONFIDENCE = 0.80
+ANALYSIS_REVIEW_CONFIDENCE = 0.55
+ANALYSIS_REQUIRED_DIMENSIONS = (
+    "people_count",
+    "scene_type",
+    "production_type",
+    "camera_style",
+    "story_level",
+)
+
+
+def _analysis_confidence(value) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def analysis_review_decision(entry: dict) -> dict:
+    """Return a small, explainable review bucket for one video ledger entry."""
+    entry = entry if isinstance(entry, dict) else {}
+    ai = entry.get("ai_analysis") if isinstance(entry.get("ai_analysis"), dict) else {}
+    raw = ai.get("raw") if isinstance(ai.get("raw"), dict) else {}
+    manual = entry.get("analysis_review") if isinstance(entry.get("analysis_review"), dict) else {}
+    manual_status = manual.get("status")
+    if manual_status in ("accepted", "excluded"):
+        return {
+            "status": manual_status,
+            "reason": "已人工接受" if manual_status == "accepted" else "已从自动分类中排除",
+            "confidence": _analysis_confidence(raw.get("confidence")),
+            "completeness": 0,
+            "identity_pending": False,
+        }
+
+    ai_status = str(ai.get("status") or "missing")
+    confidence = _analysis_confidence(raw.get("confidence"))
+    present = sum(
+        1 for key in ANALYSIS_REQUIRED_DIMENSIONS
+        if str(raw.get(key) or "").strip() not in ("", "不确定", "未知")
+    )
+    candidates = [str(x).strip() for x in (raw.get("performer_candidates") or []) if str(x).strip()]
+    confirmed = [str(x).strip() for x in (raw.get("performers") or []) if str(x).strip()]
+    identity_pending = bool(candidates and not confirmed)
+    if ai_status in ("queued", "running"):
+        status, reason = "processing", "正在排队或分析"
+    elif ai_status == "error":
+        status, reason = "attention", "分析失败，需要重试"
+    elif ai_status != "done":
+        status, reason = "attention", "尚未得到有效分析结果"
+    elif confidence >= ANALYSIS_AUTO_ACCEPT_CONFIDENCE and present >= 4:
+        status, reason = "auto_accepted", "高置信度且主要分类完整，已自动接受"
+    elif confidence >= ANALYSIS_REVIEW_CONFIDENCE:
+        status, reason = "review", "置信度一般或分类不够完整"
+    else:
+        status, reason = "attention", "置信度较低，需要重点复核"
+    return {
+        "status": status,
+        "reason": reason,
+        "confidence": confidence,
+        "completeness": present,
+        "identity_pending": identity_pending,
+    }
+
+
+def analysis_review_payload() -> dict:
+    """Build the exception-review dashboard from current per-video state."""
+    state = load_review_state()
+    ledger = state.get("videos") or {}
+    paths = []
+    progress = scanner.get_progress(0)
+    for work in progress.get("works") or []:
+        for item in work.get("items") or []:
+            path = item.get("path")
+            if item.get("type") == "video" and isinstance(path, str):
+                paths.append(path)
+    if not paths:
+        paths = [entry.get("path") for entry in ledger.values() if isinstance(entry, dict) and entry.get("path")]
+
+    counts = {key: 0 for key in ("auto_accepted", "accepted", "review", "attention", "processing", "excluded")}
+    rows = []
+    identity_pending = 0
+    region_pending = 0
+    for path in sorted(set(paths)):
+        video_id = video_asset_id(path)
+        entry = ledger.get(video_id) if isinstance(ledger.get(video_id), dict) else {}
+        decision = analysis_review_decision(entry)
+        status = decision["status"]
+        counts[status] = counts.get(status, 0) + 1
+        if decision["identity_pending"]:
+            identity_pending += 1
+        ai = entry.get("ai_analysis") if isinstance(entry.get("ai_analysis"), dict) else {}
+        raw = ai.get("raw") if isinstance(ai.get("raw"), dict) else {}
+        content_region = str(raw.get("content_region") or "不确定")
+        audio_language = str(raw.get("audio_language") or "不确定")
+        region_evidence = raw.get("region_evidence") or []
+        if isinstance(region_evidence, str):
+            region_evidence = [region_evidence]
+        if not isinstance(region_evidence, list):
+            region_evidence = []
+        if ai.get("status") == "done" and content_region in ("", "不确定"):
+            region_pending += 1
+        rows.append({
+            "video_id": video_id,
+            "path": path,
+            "filename": os.path.basename(path),
+            "status": status,
+            "reason": decision["reason"],
+            "confidence": decision["confidence"],
+            "completeness": decision["completeness"],
+            "identity_pending": decision["identity_pending"],
+            "categories": list(entry.get("categories") or [])[:12],
+            "performers": list(raw.get("performers") or [])[:8],
+            "performer_candidates": list(raw.get("performer_candidates") or [])[:8],
+            "phrase": str(raw.get("phrase") or "")[:240],
+            "error": str(ai.get("error") or "")[:400],
+            "ai_status": str(ai.get("status") or "missing"),
+            "audio_language": audio_language,
+            "content_region": content_region,
+            "region_confidence": _analysis_confidence(raw.get("region_confidence")),
+            "region_evidence": region_evidence[:5],
+            "rating": entry.get("rating"),
+        })
+    priority = {"attention": 0, "review": 1, "processing": 2, "auto_accepted": 3, "accepted": 4, "excluded": 5}
+    rows.sort(key=lambda row: (priority.get(row["status"], 9), row["filename"].lower()))
+    resolved = counts.get("auto_accepted", 0) + counts.get("accepted", 0) + counts.get("excluded", 0)
+    return {
+        "ok": True,
+        "total": len(rows),
+        "resolved": resolved,
+        "needs_review": counts.get("review", 0) + counts.get("attention", 0),
+        "identity_pending": identity_pending,
+        "region_pending": region_pending,
+        "counts": counts,
+        "thresholds": {
+            "auto_accept": ANALYSIS_AUTO_ACCEPT_CONFIDENCE,
+            "review": ANALYSIS_REVIEW_CONFIDENCE,
+        },
+        "rows": rows,
+    }
+
+
+def apply_analysis_review_action(video_ids: list, action: str) -> dict:
+    ids = list(dict.fromkeys(str(x).lower() for x in (video_ids or []) if re.fullmatch(r"[0-9a-fA-F]{16}", str(x))))
+    if action not in ("accept", "exclude", "retry"):
+        return {"ok": False, "error": "action must be accept, exclude or retry"}
+    state = load_review_state()
+    videos = state.setdefault("videos", {})
+    path_by_id = {}
+    for work in scanner.get_progress(0).get("works") or []:
+        for item in work.get("items") or []:
+            path = item.get("path")
+            if item.get("type") == "video" and isinstance(path, str):
+                path_by_id[video_asset_id(path)] = path
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    changed = 0
+    retry_paths = []
+    for video_id in ids:
+        entry = videos.get(video_id)
+        if not isinstance(entry, dict):
+            path = path_by_id.get(video_id)
+            if not path:
+                continue
+            entry = {"path": os.path.realpath(path)}
+        if action == "retry":
+            path = entry.get("path")
+            if not isinstance(path, str) or not os.path.isfile(path) or not is_path_under_root(path):
+                continue
+            entry.pop("analysis_review", None)
+            entry["ai_analysis"] = {"status": "queued", "schema_version": 4, "queued_at": now}
+            retry_paths.append(path)
+        else:
+            entry["analysis_review"] = {
+                "status": "accepted" if action == "accept" else "excluded",
+                "updated_at": now,
+            }
+        videos[video_id] = entry
+        changed += 1
+    if changed:
+        save_review_state(state)
+    if retry_paths:
+        threading.Thread(target=_resume_analysis_after_active_batch, args=(get_scan_root(),), daemon=True).start()
+    return {"ok": True, "changed": changed, "retry_count": len(retry_paths)}
 
 
 def clear_review_state(scan_root: str | None = None) -> None:
@@ -1962,6 +2337,7 @@ class MediaScanner:
             except Exception:
                 pass
             if it["type"] == "video":
+                it["asset_id"] = video_asset_id(it["path"])
                 info = get_video_info(it["path"])
                 it["duration"] = info["duration"]
                 it["width"] = info["width"]
@@ -2285,6 +2661,12 @@ def replace_cache_dir(new_dir: str) -> tuple[bool, dict]:
     old = scanner
     scanner = MediaScanner()
     scanner.start()
+    if "resume_pending_video_analysis" in globals():
+        threading.Thread(
+            target=resume_pending_video_analysis,
+            args=(_scan_root,),
+            daemon=True,
+        ).start()
     try:
         old._executor.shutdown(wait=False)
     except Exception:
@@ -2292,7 +2674,7 @@ def replace_cache_dir(new_dir: str) -> tuple[bool, dict]:
     return True, cache_settings_payload()
 
 
-def replace_scan_root(new_root: str) -> bool:
+def replace_scan_root(new_root: str, persist: bool = False) -> bool:
     """切换扫描根目录并启动新扫描任务。返回是否成功。"""
     global _scan_root, scanner
     p, err = resolve_scan_root_path(new_root)
@@ -2304,6 +2686,12 @@ def replace_scan_root(new_root: str) -> bool:
         logger.warning("扫描根不在 MB_SCAN_PRESETS 白名单: %s", p)
         return False
     _scan_root = p
+    if persist and not (os.environ.get("MB_ROOT_DIR") or "").strip() and not scan_presets_enabled():
+        _PERSISTENT_SETTINGS["scan_root"] = p
+        try:
+            _save_persistent_settings(_PERSISTENT_SETTINGS)
+        except Exception as e:
+            logger.warning("保存扫描目录设置失败: %s", e)
     prof = _apply_perf_profile_for_scan_root(_scan_root)
     logger.info(
         "扫描目录切换为: %s | 自动性能档位: %s，扫描并发=%s，每视频条带缩略图=%s",
@@ -2315,6 +2703,12 @@ def replace_scan_root(new_root: str) -> bool:
     old = scanner
     scanner = MediaScanner()
     scanner.start()
+    if persist and "resume_pending_video_analysis" in globals():
+        threading.Thread(
+            target=resume_pending_video_analysis,
+            args=(_scan_root,),
+            daemon=True,
+        ).start()
     try:
         old._executor.shutdown(wait=False)
     except Exception:
@@ -2455,7 +2849,8 @@ def _tool_version_ok(bin_path: str) -> tuple[bool, str | None]:
         return False, str(e)[:400]
 
 
-def _cache_dir_stats(cache_dir: str, max_files: int = 500_000) -> dict:
+def _cache_dir_stats(cache_dir: str, max_files: int = 5_000) -> dict:
+    """Return a bounded cache sample so /health stays responsive on large libraries."""
     total_bytes = 0
     n = 0
     truncated = False
@@ -2599,6 +2994,25 @@ def _empty_insight() -> dict:
         "event_guess": "",
         "tags": [],
         "phrase": "",
+        "people_count": "不确定",
+        "scene_type": "不确定",
+        "production_type": "不确定",
+        "camera_style": "不确定",
+        "story_level": "不确定",
+        "distinctive_features": [],
+        "confidence": 0.0,
+        "performers": [],
+        "performer_candidates": [],
+        "performer_evidence": {},
+        "studio": "",
+        "title_code": "",
+        "identity_confidence": 0.0,
+        "audio_language": "不确定",
+        "audio_language_code": "",
+        "audio_language_confidence": 0.0,
+        "content_region": "不确定",
+        "region_confidence": 0.0,
+        "region_evidence": [],
         "user_confirmed": False,
         "confirmed_phrase": "",
         "confirmed_tags": [],
@@ -2632,8 +3046,13 @@ def _extract_llm_frames(video_path: str, out_dir: str, count: int) -> list:
     if dur < 0.25:
         dur = 1.0
     out_paths = []
-    for i in range(count):
-        t = dur * (i + 1) / (count + 1)
+    if count >= 4:
+        title_ratio = min(0.03, 2.0 / dur)
+        ratios = [title_ratio] + [0.20 + (0.70 * i / max(1, count - 2)) for i in range(count - 1)]
+    else:
+        ratios = [(i + 1) / (count + 1) for i in range(count)]
+    for i, ratio in enumerate(ratios):
+        t = dur * ratio
         outp = os.path.join(out_dir, f"f{i}.jpg")
         cmd = [
             FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
@@ -2664,6 +3083,29 @@ def _ollama_health_check(host: str, timeout: float = 5.0) -> tuple:
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def _ollama_resolve_vision_model(host: str, requested: str, timeout: float = 10.0) -> tuple[str, str]:
+    """Use the configured model when installed, otherwise select an installed vision model."""
+    try:
+        req = Request(f"{host.rstrip('/')}/api/tags", method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        models = payload.get("models") or []
+        names = [str(row.get("name") or row.get("model") or "").strip() for row in models]
+        names = [name for name in names if name]
+        requested_base = requested.split(":", 1)[0].lower()
+        for name in names:
+            if name == requested or name.split(":", 1)[0].lower() == requested_base:
+                return name, "configured"
+        vision_hints = ("qwen2.5vl", "qwen2-vl", "qwen3-vl", "llava", "moondream", "minicpm-v", "bakllava")
+        for name in names:
+            low = name.lower()
+            if any(hint in low for hint in vision_hints):
+                return name, f"fallback_from:{requested}"
+        return requested, "not_installed"
+    except Exception as e:
+        return requested, f"lookup_failed:{e}"
 
 
 def _http_post_json(url: str, payload: dict, timeout: int = 300) -> dict:
@@ -2699,7 +3141,44 @@ def _parse_json_from_llm_text(text: str) -> dict:
         return {}
 
 
-def _normalize_llm_insight(raw: dict) -> dict:
+def _identity_token(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _clean_person_names(value) -> list[str]:
+    if isinstance(value, str):
+        value = [x.strip() for x in re.split(r"[,，;；|/]", value) if x.strip()]
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        name = str(item).strip().strip(".·-_ ")
+        if 2 <= len(name) <= 80 and name not in out:
+            out.append(name)
+    return out[:12]
+
+
+def _alias_performers_from_path(source_path: str) -> list[str]:
+    """Match a user-maintained {canonical: [aliases]} library against path text."""
+    alias_path = os.path.join(CACHE_DIR, "performer_aliases.json")
+    try:
+        with open(alias_path, encoding="utf-8") as f:
+            aliases = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(aliases, dict):
+        return []
+    haystack = _identity_token(source_path)
+    found = []
+    for canonical, values in aliases.items():
+        canonical = str(canonical).strip()
+        candidates = [canonical] + (values if isinstance(values, list) else [values])
+        if canonical and any(_identity_token(x) and _identity_token(x) in haystack for x in candidates):
+            found.append(canonical)
+    return found[:12]
+
+
+def _normalize_llm_insight(raw: dict, source_path: str = "") -> dict:
     tags = raw.get("tags") or raw.get("标签")
     if isinstance(tags, str):
         tags = [t.strip() for t in re.split(r"[,，;；|/]", tags) if t.strip()]
@@ -2722,13 +3201,244 @@ def _normalize_llm_insight(raw: dict) -> dict:
         phrase = ""
     if not phrase and clean_tags:
         phrase = _tags_to_chinese_sentence(clean_tags)
+
+    def controlled(value, choices: dict[str, tuple[str, ...]]) -> str:
+        text = str(value or "").strip().lower()
+        for canonical, aliases in choices.items():
+            if text == canonical.lower() or any(alias.lower() in text for alias in aliases):
+                return canonical
+        return "不确定"
+
+    people_count = controlled(raw.get("people_count") or raw.get("人物数量"), {
+        "单人": ("单人", "一人", "1人"), "双人": ("双人", "两人", "2人"),
+        "多人": ("多人", "三人", "群体", "3人", "4人"), "不确定": ("不确定", "未知"),
+    })
+    scene_type = controlled(raw.get("scene_type") or raw.get("场景类型"), {
+        "卧室": ("卧室", "床上", "床铺"), "客厅": ("客厅", "沙发"),
+        "室内其他": ("室内", "房间"), "户外": ("户外", "室外"),
+        "海滩": ("海滩", "海边"), "交通工具": ("飞机", "火车", "汽车", "车厢"),
+        "健身场所": ("健身房", "健身"), "影棚": ("影棚", "摄影棚", "布景"),
+        "不确定": ("不确定", "未知"),
+    })
+    production_type = controlled(raw.get("production_type") or raw.get("制作类型"), {
+        "剧情制作": ("剧情", "故事", "角色扮演"), "专业棚拍": ("专业", "棚拍", "多机位"),
+        "自拍视频": ("自拍", "个人拍摄", "业余"), "网络直播": ("直播", "主播", "网络摄像头"),
+        "合集剪辑": ("合集", "剪辑", "混剪"), "不确定": ("不确定", "未知"),
+    })
+    camera_style = controlled(raw.get("camera_style") or raw.get("镜头风格"), {
+        "固定机位": ("固定", "静态机位"), "手持跟拍": ("手持", "跟拍"),
+        "第一视角": ("第一视角", "主观视角"), "多机位": ("多机位", "镜头切换"),
+        "不确定": ("不确定", "未知"),
+    })
+    story_level = controlled(raw.get("story_level") or raw.get("叙事程度"), {
+        "无剧情": ("无剧情", "没有剧情"), "轻剧情": ("轻剧情", "简单剧情"),
+        "强剧情": ("强剧情", "完整剧情", "明显剧情"), "不确定": ("不确定", "未知"),
+    })
+    distinctive = raw.get("distinctive_features") or raw.get("显著特征") or []
+    if isinstance(distinctive, str):
+        distinctive = [x.strip() for x in re.split(r"[,，;；|/]", distinctive) if x.strip()]
+    if not isinstance(distinctive, list):
+        distinctive = []
+    distinctive = list(dict.fromkeys(str(x).strip() for x in distinctive if str(x).strip()))[:8]
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", raw.get("置信度", 0)) or 0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    filename_people = _clean_person_names(raw.get("filename_performers") or raw.get("文件名演员"))
+    visible_people = _clean_person_names(raw.get("visible_text_performers") or raw.get("画面文字演员"))
+    path_token = _identity_token(source_path)
+    filename_people = [name for name in filename_people if _identity_token(name) in path_token]
+    alias_people = _alias_performers_from_path(source_path) if source_path else []
+    visible_by_token = {_identity_token(name): name for name in visible_people if _identity_token(name)}
+    confirmed = list(alias_people)
+    evidence = {}
+    for name in alias_people:
+        evidence[name] = ["本地别名库", "文件路径"]
+    for name in filename_people:
+        token = _identity_token(name)
+        if token in visible_by_token and name not in confirmed:
+            confirmed.append(name)
+            evidence[name] = ["文件名", "画面文字"]
+    candidates = list(dict.fromkeys(filename_people + visible_people))
+    studio = str(raw.get("studio") or raw.get("制作方") or "").strip()[:100]
+    title_code = str(raw.get("title_code") or raw.get("作品编号") or "").strip()[:80]
+    try:
+        identity_confidence = max(0.0, min(1.0, float(raw.get("identity_confidence", 0) or 0)))
+    except (TypeError, ValueError):
+        identity_confidence = 0.0
     return {
         "time_guess": str(raw.get("time") or raw.get("时间") or "").strip(),
         "place_guess": str(raw.get("place") or raw.get("地点") or "").strip(),
         "event_guess": str(raw.get("event") or raw.get("事件") or "").strip(),
         "tags": clean_tags,
         "phrase": phrase,
+        "people_count": people_count,
+        "scene_type": scene_type,
+        "production_type": production_type,
+        "camera_style": camera_style,
+        "story_level": story_level,
+        "distinctive_features": distinctive,
+        "confidence": confidence,
+        "performers": confirmed[:12],
+        "performer_candidates": candidates[:12],
+        "performer_evidence": evidence,
+        "studio": studio,
+        "title_code": title_code,
+        "identity_confidence": identity_confidence,
     }
+
+
+_audio_language_model = None
+_audio_language_model_lock = threading.Lock()
+
+AUDIO_LANGUAGE_NAMES = {
+    "zh": "中文", "yue": "中文", "ja": "日语", "ko": "韩语", "ru": "俄语",
+    "en": "英语", "th": "泰语", "vi": "越南语", "id": "印尼语", "ms": "马来语",
+    "tl": "菲律宾语", "km": "高棉语", "lo": "老挝语", "my": "缅甸语",
+}
+
+
+def _get_audio_language_model():
+    global _audio_language_model
+    with _audio_language_model_lock:
+        if _audio_language_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                _audio_language_model = WhisperModel(
+                    os.environ.get("MB_WHISPER_MODEL", "tiny"),
+                    device="cpu",
+                    compute_type="int8",
+                    local_files_only=True,
+                )
+            except Exception as e:
+                logger.warning("本地语音语言模型不可用: %s", e)
+                _audio_language_model = False
+        return _audio_language_model
+
+
+def _detect_audio_language(video_path: str, work_dir: str) -> dict:
+    """Sample a short local audio clip and detect its spoken language."""
+    if not ffprobe_has_audio(video_path):
+        return {"audio_language": "无音轨", "audio_language_code": "", "audio_language_confidence": 1.0}
+    model = _get_audio_language_model()
+    if not model:
+        return {"audio_language": "不确定", "audio_language_code": "", "audio_language_confidence": 0.0}
+    os.makedirs(work_dir, exist_ok=True)
+    info = get_video_info(video_path)
+    duration = max(0.0, float(info.get("duration") or 0))
+    sample_seconds = min(45.0, duration) if duration > 0 else 45.0
+    start = max(0.0, min(duration * 0.28, max(0.0, duration - sample_seconds))) if duration > 0 else 0.0
+    wav_path = os.path.join(work_dir, "language-sample.wav")
+    cmd = [
+        FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-threads", "1",
+        "-ss", str(start), "-i", video_path, "-t", str(sample_seconds), "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=150)
+        if proc.returncode != 0 or not os.path.isfile(wav_path) or os.path.getsize(wav_path) < 16000:
+            return {"audio_language": "无可识别语音", "audio_language_code": "", "audio_language_confidence": 0.0}
+        segments, detected = model.transcribe(
+            wav_path,
+            beam_size=1,
+            best_of=1,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        spoken = "".join(str(seg.text or "").strip() for seg in segments)
+        code = str(getattr(detected, "language", "") or "").lower()
+        probability = _analysis_confidence(getattr(detected, "language_probability", 0.0))
+        meaningful = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", "", spoken)
+        if len(meaningful) < 6 or probability < 0.40:
+            return {"audio_language": "无可识别语音", "audio_language_code": code, "audio_language_confidence": probability}
+        return {
+            "audio_language": AUDIO_LANGUAGE_NAMES.get(code, "其他语言"),
+            "audio_language_code": code,
+            "audio_language_confidence": probability,
+        }
+    except Exception as e:
+        logger.info("音频语言检测失败 %s: %s", os.path.basename(video_path), e)
+        return {"audio_language": "不确定", "audio_language_code": "", "audio_language_confidence": 0.0}
+    finally:
+        try:
+            if os.path.isfile(wav_path):
+                os.remove(wav_path)
+        except OSError:
+            pass
+
+
+def _controlled_region(value) -> str:
+    text = str(value or "").strip().lower()
+    choices = {
+        "俄罗斯": ("俄罗斯", "俄语区", "russia", "russian"),
+        "欧美": ("欧美", "欧洲", "美国", "英国", "北美", "western", "europe", "usa"),
+        "国产": ("国产", "中国大陆", "中国", "华语", "mainland china"),
+        "日本": ("日本", "日系", "japan", "japanese"),
+        "韩国": ("韩国", "韩系", "korea", "korean"),
+        "东南亚": ("东南亚", "泰国", "越南", "菲律宾", "印尼", "马来西亚", "新加坡", "southeast asia"),
+        "其他": ("其他", "other"),
+        "不确定": ("不确定", "未知", "unknown", ""),
+    }
+    for canonical, aliases in choices.items():
+        if text == canonical.lower() or any(alias and alias.lower() in text for alias in aliases):
+            return canonical
+    return "不确定"
+
+
+def _region_from_path(source_path: str) -> tuple[str, str]:
+    parent = os.path.basename(os.path.dirname(source_path))
+    text = f"{parent} {os.path.basename(source_path)}".lower()
+    region_terms = (
+        ("俄罗斯", ("俄罗斯", "俄语", "russia", "russian")),
+        ("日本", ("日本", "日系", "无码", "有码", "jav", "japan")),
+        ("韩国", ("韩国", "韩语", "韩系", "korea")),
+        ("国产", ("国产", "大陆", "中国", "华语", "mandarin")),
+        ("东南亚", ("东南亚", "泰国", "越南", "菲律宾", "印尼", "马来", "新加坡", "thailand", "vietnam")),
+        ("欧美", ("欧美", "美国", "欧洲", "英国", "法国", "德国", "意大利", "西班牙", "western", "europe", "american")),
+    )
+    for region, terms in region_terms:
+        hit = next((term for term in terms if term in text), "")
+        if hit:
+            return region, f"文件名或直属目录包含“{hit}”"
+    return "不确定", ""
+
+
+def _resolve_content_region(source_path: str, raw: dict, audio: dict) -> dict:
+    path_region, path_evidence = _region_from_path(source_path)
+    if path_region != "不确定":
+        return {"content_region": path_region, "region_confidence": 0.92, "region_evidence": [path_evidence]}
+    language = audio.get("audio_language")
+    language_regions = {
+        "俄语": "俄罗斯", "日语": "日本", "韩语": "韩国", "中文": "国产",
+        "泰语": "东南亚", "越南语": "东南亚", "印尼语": "东南亚", "马来语": "东南亚",
+        "菲律宾语": "东南亚", "高棉语": "东南亚", "老挝语": "东南亚", "缅甸语": "东南亚",
+    }
+    audio_confidence = _analysis_confidence(audio.get("audio_language_confidence"))
+    if language in language_regions and audio_confidence >= 0.55:
+        return {
+            "content_region": language_regions[language],
+            "region_confidence": round(min(0.90, audio_confidence), 3),
+            "region_evidence": [f"音频语言识别为{language}"],
+        }
+    visual_region = _controlled_region(raw.get("visual_region") or raw.get("画面地区"))
+    visual_evidence = raw.get("region_evidence") or raw.get("地区依据") or []
+    if isinstance(visual_evidence, str):
+        visual_evidence = [x.strip() for x in re.split(r"[,，;；|]", visual_evidence) if x.strip()]
+    if not isinstance(visual_evidence, list):
+        visual_evidence = []
+    try:
+        visual_confidence = _analysis_confidence(raw.get("region_confidence", 0))
+    except (TypeError, ValueError):
+        visual_confidence = 0.0
+    if visual_region not in ("不确定", "其他") and visual_evidence and visual_confidence >= 0.55:
+        return {
+            "content_region": visual_region,
+            "region_confidence": visual_confidence,
+            "region_evidence": [str(x).strip()[:100] for x in visual_evidence if str(x).strip()][:5],
+        }
+    if language == "英语" and audio_confidence >= 0.60:
+        return {"content_region": "欧美", "region_confidence": 0.62, "region_evidence": ["音频语言识别为英语"]}
+    return {"content_region": "不确定", "region_confidence": 0.0, "region_evidence": []}
 
 
 def _tags_to_chinese_sentence(tags: list[str]) -> str:
@@ -2755,6 +3465,7 @@ def _vision_analyze_video(
     frames = _extract_llm_frames(path, frames_dir, frame_count)
     if not frames:
         raise RuntimeError("无法从视频抽取帧（请检查 ffmpeg 与视频文件）")
+    audio = _detect_audio_language(path, frames_dir)
     if callable(after_frames_hook):
         try:
             after_frames_hook()
@@ -2782,13 +3493,29 @@ def _vision_analyze_video(
         "如果确实无法确定日期，请输出空字符串 \"\"（不要输出「未知/大概/上午」这种）。\n"
         "place：地点用中文短词组（国家/城市/场景类型，如「城市街道」「海边」「室内展厅」）；\n"
         "event：正在发生的事，用中文短词组；\n"
-        "tags：3～8 条，每条为 2～8 个汉字为主的短关键词，语义具体；\n"
+        "people_count：只能是「单人、双人、多人、不确定」之一；\n"
+        "scene_type：只能是「卧室、客厅、室内其他、户外、海滩、交通工具、健身场所、影棚、不确定」之一；\n"
+        "production_type：只能是「剧情制作、专业棚拍、自拍视频、网络直播、合集剪辑、不确定」之一；\n"
+        "camera_style：只能是「固定机位、手持跟拍、第一视角、多机位、不确定」之一；\n"
+        "story_level：只能是「无剧情、轻剧情、强剧情、不确定」之一；\n"
+        "distinctive_features：0～5个真正有区分度的显著特征，不要使用「亲密、激情、室内、人物」等泛化词；\n"
+        "confidence：0到1之间的小数，表示对上述结构化判断的整体把握；\n"
+        "filename_performers：只列出文件名或目录名中明确出现的演员/模特姓名，不要把制作方或普通单词当人名；\n"
+        "visible_text_performers：只列出代表帧中文字明确显示的演员/模特姓名；严禁仅凭人脸或长相猜测身份；\n"
+        "studio：文件名、路径、片头或水印中明确出现的制作方，没有证据则空字符串；\n"
+        "title_code：明确出现的作品编号，没有则空字符串；\n"
+        "identity_confidence：0到1的小数，仅表示姓名/制作方/编号文字证据的可信度；\n"
+        "visual_region：只能是「俄罗斯、欧美、国产、日本、韩国、东南亚、其他、不确定」之一。只能根据片头片尾文字、字幕语言、明确水印、制作方或作品编号判断；严禁根据人物脸部、肤色或长相猜测国家；\n"
+        "region_evidence：0～4条地区判断依据，只写画面文字、水印、制作方、编号等可核对证据；没有可靠证据就返回空数组；\n"
+        "region_confidence：0到1的小数，只表示上述画面地区证据的可信度；\n"
+        "tags：3～8 条具体关键词，禁止只用几乎适用于所有视频的泛化词；\n"
         "phrase：用中文把上述要点连成一句极短描述（约 8～24 字），适合作文件名主题，不要空格与\\/:*?\"<>|。\n"
-        "只输出一个 JSON 对象，键名必须为 time, place, event, tags, phrase。不要输出其它文字或 Markdown。"
+        "只输出一个 JSON 对象，键名必须为 time, place, event, people_count, scene_type, production_type, camera_style, story_level, distinctive_features, confidence, filename_performers, visible_text_performers, studio, title_code, identity_confidence, visual_region, region_evidence, region_confidence, tags, phrase。不要输出其它文字或 Markdown。"
     )
     user_block = (
         f"文件名：{bn}\n"
         f"视频时长：{dur}\n"
+        f"本地音频语言检测：{audio.get('audio_language', '不确定')}（置信度 {audio.get('audio_language_confidence', 0):.2f}；这是声音证据，不要改写）\n"
         f"拍摄时间（元数据/文件时间推断）：{meta_time or '(空)'}\n"
         f"共 {len(b64_list)} 张代表帧。请分析并返回 JSON。"
     )
@@ -2797,6 +3524,7 @@ def _vision_analyze_video(
     payload = {
         "model": model,
         "stream": False,
+        "format": "json",
         "options": {"temperature": 0.2},
         "messages": [
             {
@@ -2812,18 +3540,14 @@ def _vision_analyze_video(
     raw = _parse_json_from_llm_text(content_out)
     if not raw:
         raise RuntimeError(f"模型未返回有效 JSON：{content_out[:200]}")
-    norm = _normalize_llm_insight(raw)
+    norm = _normalize_llm_insight(raw, path)
+    norm.update(audio)
+    norm.update(_resolve_content_region(path, raw, audio))
     # 若模型没给出可用日期，则回填本地元数据时间（到秒）
     if not (norm.get("time_guess") or "").strip():
         if meta_time:
             norm["time_guess"] = meta_time
-    return {
-        "time_guess": norm["time_guess"],
-        "place_guess": norm["place_guess"],
-        "event_guess": norm["event_guess"],
-        "tags": norm["tags"],
-        "phrase": norm["phrase"],
-    }
+    return norm
 
 
 class AnalysisTaskManager:
@@ -2905,7 +3629,13 @@ class AnalysisTaskManager:
                     p = it.get("path", "")
                     if os.path.isfile(p) and is_path_under_root(p):
                         selected.append(os.path.abspath(p))
-        selected = sorted(set(selected))
+        return self.create_task_from_paths(name, selected)
+
+    def create_task_from_paths(self, name: str, paths: list):
+        selected = sorted(set(
+            os.path.abspath(p) for p in (paths or [])
+            if isinstance(p, str) and os.path.isfile(p) and is_path_under_root(p)
+        ))
         tid = uuid.uuid4().hex[:12]
         now = datetime.now().isoformat(timespec="seconds")
         insights = {p: _empty_insight() for p in selected}
@@ -2955,6 +3685,20 @@ class AnalysisTaskManager:
                     "请先在本机终端运行 `ollama serve`，并确保已 `ollama pull` 视觉模型。"
                 ),
             }
+        resolved_model, model_source = _ollama_resolve_vision_model(host, model)
+        if model_source == "not_installed":
+            return {
+                "ok": False,
+                "error": f"未找到视觉模型「{model}」，请先执行 ollama pull qwen2.5vl:7b 或设置 MB_OLLAMA_MODEL。",
+            }
+        if resolved_model != model:
+            logger.info("Ollama 模型自动选择: configured=%s, active=%s", model, resolved_model)
+            model = resolved_model
+        if "qwen" in model.lower() and "vl" in model.lower():
+            # Multi-image Qwen-VL can be slow on consumer hardware.  Keep the
+            # batch representative while avoiding repeated 300s timeouts.
+            frames = min(frames, 4)
+            req_timeout = max(req_timeout, 900)
         with self._lock:
             task = self._tasks.get(tid)
             if not task:
@@ -2962,6 +3706,7 @@ class AnalysisTaskManager:
             if task.get("analyze_job", {}).get("state") == "running":
                 return {"ok": False, "error": "该任务正在分析中，请稍候"}
             n = len(task["source_files"])
+            task["status"] = "analyzing"
             task["analyze_job"] = {
                 "state": "running",
                 "done": 0,
@@ -2998,10 +3743,21 @@ class AnalysisTaskManager:
                     t["analyze_job"]["done"] = i
                     t["analyze_job"]["current_path"] = path
                     t["analyze_job"]["phase"] = "extract_frames"
-                    t["analyze_job"]["phase_detail"] = "正在从视频抽取帧（ffmpeg）…"
+                    t["analyze_job"]["phase_detail"] = "正在抽取画面并识别音频语言…"
                     ins = t["insights"].setdefault(path, _empty_insight())
                     ins["llm_status"] = "running"
                     ins["error"] = ""
+                patch_review_state_video(video_asset_id(path), {
+                    "path": path,
+                    "ai_analysis": {
+                        "status": "running",
+                        "provider": "ollama",
+                        "model": model,
+                        "schema_version": 4,
+                        "task_id": tid,
+                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                })
 
                 def _after_frames():
                     with self._lock:
@@ -3031,6 +3787,7 @@ class AnalysisTaskManager:
                         ins[k] = v
                     ins["confirmed_phrase"] = ""
                     ins["user_confirmed"] = False
+                save_automatic_video_analysis(path, result, "ollama", model)
             except Exception as e:
                 with self._lock:
                     t = self._tasks.get(tid)
@@ -3038,16 +3795,32 @@ class AnalysisTaskManager:
                         ins = t["insights"].setdefault(path, _empty_insight())
                         ins["llm_status"] = "error"
                         ins["error"] = str(e)
+                patch_review_state_video(video_asset_id(path), {
+                    "path": path,
+                    "ai_analysis": {
+                        "status": "error",
+                        "provider": "ollama",
+                        "model": model,
+                        "task_id": tid,
+                        "error": str(e)[:2000],
+                        "failed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                })
             finally:
                 shutil.rmtree(frames_dir, ignore_errors=True)
         with self._lock:
             t = self._tasks.get(tid)
             if t and t.get("analyze_job", {}).get("state") == "running":
+                error_count = sum(
+                    1 for ins in (t.get("insights") or {}).values()
+                    if ins.get("llm_status") == "error"
+                )
                 t["analyze_job"]["state"] = "done"
                 t["analyze_job"]["done"] = len(paths)
                 t["analyze_job"]["current_path"] = ""
                 t["analyze_job"]["phase"] = "idle"
                 t["analyze_job"]["phase_detail"] = "本批视频已全部处理"
+                t["status"] = "analyzed_with_errors" if error_count else "analyzed"
 
     def confirm_insights(self, tid: str, confirms: list):
         with self._lock:
@@ -3128,15 +3901,18 @@ class AnalysisTaskManager:
             if not task:
                 return None
             insights = task.get("insights") or {}
+            review_videos = (load_review_state().get("videos") or {})
             pending = [
                 p for p in task["source_files"]
-                if (insights.get(p) or {}).get("llm_status") == "done"
+                if (insights.get(p) or {}).get("llm_status") in ("done", "error")
                 and not (insights.get(p) or {}).get("user_confirmed")
+                and analysis_review_decision(review_videos.get(video_asset_id(p)) or {}).get("status")
+                not in ("auto_accepted", "accepted", "excluded")
             ]
             if pending:
                 return {
                     "ok": False,
-                    "error": "已进行过 AI 分析：请先确认每条视频的标签/短语，再生成预览。",
+                    "error": "仍有需要处理的异常分析结果；请先在“异常复核”中接受、重试或排除。",
                     "pending_confirm_paths": pending,
                 }
             by_dir = {}
@@ -3149,7 +3925,10 @@ class AnalysisTaskManager:
                 used = set(os.listdir(d))
                 for src in files:
                     ins = insights.get(src) or {}
-                    use_ai = ins.get("llm_status") == "done" and ins.get("user_confirmed")
+                    decision = analysis_review_decision(review_videos.get(video_asset_id(src)) or {})
+                    use_ai = ins.get("llm_status") == "done" and (
+                        ins.get("user_confirmed") or decision.get("status") in ("auto_accepted", "accepted")
+                    )
                     while True:
                         if use_ai:
                             phrase = (ins.get("confirmed_phrase") or ins.get("phrase") or "").strip()
@@ -3246,6 +4025,99 @@ class AnalysisTaskManager:
 
 
 analysis_tasks = AnalysisTaskManager()
+
+_ai_resume_lock = threading.Lock()
+_ai_resume_roots_active: set[str] = set()
+
+
+def resume_pending_video_analysis(expected_root: str | None = None) -> None:
+    """Create one persistent, serial AI task per unfinished video after scanning."""
+    root = os.path.realpath(expected_root or get_scan_root())
+    with _ai_resume_lock:
+        if root in _ai_resume_roots_active:
+            return
+        _ai_resume_roots_active.add(root)
+    try:
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            if os.path.realpath(get_scan_root()) != root:
+                return
+            progress = scanner.get_progress(0)
+            if progress.get("done"):
+                break
+            time.sleep(1)
+        state = load_review_state(root)
+        ledger_videos = state.get("videos") or {}
+        paths = []
+        for work in progress.get("works") or []:
+            for item in work.get("items") or []:
+                if item.get("type") != "video":
+                    continue
+                path = item.get("path")
+                if not isinstance(path, str) or not os.path.isfile(path) or not is_path_under_root(path):
+                    continue
+                entry = ledger_videos.get(video_asset_id(path)) or {}
+                ai = entry.get("ai_analysis") if isinstance(entry.get("ai_analysis"), dict) else {}
+                if ai.get("status") == "done" and int(ai.get("schema_version") or 0) >= 4:
+                    continue
+                paths.append(path)
+        if not paths:
+            return
+        queued_tasks = []
+        for path in sorted(set(paths)):
+            patch_review_state_video(video_asset_id(path), {
+                "path": path,
+                "ai_analysis": {
+                    "status": "queued",
+                    "schema_version": 4,
+                    "queued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            })
+            task = analysis_tasks.create_task_from_paths(f"自动分析 · {os.path.basename(path)}", [path])
+            task["status"] = "queued"
+            queued_tasks.append(task)
+        logger.info("扫描后已创建 %s 个单视频 AI 任务", len(queued_tasks))
+        host, _, _, _ = _ollama_config()
+        ollama_deadline = time.monotonic() + 1800
+        while True:
+            ok, error = _ollama_health_check(host, timeout=10)
+            if ok:
+                break
+            if time.monotonic() >= ollama_deadline or os.path.realpath(get_scan_root()) != root:
+                logger.warning("发现 %s 个待续分析视频，但 Ollama 持续不可用: %s", len(paths), error)
+                return
+            logger.info("等待 Ollama 后恢复 %s 个视频分析: %s", len(paths), error)
+            time.sleep(30)
+        for index, task in enumerate(queued_tasks, 1):
+            if os.path.realpath(get_scan_root()) != root:
+                return
+            result = analysis_tasks.start_analyze(task["id"])
+            if not result or not result.get("ok"):
+                task["status"] = "error"
+                logger.warning("单视频 AI 任务启动失败 %s: %s", task["id"], (result or {}).get("error", "unknown"))
+                continue
+            logger.info("单视频 AI 分析 %s/%s: task=%s", index, len(queued_tasks), task["id"])
+            while os.path.realpath(get_scan_root()) == root:
+                current = analysis_tasks.get_task(task["id"])
+                state_name = (current or {}).get("analyze_job", {}).get("state")
+                if state_name in ("done", "error"):
+                    break
+                time.sleep(1)
+    finally:
+        with _ai_resume_lock:
+            _ai_resume_roots_active.discard(root)
+
+
+def _resume_analysis_after_active_batch(expected_root: str) -> None:
+    """Wait for the serial worker, then pick up user-requested retries."""
+    root = os.path.realpath(expected_root)
+    while os.path.realpath(get_scan_root()) == root:
+        with _ai_resume_lock:
+            active = root in _ai_resume_roots_active
+        if not active:
+            resume_pending_video_analysis(root)
+            return
+        time.sleep(2)
 
 
 def trigger_exit():
@@ -3505,15 +4377,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_request_security(mutating=True) or self._body_too_large():
             return
         parsed = urlparse(self.path)
-        m = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
-        if not m:
+        work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
+        video_match = re.fullmatch(r"/api/review-state/video/([0-9a-fA-F]{16})", parsed.path or "")
+        if not work_match and not video_match:
             self.send_error(404)
             return
         data, err = self._read_json_body()
         if err:
             self._send_json({"ok": False, "error": err}, 400)
             return
-        self._send_json(patch_review_state_work(m.group(1), data or {}))
+        if video_match:
+            result = patch_review_state_video(video_match.group(1), data or {})
+        else:
+            result = patch_review_state_work(work_match.group(1), data or {})
+        self._send_json(result, 200 if result.get("ok") else 400)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -3571,6 +4448,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(prog)
         elif path == "/api/tasks":
             self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
+
+        elif path == "/api/analysis-review":
+            self._send_json(analysis_review_payload(), no_store=True)
 
         elif path == "/api/settings":
             self._send_json(cache_settings_payload(), no_store=True)
@@ -3686,6 +4566,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/review-state":
             self._send_json(review_state_get_payload(), no_store=True)
 
+        elif path == "/api/preferences/summary":
+            self._send_json(preference_summary_payload(), no_store=True)
+
         elif path == "/file":
             fpath = qs.get("path", [""])[0]
             fpath = unquote(fpath)
@@ -3761,6 +4644,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             task = analysis_tasks.create_task(data.get("name", ""), data.get("work_ids", []))
             self._send_json({"ok": True, "task": {"id": task["id"], "name": task["name"], "file_count": len(task["source_files"])}})
+            return
+        if parsed.path == "/api/analysis-review/action":
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
+                return
+            ret = apply_analysis_review_action(data.get("video_ids") or [], str(data.get("action") or ""))
+            self._send_json(ret, 200 if ret.get("ok") else 400)
             return
         m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/analyze", parsed.path or "")
         if m:
@@ -3865,7 +4756,7 @@ class Handler(BaseHTTPRequestHandler):
                 code = 403 if scan_presets_enabled() else 400
                 self._send_json({"ok": False, "error": preset_err}, code)
                 return
-            if replace_scan_root(p):
+            if replace_scan_root(p, persist=True):
                 self._send_json({"ok": True, "path": get_scan_root()})
             else:
                 _resolved, err = resolve_scan_root_path(p)
@@ -4562,6 +5453,44 @@ header select:focus { outline: none; border-color: #0a84ff; }
     vertical-align: top;
 }
 .analysis-table .ops button { margin-right: 6px; margin-bottom: 4px; }
+.analysis-review-stats {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(105px, 1fr));
+    gap: 8px;
+    margin: 10px 0 12px;
+}
+.analysis-review-stat { background:#1b1b1b; border:1px solid #2d2d2d; border-radius:8px; padding:10px; }
+.analysis-review-stat b { display:block; font-size:22px; color:#f1f1f1; margin-top:3px; }
+.analysis-review-stat span { color:#999; font-size:11px; }
+.analysis-review-list { display:grid; gap:10px; margin-top:10px; }
+.analysis-review-item {
+    display:grid;
+    grid-template-columns: auto 160px minmax(220px,1fr) auto;
+    gap:10px;
+    align-items:start;
+    padding:10px;
+    border:1px solid #303030;
+    border-radius:9px;
+    background:#181818;
+}
+.analysis-review-item.attention { border-color:#653c3c; }
+.analysis-review-item.review { border-color:#665a32; }
+.analysis-review-item img { width:160px; height:90px; object-fit:cover; border-radius:6px; background:#0b0b0b; }
+.analysis-review-main { min-width:0; }
+.analysis-review-name { color:#eee; font-size:12px; word-break:break-all; margin-bottom:6px; }
+.analysis-review-tags { display:flex; flex-wrap:wrap; gap:5px; }
+.analysis-review-tags span { background:#252525; color:#ccc; border-radius:999px; padding:3px 7px; font-size:10px; }
+.analysis-review-actions { display:flex; flex-direction:column; gap:6px; min-width:74px; }
+.analysis-review-actions button { background:#242424; border:1px solid #444; color:#ddd; border-radius:6px; padding:6px 8px; cursor:pointer; }
+.analysis-review-actions button.primary { background:#0a84ff; border-color:#0a84ff; color:#fff; }
+.analysis-advanced { margin-top:12px; }
+.analysis-advanced > summary { cursor:pointer; color:#aaa; padding:10px 4px; }
+@media (max-width: 760px) {
+    .analysis-review-stats { grid-template-columns: repeat(2, minmax(110px,1fr)); }
+    .analysis-review-item { grid-template-columns:auto 112px minmax(0,1fr); }
+    .analysis-review-item img { width:112px; height:72px; }
+    .analysis-review-actions { grid-column:2 / -1; flex-direction:row; flex-wrap:wrap; }
+}
 .analysis-metrics {
     display: grid;
     grid-template-columns: repeat(2, minmax(260px, 1fr));
@@ -4949,11 +5878,26 @@ body.batch-open #backToTop.show { bottom: 118px; }
     color: #aaa;
     text-align: center;
     max-width: calc(100% - 40px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow: visible;
+    white-space: normal;
     flex-shrink: 0;
 }
+.mb-file-meta-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.mb-video-rating-row {
+    display: flex; align-items: center; justify-content: center; gap: 5px;
+    margin-top: 7px; min-height: 30px; white-space: nowrap; overflow: visible;
+}
+.mb-video-rating-label { color: #aaa; margin-right: 3px; flex: 0 0 auto; }
+.mb-video-rating-row .review-rating { display: inline-flex; flex: 0 0 auto; gap: 3px; }
+.mb-video-rating-row .review-rating button {
+    flex: 0 0 30px; width: 30px; height: 30px; padding: 0; border: 0;
+    background: transparent; color: #ffd45c; font-size: 22px; line-height: 30px; cursor: pointer;
+}
+.mb-video-rating-row .review-rating button.mb-rating-zero {
+    width: auto; min-width: 58px; padding: 0 7px; color: #ff8a8a; font-size: 12px;
+    border: 1px solid #633; border-radius: 5px;
+}
+.mb-video-rating-row .review-rating button.mb-rating-zero.active { background: #5a2020; color: #fff; }
 .modal-main .shortcut-hint {
     margin-top: 8px;
     font-size: 11px;
@@ -5380,7 +6324,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     .work-card { margin-bottom: 12px; }
     .work-card .title { font-size: 15px; }
     body.mb-mobile .modal.active .shortcut-hint { display: none; }
-    body.mb-mobile .modal.active .file-info { font-size: 11px; max-height: 2.6em; overflow: hidden; text-overflow: ellipsis; }
+    body.mb-mobile .modal.active .file-info { font-size: 11px; max-height: none; overflow: visible; }
     body.mb-mobile .modal.active .modal-body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
     body.mb-mobile .modal.active .modal-main { padding-bottom: calc(52px + env(safe-area-inset-bottom, 0px)); }
     body.mb-mobile.mb-gallery-open { padding-bottom: 0; }
@@ -5462,7 +6406,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
-    <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的作品">永久删除待删除作品</button>
+    <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的视频，不影响同文件夹其它媒体">永久删除待删除视频</button>
     <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
@@ -5510,6 +6454,34 @@ body.batch-open #backToTop.show { bottom: 118px; }
 </div>
 
 <section id="analysisPanel" class="analysis-panel" aria-live="polite">
+    <div class="analysis-card" id="analysisReviewCard">
+        <h3>自动分类进度</h3>
+        <div class="analysis-note">高置信度且分类完整的视频会自动接受。这里默认只列出需要你处理的少量异常，不再要求逐条填写标签。</div>
+    <div id="analysisReviewSummary" class="analysis-review-stats">
+            <div class="analysis-review-stat"><span>视频总数</span><b>–</b></div>
+            <div class="analysis-review-stat"><span>已自动处理</span><b>–</b></div>
+            <div class="analysis-review-stat"><span>需要复核</span><b>–</b></div>
+            <div class="analysis-review-stat"><span>分析中</span><b>–</b></div>
+            <div class="analysis-review-stat"><span>演员候选</span><b>–</b></div>
+            <div class="analysis-review-stat"><span>地区待识别</span><b>–</b></div>
+        </div>
+        <div class="analysis-row" id="analysisReviewFilters">
+            <button type="button" class="primary" data-ar-filter="exceptions">只看待处理</button>
+            <button type="button" data-ar-filter="attention">只看失败/低置信度</button>
+            <button type="button" data-ar-filter="all">查看全部</button>
+            <button type="button" id="refreshAnalysisReview">刷新</button>
+        </div>
+        <div class="analysis-row">
+            <label class="analysis-note"><input type="checkbox" id="analysisReviewSelectAll"> 选择当前列表</label>
+            <button type="button" id="analysisBulkAccept">批量接受</button>
+            <button type="button" id="analysisBulkRetry">批量重试</button>
+            <button type="button" id="analysisBulkExclude">批量排除</button>
+            <span class="analysis-note">快捷键：A 接受、R 重试、X 排除当前第一项</span>
+        </div>
+        <div id="analysisReviewList" class="analysis-review-list"><div class="analysis-note">正在读取分类状态…</div></div>
+    </div>
+    <details class="analysis-advanced" id="analysisAdvancedDetails">
+    <summary>高级详情：任务、逐字段结果与重命名</summary>
     <div class="analysis-card">
         <h3>视频分析任务</h3>
         <div class="analysis-row">
@@ -5518,8 +6490,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button type="button" id="refreshTasksBtn">刷新任务列表</button>
         </div>
         <div class="analysis-note">
-            <b>推荐流程：</b>本机运行 Ollama 并拉取视觉模型（如 <code>ollama pull llava</code>）→ 创建任务 → 点「AI分析」（默认 <code>http://127.0.0.1:11434</code>，可用 <code>MB_OLLAMA_HOST</code> / <code>MB_OLLAMA_MODEL</code> 配置）→ 在下方表格核对时间/地点/事件与标签、修改短语 → 勾选「准确」并保存 → 再点「预览」「执行」重命名。<br>
-            若未跑 AI，仍可用文件夹路径的启发式命名生成预览。<br>
+            扫描后会自动按视频创建并串行执行分析任务；通常无需在这里手工创建。此区域保留给故障排查、逐字段修改和重命名。<br>
             <b>范围规则：</b>仅同目录改名，禁止跨目录移动；执行前预览并生成映射备份；文件名末尾自动追加序号。
         </div>
     </div>
@@ -5534,14 +6505,14 @@ body.batch-open #backToTop.show { bottom: 118px; }
         </table>
     </div>
     <div class="analysis-card" id="insightCard">
-        <h3>AI 标签核对（确认后再重命名）</h3>
+        <h3>逐字段结果（高级）</h3>
         <div class="analysis-row" style="flex-wrap:wrap;gap:8px;">
             <span id="insightTaskLabel" class="analysis-note">先点某一行的「标签」打开此表，或创建任务后点「AI分析」。</span>
             <button type="button" id="loadInsightBtn">刷新本表</button>
             <button type="button" class="primary" id="saveConfirmBtn">保存确认</button>
         </div>
         <div id="analyzeProgress" class="analysis-note" style="display:none;margin-top:6px;"></div>
-        <div class="analysis-note" style="margin-top:4px;color:#888;font-size:12px;">提示：点「AI分析」会自动切到本页；左侧列为<strong>视频缩略图</strong>（点击在新标签页播放），请对照画面核对标签与短语。若启动失败，请先在本机运行 <code>ollama serve</code>。</div>
+        <div class="analysis-note" style="margin-top:4px;color:#888;font-size:12px;">这里仅供少数需要精细修改或重命名的场景；日常分类请使用上方异常复核卡片。</div>
         <div id="insightTableWrap" style="overflow:auto;max-height:460px;margin-top:8px;"></div>
     </div>
     <div class="analysis-card">
@@ -5566,6 +6537,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         </div>
         <div id="evalResult" class="analysis-note">还没有保存打分。</div>
     </div>
+    </details>
 </section>
 
 <div id="reviewShell" class="mb-review-shell">
@@ -5578,6 +6550,11 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <button type="button" id="mbContinueReview" class="mb-continue-review mb-hidden" title="从上次审阅位置继续">继续审阅</button>
 </aside>
 <div id="reviewSecondary" class="mb-review-secondary" aria-hidden="true">
+<div class="mb-review-secondary-card" id="preferenceSummaryCard">
+<div class="mb-hint-title">我的偏好与分类依据</div>
+<div id="preferenceSummary" class="analysis-note">完成评分和分类后，这里会自动汇总。</div>
+<button type="button" id="refreshPreferenceSummary" style="margin-top:8px;">刷新依据</button>
+</div>
 <div class="mb-review-secondary-card">
 <div class="mb-hint-title">布局说明</div>
 <p>桌面：左侧作品列表与右侧提示栏分栏。平板：点 ⟨ 可折叠左侧列表。手机：底部「作品 / 画廊 / 更多」；画廊底栏可删当前/删作品、保留；横划切文件，长横划切作品；双指捏合缩放。</p>
@@ -5644,7 +6621,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
             <div class="file-info" id="modalFileInfo"></div>
-            <div class="shortcut-hint" id="shortcutHint">← → 翻页 · ESC 关闭 · 空格 播放/暂停 · Ctrl+Shift+L 保留并下一作品 · Ctrl+I 删当前 · Ctrl+Shift+I 删本作品</div>
+            <div class="shortcut-hint" id="shortcutHint">数字键 0 待删除、1–5 保留评分 · ← → 翻页 · ESC 关闭 · 空格 播放/暂停 · Ctrl+I 删当前</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
             <div class="modal-sidebar-top">
@@ -5659,7 +6636,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <nav id="mbGalleryBar" class="mb-gallery-bar" aria-label="画廊操作">
         <button type="button" id="mbGalClose" title="关闭">关闭</button>
         <button type="button" id="mbGalPrev" title="上一个">◀</button>
-        <button type="button" id="mbGalReview" class="mb-primary" title="保留并进入下一作品（1）">保留</button>
+        <button type="button" id="mbGalReview" class="mb-primary" title="保留并进入下一视频">保留</button>
         <button type="button" id="mbGalPending" title="待定并进入下一作品（2）">待定</button>
         <button type="button" id="mbGalQueueDelete" class="mb-danger" title="加入待删除并进入下一作品（3）">待删除</button>
         <button type="button" id="mbGalDelete" class="mb-danger">删当前文件</button>
@@ -5759,6 +6736,9 @@ let pollGen = 0;
 let activeTab = 'review';
 let insightTaskId = null;
 let insightPollTimer = null;
+let analysisReviewPollTimer = null;
+let analysisReviewData = { rows: [], counts: {} };
+let analysisReviewFilter = 'exceptions';
 
 document.body.classList.add('mb-review-tab');
 
@@ -6122,11 +7102,81 @@ window.insightRowThumbError = function(ev) {
     );
 };
 function getWorkReviewTag(workId) {
-    if (mbReviewState && mbReviewState.works && mbReviewState.works[workId]) {
-        const t = mbReviewState.works[workId].tag;
-        if (t === 'kept' || t === 'pending' || t === 'deleted') return t;
-    }
+    const work = allWorks.find(function (w) { return w.id === workId; });
+    const videos = work ? work.items.filter(function (it) { return it.type === 'video'; }) : [];
+    if (!videos.length) return 'pending';
+    const tags = videos.map(function (it) { return getVideoReviewTag(it); });
+    if (tags.every(function (t) { return t === 'deleted'; })) return 'deleted';
+    if (tags.every(function (t) { return t !== 'pending'; })) return 'kept';
     return 'pending';
+}
+function mbGetVideoReviewEntry(item) {
+    if (!item || !item.asset_id || !mbReviewState || !mbReviewState.videos) return null;
+    return mbReviewState.videos[item.asset_id] || null;
+}
+function getVideoReviewTag(item) {
+    const entry = mbGetVideoReviewEntry(item) || {};
+    return ['kept','pending','deleted'].includes(entry.tag) ? entry.tag : 'pending';
+}
+async function mbPatchReviewVideo(item, patch) {
+    if (!item || item.type !== 'video' || !item.asset_id) return false;
+    if (!mbReviewState) mbReviewState = { global: {}, works: {}, videos: {} };
+    if (!mbReviewState.videos) mbReviewState.videos = {};
+    const payload = Object.assign({ path: item.path }, patch || {});
+    mbReviewState.videos[item.asset_id] = Object.assign({}, mbReviewState.videos[item.asset_id] || {}, payload);
+    try {
+        const res = await fetch('/api/review-state/video/' + item.asset_id, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '保存失败');
+        mbReviewState.videos[item.asset_id] = data.video;
+        return true;
+    } catch (e) { alert('视频标记保存失败：' + (e.message || String(e))); return false; }
+}
+async function setCurrentVideoRating(rating) {
+    const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
+    const item = work && work.items[galleryState.itemIdx];
+    if (!item || item.type !== 'video') return false;
+    const normalized = rating === null ? null : Number(rating);
+    const ok = await mbPatchReviewVideo(item, { rating: normalized });
+    if (ok) {
+        document.querySelectorAll('[data-current-video-rating]').forEach(function (btn) {
+            const n = Number(btn.dataset.currentVideoRating);
+            if (n === 0) btn.classList.toggle('active', normalized === 0);
+            else btn.textContent = normalized !== null && normalized > 0 && n <= normalized ? '★' : '☆';
+            btn.setAttribute('aria-pressed', n === normalized ? 'true' : 'false');
+        });
+        updateGalleryReviewBtn(galleryState.workId);
+        loadPreferenceSummary();
+        advanceToNextVideoAfterDecision();
+    }
+    return ok;
+}
+
+function advanceToNextVideoAfterDecision() {
+    const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
+    if (!work) return false;
+    const nextVideoIdx = work.items.findIndex(function (it, idx) {
+        return idx > galleryState.itemIdx && it.type === 'video';
+    });
+    if (nextVideoIdx >= 0) {
+        galleryState.itemIdx = nextVideoIdx;
+        galleryState.thumbIdx = -1;
+        renderGallery();
+        return true;
+    }
+    const nav = galleryWorkNavListAndIndex();
+    for (let wi = nav.wi + 1; wi >= 0 && wi < nav.list.length; wi++) {
+        const nextWork = nav.list[wi];
+        const firstVideoIdx = nextWork.items.findIndex(function (it) { return it.type === 'video'; });
+        if (firstVideoIdx >= 0) {
+            openGallery(nextWork.id, firstVideoIdx, -1, { forceItemIdx: true });
+            ensureWorkCardInDomAndScroll(nextWork.id);
+            return true;
+        }
+    }
+    return false;
 }
 function mbGetWorkReviewEntry(workId) {
     if (!mbReviewState || !mbReviewState.works) return null;
@@ -6239,19 +7289,32 @@ async function mbLoadReviewState() {
     }
     mbUpdateContinueReviewUi();
     if (allWorks.length) sortAndRenderAll();
+    loadPreferenceSummary();
 }
 function buildReviewStripHtml(workId, work) {
-    const tag = getWorkReviewTag(workId);
-    const txt = tag === 'kept' ? '保留' : (tag === 'deleted' ? '待删除' : '待定');
+    const videos = (work && work.items || []).filter(function (it) { return it.type === 'video'; });
+    const counts = { kept: 0, pending: 0, deleted: 0 };
+    videos.forEach(function (it) { counts[getVideoReviewTag(it)]++; });
     const invalid = work && work.invalid_count
         ? '<span class="review-tag invalid">疑似无效 ' + work.invalid_count + '</span>'
         : '';
-    return '<div class="review-strip"><span class="review-tag ' + tag + '">' + txt + '</span>' + invalid
-        + '<span class="review-actions">'
-        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="kept">保留</button>'
-        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="pending">待定</button>'
-        + '<button type="button" data-work-id="' + escapeHtml(workId) + '" data-review-tag="deleted">待删除</button>'
-        + '</span></div>';
+    return '<div class="review-strip"><span class="review-tag kept">视频保留 ' + counts.kept + '</span>'
+        + '<span class="review-tag pending">待判断 ' + counts.pending + '</span>'
+        + '<span class="review-tag deleted">待删除 ' + counts.deleted + '</span>' + invalid + '</div>';
+}
+async function loadPreferenceSummary() {
+    const el = document.getElementById('preferenceSummary');
+    if (!el) return;
+    try {
+        const data = await fetch('/api/preferences/summary', { cache: 'no-store' }).then(function (r) { return r.json(); });
+        const tags = data.tag_counts || {};
+        const cats = (data.categories || []).slice(0, 8).map(function (x) { return escapeHtml(x.name) + ' (' + x.total + ')'; });
+        const feats = (data.features || []).slice(0, 6).map(function (x) { return escapeHtml(x.name) + '：' + x.values.map(function (v) { return escapeHtml(v.value) + '×' + v.count; }).join('、'); });
+        el.innerHTML = '已完成决策 <b>' + (data.reviewed || 0) + '</b>，已评分 <b>' + (data.rated || 0) + '</b><br>'
+            + '保留 ' + (tags.kept || 0) + ' · 待定 ' + (tags.pending || 0) + ' · 待删除 ' + (tags.deleted || 0)
+            + (cats.length ? '<br><b>常用分类：</b>' + cats.join('、') : '')
+            + (feats.length ? '<br><b>分类依据：</b><br>' + feats.join('<br>') : '');
+    } catch (e) { el.textContent = '偏好依据加载失败'; }
 }
 function setWorkReviewTag(workId, tag) {
     mbPatchReviewWork(workId, { tag: tag, update_global: false }, false);
@@ -6280,10 +7343,12 @@ function toggleWorkReview(workId) {
 function updateGalleryReviewBtn(workId) {
     const btn = document.getElementById('galleryReviewBtn');
     if (!btn) return;
-    const tag = getWorkReviewTag(workId);
+    const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
+    const item = work && work.items[galleryState.itemIdx];
+    const tag = item && item.type === 'video' ? getVideoReviewTag(item) : 'pending';
     btn.textContent = tag === 'kept' ? '保留' : (tag === 'deleted' ? '待删除' : '待定');
     btn.className = 'gallery-review-btn ' + tag;
-    btn.title = '当前作品审阅状态';
+    btn.title = '当前视频审阅状态';
     const galBtn = document.getElementById('mbGalReview');
     if (galBtn) {
         galBtn.textContent = '保留';
@@ -6334,7 +7399,128 @@ function switchTab(tab) {
     document.getElementById('analysisPanel').classList.toggle('active', !reviewVisible);
     document.getElementById('tabReview').classList.toggle('active', reviewVisible);
     document.getElementById('tabAnalysis').classList.toggle('active', !reviewVisible);
-    if (!reviewVisible) loadTaskList();
+    if (reviewVisible) {
+        if (analysisReviewPollTimer) clearInterval(analysisReviewPollTimer);
+        analysisReviewPollTimer = null;
+    } else {
+        loadTaskList();
+        loadAnalysisReview();
+        if (!analysisReviewPollTimer) {
+            analysisReviewPollTimer = setInterval(() => { loadAnalysisReview(true); }, 4000);
+        }
+    }
+}
+
+function analysisReviewVisibleRows() {
+    const rows = (analysisReviewData && analysisReviewData.rows) || [];
+    if (analysisReviewFilter === 'all') return rows;
+    if (analysisReviewFilter === 'attention') return rows.filter(r => r.status === 'attention');
+    return rows.filter(r => r.status === 'review' || r.status === 'attention');
+}
+
+function renderAnalysisReview() {
+    const data = analysisReviewData || { rows: [], counts: {} };
+    const c = data.counts || {};
+    const summary = document.getElementById('analysisReviewSummary');
+    if (summary) {
+        const handled = Number(c.auto_accepted || 0) + Number(c.accepted || 0) + Number(c.excluded || 0);
+        summary.innerHTML = `
+            <div class="analysis-review-stat"><span>视频总数</span><b>${Number(data.total || 0)}</b></div>
+            <div class="analysis-review-stat"><span>已自动处理</span><b>${handled}</b></div>
+            <div class="analysis-review-stat"><span>需要复核</span><b>${Number(data.needs_review || 0)}</b></div>
+            <div class="analysis-review-stat"><span>分析中</span><b>${Number(c.processing || 0)}</b></div>
+            <div class="analysis-review-stat"><span>演员候选</span><b>${Number(data.identity_pending || 0)}</b></div>
+            <div class="analysis-review-stat"><span>地区待识别</span><b>${Number(data.region_pending || 0)}</b></div>`;
+    }
+    document.querySelectorAll('#analysisReviewFilters [data-ar-filter]').forEach(btn => {
+        btn.classList.toggle('primary', btn.dataset.arFilter === analysisReviewFilter);
+    });
+    const list = document.getElementById('analysisReviewList');
+    if (!list) return;
+    const rows = analysisReviewVisibleRows();
+    if (!rows.length) {
+        const msg = analysisReviewFilter === 'exceptions'
+            ? '目前没有需要人工处理的异常。高置信度结果已经自动接受。'
+            : '当前筛选条件下没有视频。';
+        list.innerHTML = `<div class="analysis-note">${msg}</div>`;
+        return;
+    }
+    const labels = {
+        attention: '需要重点处理', review: '快速复核', processing: '分析中',
+        auto_accepted: '已自动接受', accepted: '已接受', excluded: '已排除'
+    };
+    list.innerHTML = rows.map((row) => {
+        const p = row.path || '';
+        const tags = (row.categories || []).slice(0, 8);
+        const performers = (row.performers || []).map(x => '演员：' + x);
+        const candidates = (row.performer_candidates || []).map(x => '候选：' + x);
+        const allTags = tags.concat(performers).concat(candidates).slice(0, 12);
+        const confidence = Math.round(Number(row.confidence || 0) * 100);
+        const note = row.error || row.phrase || row.reason || '';
+        const processing = row.status === 'processing';
+        return `<div class="analysis-review-item ${escapeHtml(row.status)}" data-video-id="${row.video_id}">
+            <input type="checkbox" class="analysis-review-check" aria-label="选择 ${escapeHtml(row.filename || '')}">
+            <a href="${buildVideoPlayUrl(p)}" target="_blank" rel="noopener noreferrer" title="播放核对">
+                <img src="/api/preview-thumb?path=${encodeURIComponent(p)}" alt="" loading="lazy" onerror="window.insightRowThumbError(event)">
+            </a>
+            <div class="analysis-review-main">
+                <div class="analysis-review-name" title="${escapeHtml(p)}">${escapeHtml(row.filename || p)}</div>
+                <div class="analysis-note"><b>${escapeHtml(labels[row.status] || row.status)}</b> · 置信度 ${confidence}% · ${escapeHtml(row.reason || '')}</div>
+                ${note ? `<div class="analysis-note" style="margin-top:4px;color:${row.error ? '#f99' : '#aaa'}">${escapeHtml(String(note).slice(0, 220))}</div>` : ''}
+                <div class="analysis-review-tags" style="margin-top:7px;">${allTags.map(x => `<span>${escapeHtml(x)}</span>`).join('')}</div>
+                ${row.identity_pending ? '<div class="analysis-note" style="margin-top:6px;color:#9ab;">演员姓名仍是候选，不影响其他分类自动生效。</div>' : ''}
+            </div>
+            <div class="analysis-review-actions">
+                <button type="button" class="primary" data-ar-action="accept" ${processing ? 'disabled' : ''}>接受</button>
+                <button type="button" data-ar-action="retry" ${processing ? 'disabled' : ''}>重试</button>
+                <button type="button" data-ar-action="exclude" ${processing ? 'disabled' : ''}>排除</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function loadAnalysisReview(silent) {
+    try {
+        const r = await fetch('/api/analysis-review', { cache: 'no-store' });
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || '加载失败');
+        analysisReviewData = data;
+        renderAnalysisReview();
+    } catch (e) {
+        if (!silent) {
+            const list = document.getElementById('analysisReviewList');
+            if (list) list.innerHTML = `<div class="analysis-note" style="color:#f99">读取分类状态失败：${escapeHtml(e.message || String(e))}</div>`;
+        }
+    }
+}
+
+async function analysisReviewAction(action, videoIds) {
+    const ids = Array.from(new Set((videoIds || []).filter(Boolean)));
+    if (!ids.length) return;
+    try {
+        const r = await fetch('/api/analysis-review/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ action: action, video_ids: ids }),
+        });
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || '操作失败');
+        await loadAnalysisReview(false);
+    } catch (e) {
+        alert('复核操作失败：' + (e.message || String(e)));
+    }
+}
+
+function selectedAnalysisReviewIds() {
+    return Array.from(document.querySelectorAll('#analysisReviewList .analysis-review-item')).filter(card => {
+        const cb = card.querySelector('.analysis-review-check');
+        return cb && cb.checked;
+    }).map(card => card.dataset.videoId).filter(Boolean);
+}
+
+function firstAnalysisReviewId() {
+    const card = document.querySelector('#analysisReviewList .analysis-review-item');
+    return card ? card.dataset.videoId : '';
 }
 
 async function loadTaskList() {
@@ -6798,26 +7984,30 @@ async function batchMarkReview(state) {
     sortAndRenderAll();
 }
 async function deleteAllMarkedWorks() {
-    const marked = allWorks.filter(function (w) { return getWorkReviewTag(w.id) === 'deleted'; });
+    const marked = [];
+    allWorks.forEach(function (w) { w.items.forEach(function (it) {
+        if (it.type === 'video' && getVideoReviewTag(it) === 'deleted') marked.push({ work: w, item: it });
+    }); });
     if (!marked.length) {
-        alert('当前没有标记为待删除的作品。');
+        alert('当前没有标记为待删除的视频。');
         return;
     }
-    const fileCount = marked.reduce(function (n, w) { return n + w.items.length; }, 0);
-    if (!confirm('将永久删除 ' + marked.length + ' 个待删除作品中的 ' + fileCount + ' 个媒体文件，不可恢复。确定？')) return;
+    if (!confirm('将永久删除 ' + marked.length + ' 个待删除视频，不会删除同文件夹中的其它视频或图片。不可恢复，确定？')) return;
     closeModal();
-    let deletedWorks = 0;
-    let failedWorks = 0;
-    for (const work of marked.slice()) {
-        const before = work.items.length;
-        await deleteWorkAllFiles(work, true);
-        if (!allWorks.some(function (w) { return w.id === work.id; })) {
-            deletedWorks++;
-            await mbPatchReviewWork(work.id, { tag: 'pending', update_global: false }, false);
-        }
-        else if (work.items.length === before) failedWorks++;
+    let deleted = 0, failed = 0;
+    for (const row of marked) {
+        try {
+            const data = await fetch('/delete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path: row.item.path, work_path: row.work.path }) }).then(function (r) { return r.json(); });
+            if (data.ok) {
+                deleted++;
+                const i = row.work.items.indexOf(row.item);
+                if (i >= 0) { row.work.items.splice(i, 1); row.work.video_count = Math.max(0, row.work.video_count - 1); }
+            }
+            else failed++;
+        } catch (e) { failed++; }
     }
-    alert('已删除 ' + deletedWorks + ' 个作品' + (failedWorks ? '；' + failedWorks + ' 个作品删除失败或未完全删除。' : '。'));
+    sortAndRenderAll();
+    alert('已删除 ' + deleted + ' 个视频' + (failed ? '；' + failed + ' 个删除失败，已加入废纸篓。' : '。'));
     mbRefreshTrashBadge(true);
 }
 async function batchOpenFinder() {
@@ -7282,8 +8472,8 @@ function sortAndRenderAll() {
     const list = getFilteredSortedWorks();
     const deleteMarkedBtn = document.getElementById('mbDeleteMarkedBtn');
     if (deleteMarkedBtn) {
-        const markedCount = allWorks.filter(function (w) { return getWorkReviewTag(w.id) === 'deleted'; }).length;
-        deleteMarkedBtn.textContent = '永久删除待删除作品' + (markedCount ? ' (' + markedCount + ')' : '');
+        const markedVideos = allWorks.reduce(function (n, w) { return n + w.items.filter(function (it) { return it.type === 'video' && getVideoReviewTag(it) === 'deleted'; }).length; }, 0);
+        deleteMarkedBtn.textContent = '永久删除待删除视频' + (markedVideos ? ' (' + markedVideos + ')' : '');
     }
     container.innerHTML = '';
     displayedIds.clear();
@@ -7627,12 +8817,23 @@ function renderGallery() {
     const delWorkBtn = `<span onclick="event.stopPropagation(); deleteCurrentWork();" style="cursor:pointer;color:#ff6666;margin-left:10px;font-size:12px;" title="删除本作品全部媒体：⌘⇧I / Ctrl+Shift+I">🗑 删本作品</span>`;
     const invalid = item.invalid_reason ? `<span class="review-tag invalid" title="${escapeHtml(item.invalid_reason)}">疑似无效：${escapeHtml(item.invalid_reason)}</span>` : '';
     const reviewBtn = `<button type="button" id="galleryReviewBtn" class="gallery-review-btn" data-work-id="${escapeHtml(work.id)}">标记</button>`;
-    infoDiv.innerHTML = `${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${invalid}${delBtn}${delWorkBtn}${reviewBtn}`;
+    const videoEntry = item.type === 'video' ? (mbGetVideoReviewEntry(item) || {}) : {};
+    const hasRating = Number.isInteger(videoEntry.rating);
+    const rating = hasRating ? Number(videoEntry.rating) : null;
+    const ratingHtml = item.type === 'video' ? '<div class="mb-video-rating-row"><span class="mb-video-rating-label">当前视频（键盘 0–5）</span><span class="review-rating">'
+        + '<button type="button" class="mb-rating-zero' + (rating === 0 ? ' active' : '') + '" data-current-video-rating="0" title="0 分：标记为待删除">0 待删除</button>'
+        + [1,2,3,4,5].map(function (n) {
+        return '<button type="button" data-current-video-rating="' + n + '" title="当前视频 ' + n + ' 星">' + (n <= rating ? '★' : '☆') + '</button>';
+    }).join('') + '</span></div>' : '';
+    const autoCats = (videoEntry.categories || []).map(function (x) { return escapeHtml(String(x)); }).join(' · ');
+    const autoFeatures = Object.entries(videoEntry.features || {}).map(function (pair) { return escapeHtml(pair[0]) + '：' + escapeHtml(String(pair[1])); }).join('；');
+    const autoInfo = item.type === 'video' ? '<div class="analysis-note" style="margin-top:5px">自动分类：' + (autoCats || '尚未分析') + (autoFeatures ? '<br>自动特征：' + autoFeatures : '') + '</div>' : '';
+    infoDiv.innerHTML = `<div class="mb-file-meta-line">${res}${codec}${bitrate}${fps}${dur}${escapeHtml(item.name)} · ${fmtSize(item.size)}${invalid}${delBtn}${delWorkBtn}${reviewBtn}</div>${ratingHtml}${autoInfo}`;
     updateGalleryReviewBtn(work.id);
     const sh = document.getElementById('shortcutHint');
     if (sh) {
         if (item.type === 'video') {
-            sh.textContent = '← → 快退/快进5s · Shift+←→ 翻文件（末档再→ 进下一作品）· ⌘←⌘→ 切作品 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ,/. 逐帧 · ESC 关闭 · ⌘I 删当前 · ⌘⇧I 删本作品';
+            sh.textContent = '0 待删除、1–5 保留评分 · ← → 快退/快进5s · Shift+←→ 翻文件 · ⌘←⌘→ 切作品 · J/L 退/进10s · 空格/K 播放 · F 全屏 · M 静音 · ↑↓ 音量 · ESC 关闭';
         } else {
             sh.textContent = '← → 翻图片（末张再→ 进下一作品首张）· ⌘←⌘→ 切作品 · 滚轮缩放 · 拖拽平移 · 双击还原 · ESC 关闭 · ⌘I 删当前 · ⌘⇧I 删本作品';
         }
@@ -7738,15 +8939,15 @@ function nextGalleryWorkBeforeRemoval(workId) {
 async function quickReviewCurrentWork(tag) {
     const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
     if (!work) return;
-    const nextWork = nextGalleryWorkBeforeRemoval(work.id);
-    await mbPatchReviewWork(work.id, { tag: tag, update_global: false }, false);
+    const item = work.items[galleryState.itemIdx];
+    if (!item || item.type !== 'video') return;
+    const currentEntry = mbGetVideoReviewEntry(item) || {};
+    const patch = tag === 'deleted' ? { rating: 0 }
+        : (tag === 'pending' ? { rating: null }
+        : { rating: (Number(currentEntry.rating) >= 1 && Number(currentEntry.rating) <= 5) ? Number(currentEntry.rating) : 3 });
+    await mbPatchReviewVideo(item, patch);
     sortAndRenderAll();
-    if (nextWork && allWorks.some(function (w) { return w.id === nextWork.id; })) {
-        openGallery(nextWork.id, 0, -1, { forceItemIdx: true });
-        ensureWorkCardInDomAndScroll(nextWork.id);
-        return;
-    }
-    closeModal();
+    advanceToNextVideoAfterDecision();
 }
 
 function removeEmptyWorkAndContinue(work, nextWork) {
@@ -8164,6 +9365,17 @@ document.addEventListener('fullscreenchange', () => {
 
 // 事件委托：卡片列表中的"标为待审"按钮
 document.addEventListener('click', (e) => {
+    const currentRating = e.target.closest('[data-current-video-rating]');
+    if (currentRating) {
+        e.stopPropagation();
+        setCurrentVideoRating(Number(currentRating.dataset.currentVideoRating));
+        return;
+    }
+    if (e.target.closest('#refreshPreferenceSummary')) {
+        e.stopPropagation();
+        loadPreferenceSummary();
+        return;
+    }
     const gridSizeBtn = e.target.closest('[data-image-grid-size]');
     if (gridSizeBtn) {
         e.stopPropagation();
@@ -8174,12 +9386,6 @@ document.addEventListener('click', (e) => {
     if (gridDeleteBtn) {
         e.stopPropagation();
         deleteCurrentImageGridGroup(false);
-        return;
-    }
-    const reviewAction = e.target.closest('[data-review-tag][data-work-id]');
-    if (reviewAction) {
-        e.stopPropagation();
-        setWorkReviewTag(reviewAction.dataset.workId, reviewAction.dataset.reviewTag);
         return;
     }
     const pendingBtn = e.target.closest('.review-to-pending');
@@ -8207,6 +9413,19 @@ document.addEventListener('keydown', (e) => {
     }
     const modal = document.getElementById('modal');
     if (!modal || !modal.classList.contains('active')) {
+        if (typeof activeTab !== 'undefined' && activeTab === 'analysis') {
+            const el = e.target;
+            const editing = el && el.closest && el.closest('input, textarea, select, [contenteditable="true"]');
+            if (!editing && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                const key = String(e.key || '').toLowerCase();
+                const action = key === 'a' ? 'accept' : (key === 'r' ? 'retry' : (key === 'x' ? 'exclude' : ''));
+                const id = action ? firstAnalysisReviewId() : '';
+                if (id) {
+                    e.preventDefault();
+                    analysisReviewAction(action, [id]);
+                }
+            }
+        }
         if (typeof activeTab !== 'undefined' && activeTab === 'review') {
             const el = e.target;
             if (el && el.closest && !el.closest('input, textarea, select, [contenteditable="true"]')) {
@@ -8220,9 +9439,9 @@ document.addEventListener('keydown', (e) => {
 
     // 全局
     if (e.key === 'Escape') { closeModal(); return; }
-    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === '1' || e.key === '2' || e.key === '3')) {
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && /^[0-5]$/.test(e.key)) {
         e.preventDefault();
-        quickReviewCurrentWork(e.key === '1' ? 'kept' : (e.key === '2' ? 'pending' : 'deleted'));
+        setCurrentVideoRating(Number(e.key));
         return;
     }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'l' || e.key === 'L')) {
@@ -8717,6 +9936,34 @@ async function mbApplyCacheDirSwitch() {
     if (createTaskBtn) createTaskBtn.addEventListener('click', createAnalysisTask);
     if (refreshTasksBtn) refreshTasksBtn.addEventListener('click', loadTaskList);
     if (saveEvalBtn) saveEvalBtn.addEventListener('click', saveTaskEvaluation);
+    const analysisReviewList = document.getElementById('analysisReviewList');
+    const analysisReviewFilters = document.getElementById('analysisReviewFilters');
+    const analysisReviewSelectAll = document.getElementById('analysisReviewSelectAll');
+    const refreshAnalysisReview = document.getElementById('refreshAnalysisReview');
+    if (analysisReviewFilters) analysisReviewFilters.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-ar-filter]');
+        if (!btn) return;
+        analysisReviewFilter = btn.dataset.arFilter || 'exceptions';
+        if (analysisReviewSelectAll) analysisReviewSelectAll.checked = false;
+        renderAnalysisReview();
+    });
+    if (analysisReviewList) analysisReviewList.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-ar-action]');
+        const card = btn && btn.closest('.analysis-review-item');
+        if (!btn || !card) return;
+        analysisReviewAction(btn.dataset.arAction, [card.dataset.videoId]);
+    });
+    if (analysisReviewSelectAll) analysisReviewSelectAll.addEventListener('change', () => {
+        document.querySelectorAll('#analysisReviewList .analysis-review-check').forEach(cb => { cb.checked = analysisReviewSelectAll.checked; });
+    });
+    if (refreshAnalysisReview) refreshAnalysisReview.addEventListener('click', () => loadAnalysisReview(false));
+    const bindBulkReview = (id, action) => {
+        const btn = document.getElementById(id);
+        if (btn) btn.addEventListener('click', () => analysisReviewAction(action, selectedAnalysisReviewIds()));
+    };
+    bindBulkReview('analysisBulkAccept', 'accept');
+    bindBulkReview('analysisBulkRetry', 'retry');
+    bindBulkReview('analysisBulkExclude', 'exclude');
     // 任务表按钮使用内联 onclick，需要挂到全局
     window.previewAnalysisTask = previewAnalysisTask;
     window.executeAnalysisTask = executeAnalysisTask;
@@ -8823,6 +10070,11 @@ def main():
     logger.info("按 Ctrl+C 停止")
     if should_auto_scan_on_startup():
         scanner.start()
+        threading.Thread(
+            target=resume_pending_video_analysis,
+            args=(get_scan_root(),),
+            daemon=True,
+        ).start()
     else:
         scanner.mark_idle()
         logger.info(

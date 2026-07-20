@@ -2,7 +2,7 @@
 
 本地视频/图片流式浏览与轻量审阅（单文件 **`media_browser.py`**）。依赖 **ffmpeg**、**ffprobe**（脚本用 PATH；`.app` 会捆绑构建时的可执行文件）。
 
-**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **1.5.0**，发版前请与打包配置核对）。
+**当前版本**以 `media_browser.py` 中 `APP_VERSION` 与页眉 `v…` 为准（当前为 **2.0.0**，打包配置会自动读取该版本号）。
 
 ---
 
@@ -81,9 +81,10 @@ docker compose up -d --build
 | `MB_ROOT_DIR` | 启动时的扫描根目录；运行中可在**页眉**改路径并「应用并扫描」 | macOS: `/Volumes/Untitled/pri`<br>Win/Linux: `~/MediaBrowser` | `~/Documents/MediaBrowser` |
 | `MB_CACHE_DIR` | 缩略图/播放转码/审阅账本等缓存目录；也可在页面顶部「缓存目录」中修改 | `~/.cache/media-browser/thumbs` | `~/Library/Application Support/Media Browser/thumbs` |
 | `MB_OLLAMA_HOST` | 本地 Ollama 地址（AI 视频分析） | `http://127.0.0.1:11434` | 同上 |
-| `MB_OLLAMA_MODEL` | 视觉模型名（如 `llava`、`moondream`） | `llava` | 同上 |
+| `MB_OLLAMA_MODEL` | 视觉模型名；配置模型未安装时自动选择本机已有视觉模型 | `llava` | 同上 |
 | `MB_OLLAMA_TIMEOUT` | Ollama 单次请求超时（秒） | `300` | 同上 |
 | `MB_ANALYZE_FRAME_COUNT` | AI 分析时每视频抽帧数（2–12） | `5` | 同上 |
+| `MB_WHISPER_MODEL` | 本地音频语言识别模型；需已缓存的 faster-whisper 模型 | `tiny` | 同上 |
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
 | `MB_HOST` | 监听地址；非本机地址必须同时设置 `MB_ACCESS_TOKEN` | `127.0.0.1` | 同上 |
 | `MB_ACCESS_TOKEN` | 局域网访问令牌；首次浏览器访问用 `/?token=...`，API 可用 Bearer Token | 未设置 | 同上 |
@@ -194,8 +195,10 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/play?path=` | GET | 实时转码 MP4 |
 | `/open?path=` | GET | 在文件管理器中打开目录（跨平台） |
 | `/api/tasks` | POST | 创建 AI 分析任务 |
+| `/api/analysis-review` | GET | 查看按视频汇总的自动接受、待复核、失败与分析中状态 |
+| `/api/analysis-review/action` | POST | 按视频批量接受、重试或排除分类结果 |
 | `/api/tasks/{id}/analyze` | POST | 开始 AI 分析 |
-| `/api/tasks/{id}/confirm` | POST | 确认分析结果标签 |
+| `/api/tasks/{id}/confirm` | POST | 高级模式下逐字段确认分析结果 |
 | `/api/tasks/{id}/preview` | POST | 预览批量重命名映射 |
 | `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
 | `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
@@ -283,7 +286,7 @@ GitHub Actions 生成的 Windows 包如果没有代码签名证书，Windows 可
 临时运行方式：
 
 ```powershell
-Unblock-File .\MediaBrowser-v1.5.0-windows.zip
+Unblock-File .\MediaBrowser-v2.0.0-windows.zip
 ```
 
 先对 zip 执行上面的解除阻止，再解压运行。也可以右键 zip → 属性 → 勾选“解除锁定/解除阻止” → 确定后再解压。Windows zip 内也会附带 `README-WINDOWS.txt`，方便离线查看这一步。
@@ -302,8 +305,8 @@ Unblock-File .\MediaBrowser-v1.5.0-windows.zip
 项目已配置 GitHub Actions，推送 `v*` 标签时自动构建并发布：
 
 ```bash
-git tag v1.5.0
-git push origin v1.5.0
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
 Actions 会并行构建：
