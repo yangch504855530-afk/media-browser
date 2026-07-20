@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+      - "V*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build and upload assets for"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,6 +20,8 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -45,6 +54,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -77,6 +88,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -176,6 +189,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -186,6 +201,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             artifacts/macos-intel/**/*.dmg
             artifacts/macos-arm/**/*.dmg
