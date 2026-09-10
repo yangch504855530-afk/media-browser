@@ -5008,6 +5008,9 @@ class Handler(BaseHTTPRequestHandler):
             )
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
+
 
 
 
