@@ -35,7 +35,7 @@ def segment(mb, path, index):
     if index < 0 or index * SEGMENT_SECONDS >= metadata['duration']:
         raise ValueError('播放位置超出视频范围')
     key = mb._play_cache_key(path)
-    target = os.path.join(mb.play_cache_root(), 'ondemand-v1', key, str(index) + '.mp4')
+    target = os.path.join(mb.play_cache_root(), 'ondemand-v1', key[:2], key, str(index) + '.mp4')
     with mb._play_job_lock('segment:' + key + ':' + str(index)):
         if os.path.isfile(target) and os.path.getsize(target) > 512:
             return target

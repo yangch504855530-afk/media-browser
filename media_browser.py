@@ -60,6 +60,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
 APP_VERSION = "2.1.0"
+MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
 def _default_settings_dir() -> str:
@@ -488,6 +489,12 @@ _ensure_cache_dir_ready()
 # ===================== 工具函数 =====================
 def sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+def _thumb_cache_dir(file_hash: str) -> str:
+    old_dir = os.path.join(CACHE_DIR, file_hash)
+    if os.path.isdir(old_dir):
+        return old_dir
+    return os.path.join(CACHE_DIR, file_hash[:2], file_hash)
 
 
 def _play_cache_key(source: str) -> str:
@@ -1570,7 +1577,7 @@ def remove_media_thumb_cache(media_path: str) -> None:
     """删除该媒体在缓存目录下对应的缩略图文件夹（与 generate_* 使用的 sha256(abspath) 一致）。"""
     try:
         key = sha256_str(os.path.abspath(media_path))
-        thumb_dir = os.path.join(CACHE_DIR, key)
+        thumb_dir = _thumb_cache_dir(key)
         if os.path.isdir(thumb_dir):
             shutil.rmtree(thumb_dir, ignore_errors=True)
     except Exception:
@@ -2085,7 +2092,7 @@ def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str
     if not os.path.isfile(video_path):
         return ""
     file_hash = sha256_str(os.path.abspath(video_path))
-    thumb_dir = os.path.join(CACHE_DIR, file_hash)
+    thumb_dir = _thumb_cache_dir(file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
     dst = os.path.join(thumb_dir, "0.jpg")
     if os.path.exists(dst) and os.path.getsize(dst) > 100:
@@ -2125,7 +2132,7 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
     if not os.path.isfile(video_path):
         return []
     file_hash = sha256_str(os.path.abspath(video_path))
-    thumb_dir = os.path.join(CACHE_DIR, file_hash)
+    thumb_dir = _thumb_cache_dir(file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
 
     expected = [os.path.join(thumb_dir, f"{i}.jpg") for i in range(count)]
@@ -2188,7 +2195,7 @@ def generate_image_thumb(image_path: str) -> str:
     if not os.path.isfile(image_path):
         return ""
     file_hash = sha256_str(os.path.abspath(image_path))
-    thumb_dir = os.path.join(CACHE_DIR, file_hash)
+    thumb_dir = _thumb_cache_dir(file_hash)
     os.makedirs(thumb_dir, exist_ok=True)
     dst = os.path.join(thumb_dir, "0.jpg")
     if os.path.exists(dst) and os.path.getsize(dst) > 100:
@@ -4064,6 +4071,8 @@ _ai_resume_roots_active: set[str] = set()
 
 def resume_pending_video_analysis(expected_root: str | None = None) -> None:
     """Create one persistent, serial AI task per unfinished video after scanning."""
+    if not MB_ENABLE_AI:
+        return
     root = os.path.realpath(expected_root or get_scan_root())
     with _ai_resume_lock:
         if root in _ai_resume_roots_active:
@@ -4575,7 +4584,7 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 file_hash = parts[2]
                 idx_name = parts[3]
-                thumb_path = os.path.realpath(os.path.join(CACHE_DIR, file_hash, idx_name))
+                thumb_path = os.path.realpath(os.path.join(_thumb_cache_dir(file_hash), idx_name))
                 cache_root = os.path.realpath(CACHE_DIR)
                 if thumb_path.startswith(cache_root + os.sep):
                     self._send_file(thumb_path, "image/jpeg")
@@ -4683,6 +4692,9 @@ class Handler(BaseHTTPRequestHandler):
             trigger_exit()
             return
         if parsed.path == "/api/tasks":
+            if not MB_ENABLE_AI:
+                self._send_json({"ok": False, "error": "AI 分析功能已通过 MB_ENABLE_AI=0 禁用"}, 403)
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -4706,6 +4718,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/tasks/([0-9a-fA-F]+)/analyze", parsed.path or "")
         if m:
+            if not MB_ENABLE_AI:
+                self._send_json({"ok": False, "error": "AI 分析功能已禁用"}, 403)
+                return
             ret = analysis_tasks.start_analyze(m.group(1))
             if ret is None:
                 self._send_json({"ok": False, "error": "task not found"}, 404)

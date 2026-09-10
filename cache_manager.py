@@ -9,11 +9,16 @@ LABELS = {'full':'完整播放缓存','segments':'按需播放片段','thumbs':'
 
 def _kind(relative):
     parts = relative.replace('\\', '/').split('/')
-    if len(parts)==3 and parts[0]=='play_mp4' and re.fullmatch(r'[0-9a-f]{2}',parts[1]) and re.fullmatch(r'[0-9a-f]{64}\.mp4',parts[2]):
+    if len(parts) == 3 and parts[0] == 'play_mp4' and re.fullmatch(r'[0-9a-f]{2}', parts[1]) and re.fullmatch(r'[0-9a-f]{64}\.mp4', parts[2]):
         return 'full'
-    if len(parts)==4 and parts[:2]==['play_mp4','ondemand-v1'] and re.fullmatch(r'[0-9a-f]{64}',parts[2]) and re.fullmatch(r'\d+\.mp4',parts[3]):
-        return 'segments'
-    if len(parts)==2 and re.fullmatch(r'[0-9a-f]{16}',parts[0]) and parts[1].lower().endswith('.jpg'):
+    if len(parts) in (4, 5) and parts[:2] == ['play_mp4', 'ondemand-v1']:
+        if len(parts) == 5 and re.fullmatch(r'[0-9a-f]{2}', parts[2]) and re.fullmatch(r'[0-9a-f]{64}', parts[3]) and re.fullmatch(r'\d+\.mp4', parts[4]):
+            return 'segments'
+        if len(parts) == 4 and re.fullmatch(r'[0-9a-f]{64}', parts[2]) and re.fullmatch(r'\d+\.mp4', parts[3]):
+            return 'segments'
+    if len(parts) == 3 and re.fullmatch(r'[0-9a-f]{2}', parts[0]) and re.fullmatch(r'[0-9a-f]{16}', parts[1]) and parts[2].lower().endswith('.jpg'):
+        return 'thumbs'
+    if len(parts) == 2 and re.fullmatch(r'[0-9a-f]{16}', parts[0]) and parts[1].lower().endswith('.jpg'):
         return 'thumbs'
     return 'protected'
 
