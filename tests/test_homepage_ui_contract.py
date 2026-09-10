@@ -16,7 +16,7 @@ import media_browser as mb
 def _build_homepage_text() -> str:
     presets_json = json.dumps(mb.get_scan_presets(), ensure_ascii=False)
     return (
-        mb.HTML_PAGE.replace("__MB_ROOT_DIR__", html_mod.escape(mb.get_scan_root()))
+        open(mb.os.path.join(mb.os.path.dirname(mb.__file__), 'templates', 'index.html'), encoding='utf-8').read().replace("__MB_ROOT_DIR__", html_mod.escape(mb.get_scan_root()))
         .replace("__MB_CACHE_DIR__", html_mod.escape(mb.CACHE_DIR))
         .replace("__MB_CACHE_DIR_JSON__", json.dumps(mb.CACHE_DIR, ensure_ascii=False))
         .replace("__THUMB_COUNT__", str(mb.THUMB_COUNT))
