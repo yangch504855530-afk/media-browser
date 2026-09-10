@@ -60,7 +60,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
@@ -1223,7 +1223,7 @@ def video_asset_id(path: str) -> str:
 
 
 def patch_review_state_video(video_id: str, patch: dict) -> dict:
-    if not video_id or not re.fullmatch(r"[0-9a-fA-F]{16}", video_id):
+    if not video_id or not re.fullmatch(r"[0-9a-fA-F]{16,64}", video_id):
         return {"ok": False, "error": "invalid video_id"}
     if not isinstance(patch, dict):
         return {"ok": False, "error": "invalid patch"}
@@ -4498,8 +4498,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_request_security(mutating=True) or self._body_too_large():
             return
         parsed = urlparse(self.path)
-        work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
-        video_match = re.fullmatch(r"/api/review-state/video/([0-9a-fA-F]{16})", parsed.path or "")
+        work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]{16,64})", parsed.path or "")
+        video_match = re.fullmatch(r"/api/review-state/video/([0-9a-fA-F]{16,64})", parsed.path or "")
         if not work_match and not video_match:
             self.send_error(404)
             return
