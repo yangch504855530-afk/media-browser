@@ -2346,8 +2346,8 @@ function getWorkReviewTag(workId) {
     const videos = work ? work.items.filter(function (it) { return it.type === 'video'; }) : [];
     if (!videos.length) return 'pending';
     const tags = videos.map(function (it) { return getVideoReviewTag(it); });
+    if (tags.some(function (t) { return t === 'kept'; })) return 'kept';
     if (tags.every(function (t) { return t === 'deleted'; })) return 'deleted';
-    if (tags.every(function (t) { return t !== 'pending'; })) return 'kept';
     return 'pending';
 }
 function mbGetVideoReviewEntry(item) {
@@ -2388,6 +2388,11 @@ async function setCurrentVideoRating(rating) {
             btn.setAttribute('aria-pressed', n === normalized ? 'true' : 'false');
         });
         updateGalleryReviewBtn(galleryState.workId);
+        const card = document.querySelector('.work-card[data-id="' + CSS.escape(galleryState.workId) + '"]');
+        if (card) {
+            const strip = card.querySelector('.review-strip');
+            if (strip) strip.outerHTML = buildReviewStripHtml(galleryState.workId, work);
+        }
         loadPreferenceSummary();
         advanceToNextVideoAfterDecision();
     }
@@ -3266,7 +3271,13 @@ function workMatchesFilter(w, ft) {
     if (ft === 'all') return true;
     if (ft === 'video') return w.video_count > 0;
     if (ft === 'image') return w.image_count > 0;
-    if (ft === 'pending') return getWorkReviewTag(w.id) === 'pending';
+    if (ft === 'pending') {
+        const videos = (w && w.items || []).filter(function (it) { return it.type === 'video'; });
+        if (videos.length > 0) {
+            return videos.some(function (it) { return getVideoReviewTag(it) === 'pending'; });
+        }
+        return getWorkReviewTag(w.id) === 'pending';
+    }
     if (ft === 'kept') return getWorkReviewTag(w.id) === 'kept';
     if (ft === 'deleted') return getWorkReviewTag(w.id) === 'deleted';
     if (ft === 'invalid') return Number(w.invalid_count || 0) > 0;
@@ -4410,6 +4421,9 @@ function closeModal() {
     }
     galleryState = { workId: null, itemIdx: 0 };
     mbSyncMobileStatusText();
+    if (filterType !== 'all') {
+        sortAndRenderAll();
+    }
 }
 
 function setupImageZoom() {

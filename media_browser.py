@@ -60,8 +60,17 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.5.2"
+APP_VERSION = "2.5.3"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
+
+
+def _load_homepage_template() -> str:
+    path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+HTML_PAGE = _load_homepage_template()
 
 
 def _default_settings_dir() -> str:
@@ -1538,7 +1547,7 @@ def analysis_review_payload() -> dict:
 
 
 def apply_analysis_review_action(video_ids: list, action: str) -> dict:
-    ids = list(dict.fromkeys(str(x).lower() for x in (video_ids or []) if re.fullmatch(r"[0-9a-fA-F]{16}", str(x))))
+    ids = list(dict.fromkeys(str(x).lower() for x in (video_ids or []) if re.fullmatch(r"[0-9a-fA-F]{16,64}", str(x))))
     if action not in ("accept", "exclude", "retry"):
         return {"ok": False, "error": "action must be accept, exclude or retry"}
     state = load_review_state()
@@ -4498,7 +4507,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_request_security(mutating=True) or self._body_too_large():
             return
         parsed = urlparse(self.path)
-        work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]{16,64})", parsed.path or "")
+        work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
         video_match = re.fullmatch(r"/api/review-state/video/([0-9a-fA-F]{16,64})", parsed.path or "")
         if not work_match and not video_match:
             self.send_error(404)
