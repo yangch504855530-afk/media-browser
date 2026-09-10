@@ -1,0 +1,71 @@
+"""Cache inventory and conservative removal of regenerable, recognized files."""
+import hashlib
+import os
+import re
+import stat
+import time
+
+LABELS = {'full':'完整播放缓存','segments':'按需播放片段','thumbs':'缩略图','protected':'审阅记录、分析数据及其他文件'}
+
+def _kind(relative):
+    parts = relative.replace('\\', '/').split('/')
+    if len(parts)==3 and parts[0]=='play_mp4' and re.fullmatch(r'[0-9a-f]{2}',parts[1]) and re.fullmatch(r'[0-9a-f]{64}\.mp4',parts[2]):
+        return 'full'
+    if len(parts)==4 and parts[:2]==['play_mp4','ondemand-v1'] and re.fullmatch(r'[0-9a-f]{64}',parts[2]) and re.fullmatch(r'\d+\.mp4',parts[3]):
+        return 'segments'
+    if len(parts)==2 and re.fullmatch(r'[0-9a-f]{16}',parts[0]) and parts[1].lower().endswith('.jpg'):
+        return 'thumbs'
+    return 'protected'
+
+def _linked(path):
+    st=os.lstat(path)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st,'st_file_attributes',0)&0x400)
+
+def _inventory(root):
+    if not os.path.isdir(root) or _linked(root):
+        return
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if not _linked(os.path.join(directory,name))]
+        for name in files:
+            path=os.path.join(directory,name)
+            try:
+                if _linked(path): continue
+                st=os.stat(path)
+                yield path,_kind(os.path.relpath(path,root)),st
+            except OSError:
+                continue
+
+def snapshot(mb):
+    root=os.path.abspath(mb.CACHE_DIR)
+    categories={key:{'id':key,'label':label,'bytes':0,'files':0,'clearable':key!='protected'} for key,label in LABELS.items()}
+    for path,kind,st in _inventory(root):
+        categories[kind]['bytes']+=st.st_size
+        categories[kind]['files']+=1
+    return {'root':root,'token':hashlib.sha256(root.encode()).hexdigest(),'categories':list(categories.values()),'total':sum(row['bytes'] for row in categories.values())}
+
+def clear(mb, kind, token):
+    if kind not in ('full','segments','thumbs','all'):
+        raise ValueError('不支持清理此类数据')
+    report=snapshot(mb)
+    if token!=report['token']:
+        raise ValueError('缓存目录已变化，请刷新后再清理')
+    if kind in ('thumbs','all') and not getattr(mb.scanner,'done',True):
+        raise ValueError('正在扫描，请等待完成后再清理缩略图')
+    root=report['root']; removed=0; freed=0; skipped=0
+    for path,category,st in _inventory(root):
+        if category=='protected' or (kind!='all' and category!=kind): continue
+        try:
+            # Recent writes may still belong to an active scan or playback request.
+            if time.time()-st.st_mtime<60:
+                skipped+=1; continue
+            resolved=os.path.realpath(path)
+            if os.path.commonpath([root,resolved])!=root or _linked(path):
+                skipped+=1; continue
+            current=os.stat(path)
+            if (current.st_size,current.st_mtime_ns)!=(st.st_size,st.st_mtime_ns):
+                skipped+=1; continue
+            os.remove(path)
+            removed+=1;freed+=st.st_size
+        except OSError:
+            skipped+=1
+    return {'ok':True,'removed':removed,'freed':freed,'skipped':skipped,'snapshot':snapshot(mb)}

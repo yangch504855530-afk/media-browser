@@ -14,3 +14,9 @@ package/*.zip
 package/*.tar
 package/*.tar.gz
 package/*.oci
+
+# Local Windows runtime and verification output
+/ffmpeg.exe
+/ffprobe.exe
+/runtime/
+/playback-sample-summary.json

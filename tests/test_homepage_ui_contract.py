@@ -151,13 +151,13 @@ def test_gallery_switch_releases_and_invalidates_previous_video(homepage_html: s
     assert "videoRenderToken !== galleryVideoRenderToken || !v.isConnected" in js
 
 
-def test_gallery_video_mp4_direct_first_with_fallback(homepage_html: str):
-    """MP4 containers direct-play first, then force transcode only if playback fails."""
+def test_gallery_video_codec_routing_with_fallback(homepage_html: str):
+    """Route incompatible codecs to conversion and retain direct-play fallback."""
     js = _extract_main_script(homepage_html)
     assert "const MP4_NATIVE_VIDEO_CODECS = new Set(['h264','avc1']);" in js
     assert "function videoCodecNeedsTranscodePlay(filePath, codec)" in js
     assert "function videoItemNeedsTranscodePlay(item)" in js
-    assert "return videoNeedsTranscodePlay(item.path || '');" in js
+    assert "return videoNeedsTranscodePlay(item.path || '') || videoCodecNeedsTranscodePlay(item.path || '', item.codec);" in js
     assert "function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderToken, reason)" in js
     assert "function watchDirectVideoFrames(item, videoEl, overlayEl, renderToken, onFallback)" in js
     assert "force=1" in js
