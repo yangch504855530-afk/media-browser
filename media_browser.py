@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "1.5.0-playback-fix"
+APP_VERSION = "1.6.0"
 
 
 def _default_settings_dir() -> str:
