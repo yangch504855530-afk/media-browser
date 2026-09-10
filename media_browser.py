@@ -1048,6 +1048,45 @@ def _review_state_store_path(scan_root: str | None = None) -> str:
     return os.path.join(review_dir, f"{key}.json")
 
 
+
+_library_index_cache = {}
+_library_index_lock = threading.Lock()
+
+def _library_index_store_path(scan_root: str | None = None) -> str:
+    root = os.path.realpath(scan_root or get_scan_root())
+    key = sha256_str(root)
+    library_dir = os.path.join(CACHE_DIR, "library")
+    os.makedirs(library_dir, exist_ok=True)
+    return os.path.join(library_dir, f"library_index_{key}.json")
+
+def load_library_index(scan_root: str | None = None) -> dict:
+    global _library_index_cache
+    path = _library_index_store_path(scan_root)
+    with _library_index_lock:
+        if not os.path.isfile(path):
+            _library_index_cache = {}
+            return _library_index_cache
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+                _library_index_cache = data if isinstance(data, dict) else {}
+        except Exception:
+            _library_index_cache = {}
+        return _library_index_cache
+
+def save_library_index(scan_root: str | None = None) -> None:
+    global _library_index_cache
+    path = _library_index_store_path(scan_root)
+    with _library_index_lock:
+        part = path + ".part"
+        try:
+            with open(part, "w", encoding="utf-8") as f:
+                json.dump(_library_index_cache, f, ensure_ascii=False)
+            os.replace(part, path)
+        except Exception as e:
+            logger.warning("Failed to save library index: %s", e)
+
+
 def empty_review_state(scan_root: str | None = None) -> dict:
     root = os.path.realpath(scan_root or get_scan_root())
     return {
@@ -2248,6 +2287,7 @@ class MediaScanner:
         self.idle = False
         self.started = True
         self.done = False
+        load_library_index()
         self._enumerate()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -2303,19 +2343,7 @@ class MediaScanner:
                     continue
                 if not is_path_under_root(entry.path):
                     continue
-                has_media = False
-                seen = {os.path.normcase(os.path.realpath(entry.path))}
-                for root, dirs, files in os.walk(entry.path, followlinks=True):
-                    _prune_walk_dirs(dirs, root, get_scan_root(), seen)
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in VIDEO_EXTS or ext in IMAGE_EXTS:
-                            has_media = True
-                            break
-                    if has_media:
-                        break
-                if has_media:
-                    candidates.append(entry.path)
+                candidates.append(entry.path)
         except Exception as e:
             logger.warning("枚举错误: %s", e)
             self.enum_error = str(e)
@@ -2358,6 +2386,7 @@ class MediaScanner:
                 self.scanned_dirs += 1
 
         self.done = True
+        save_library_index()
         logger.info("扫描完成")
 
     def _build_work_from_items(self, items, work_path: str, display_name_override: str = None):
@@ -2472,6 +2501,7 @@ class MediaScanner:
             if not is_path_under_root(work_path):
                 return None
             items = []
+            items_for_hash = []
             scan_root = os.path.realpath(get_scan_root())
             seen = {os.path.normcase(os.path.realpath(work_path))}
             for root, dirs, files in os.walk(work_path, followlinks=True):
@@ -2480,28 +2510,45 @@ class MediaScanner:
                     if f.startswith("._"):
                         continue
                     ext = os.path.splitext(f)[1].lower()
+                    if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
+                        continue
                     fpath = os.path.join(root, f)
                     if not is_path_under_root(fpath):
                         continue
                     try:
-                        fsize = os.path.getsize(fpath)
+                        st = os.stat(fpath)
+                        fsize = st.st_size
+                        mtime = st.st_mtime
                     except OSError:
                         continue
-                    if ext in VIDEO_EXTS:
-                        items.append({
-                            "type": "video",
-                            "path": fpath,
-                            "name": f,
-                            "size": fsize,
-                        })
-                    elif ext in IMAGE_EXTS:
-                        items.append({
-                            "type": "image",
-                            "path": fpath,
-                            "name": f,
-                            "size": fsize,
-                        })
-            return self._build_work_from_items(items, work_path, None)
+                        
+                    items.append({
+                        "type": "video" if ext in VIDEO_EXTS else "image",
+                        "path": fpath,
+                        "name": f,
+                        "size": fsize,
+                        "mtime": mtime
+                    })
+                    items_for_hash.append(f"{fpath}|{fsize}|{mtime}")
+            
+            if not items:
+                return None
+            items_for_hash.sort()
+            sig = sha256_str("\n".join(items_for_hash))
+            
+            work_id_seed = os.path.abspath(work_path)
+            work_id = sha256_str(work_id_seed)
+            
+            cached_work = _library_index_cache.get(work_id)
+            if cached_work and cached_work.get("_signature") == sig:
+                return cached_work
+                
+            work = self._build_work_from_items(items, work_path, None)
+            if work:
+                work["_signature"] = sig
+                with _library_index_lock:
+                    _library_index_cache[work_id] = work
+            return work
         except Exception as e:
             logger.warning("process error %s: %s", work_path, e)
             return None
