@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
@@ -2381,9 +2381,11 @@ class MediaScanner:
                     with self.lock:
                         self.works.append(work)
                 self.scanned_dirs += 1
+                save_library_index()
             except Exception as e:
                 logger.error("扫描错误 %s: %s", label, e)
                 self.scanned_dirs += 1
+                save_library_index()
 
         self.done = True
         save_library_index()
