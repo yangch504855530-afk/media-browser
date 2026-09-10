@@ -4843,7 +4843,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": err}, 400)
                 return
             try:
-                self._send_json(cache_manager.clear(sys.modules[__name__], data.get("kind"), data.get("token")), no_store=True)
+                kind = data.get("kind")
+                if kind == "orphans":
+                    self._send_json(cache_manager.clear_orphans(sys.modules[__name__]), no_store=True)
+                else:
+                    self._send_json(cache_manager.clear(sys.modules[__name__], kind, data.get("token")), no_store=True)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, 400, no_store=True)
             return

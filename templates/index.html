@@ -1465,6 +1465,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <p style="color:#aaa">最近一分钟生成的文件会保留；正在扫描时不能清理缩略图。清理缩略图后，请点击“应用并扫描”重新生成。</p>
         <button type="button" onclick="openCacheManager()">刷新占用</button>
         <button type="button" onclick="clearManagedCache('all')">清理全部可再生成缓存</button>
+        <button type="button" onclick="clearManagedCache('orphans')" style="background-color: #7b2929; border-color: #7b2929">清理孤儿残留缓存</button>
         <button type="button" onclick="document.getElementById('cacheManager').close()">关闭</button>
     </dialog>
     <div class="app-tabs" aria-label="一级菜单">
@@ -1525,6 +1526,27 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button data-filter="deleted">待删除</button>
             <button data-filter="invalid">疑似无效</button>
         </div>
+    <div class="filters" style="margin-top: 8px;">
+        <select id="mobAdvRegion" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
+            <option value="">所有地区</option>
+            <option value="欧美">欧美</option>
+            <option value="日本">日本</option>
+            <option value="韩国">韩国</option>
+            <option value="国产">国产</option>
+        </select>
+        <select id="mobAdvPeople" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
+            <option value="">所有人数</option>
+            <option value="1人">单人</option>
+            <option value="2人">双人</option>
+            <option value="多于2人">多人</option>
+        </select>
+        <select id="mobAdvStar" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
+            <option value="">所有星级</option>
+            <option value="4">4星</option>
+            <option value="5">5星</option>
+        </select>
+    </div>
+
         <div id="mbDrawerScanRootBlock" class="mb-drawer-scan-root" style="display:none">
             <label for="scanRootPresetDrawer">媒体库</label>
             <select id="scanRootPresetDrawer"></select>
@@ -2117,7 +2139,7 @@ async function openCacheManager() {
 }
 async function clearManagedCache(kind) {
     if (!cacheManagerSnapshot) return;
-    const label = kind === 'all' ? '全部可再生成缓存' : cacheManagerSnapshot.categories.find(row => row.id === kind).label;
+    const label = kind === 'all' ? '全部可再生成缓存' : (kind === 'orphans' ? '孤儿残留缓存' : cacheManagerSnapshot.categories.find)(row => row.id === kind).label;
     if (!confirm('清理' + label + '？下次浏览时会重新生成，原视频及审阅记录保留。')) return;
     const status = document.getElementById('cacheActionStatus');
     const buttons = document.querySelectorAll('#cacheManager button');
@@ -3180,7 +3202,7 @@ function selectAllVisible() {
     const q = searchInput.value.trim().toLowerCase();
     const sorted = sortWorks(allWorks);
     for (const w of sorted) {
-        if (workMatchesFilter(w, filterType) && workMatchesSearch(w, q)) {
+        if (workMatchesFilter(w, filterType) && workMatchesSearch(w, q) && workMatchesAdvancedFilter(w)) {
             selectedIds.add(w.id);
         }
     }
@@ -3266,6 +3288,31 @@ function mbBuildWorksStatusText(listLen, narrowed) {
     }
     return '共 0 个作品';
 }
+
+let advRegion = '';
+let advPeople = '';
+let advStar = '';
+
+function applyAdvancedFilters() {
+    advRegion = document.getElementById('advRegion') ? document.getElementById('advRegion').value : '';
+    advPeople = document.getElementById('advPeople') ? document.getElementById('advPeople').value : '';
+    advStar = document.getElementById('advStar') ? document.getElementById('advStar').value : '';
+    sortAndRenderAll();
+}
+
+function workMatchesAdvancedFilter(w) {
+    if (!advRegion && !advPeople && !advStar) return true;
+    return w.items.some(function(it) {
+        if (it.type !== 'video') return false;
+        const entry = mbGetVideoReviewEntry(it) || {};
+        const feats = entry.features || {};
+        if (advRegion && feats['地区'] !== advRegion) return false;
+        if (advPeople && feats['人数'] !== advPeople && feats['出场人数'] !== advPeople) return false;
+        if (advStar && feats['星级'] !== advStar && feats['评分'] !== advStar) return false;
+        return true;
+    });
+}
+
 function workMatchesSearch(w, q) {
     if (!q) return true;
     const lq = q.toLowerCase();
@@ -3615,7 +3662,7 @@ function createWorkCard(work, virtualIndex) {
 
 function getFilteredSortedWorks() {
     const q = searchInput.value.trim().toLowerCase();
-    let list = allWorks.filter(w => workMatchesFilter(w, filterType) && workMatchesSearch(w, q));
+    let list = allWorks.filter(w => workMatchesFilter(w, filterType) && workMatchesSearch(w, q) && workMatchesAdvancedFilter(w));
     return sortWorks(list);
 }
 

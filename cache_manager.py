@@ -74,3 +74,58 @@ def clear(mb, kind, token):
         except OSError:
             skipped+=1
     return {'ok':True,'removed':removed,'freed':freed,'skipped':skipped,'snapshot':snapshot(mb)}
+
+def clear_orphans(mb):
+    if not getattr(mb.scanner, 'done', True):
+        raise ValueError('正在扫描，请等待完成后再清理孤儿缓存')
+    
+    valid_thumb_hashes = set()
+    valid_play_keys = set()
+    
+    for work in mb.get_all_works():
+        for item in work.get("items", []):
+            path = item.get("path")
+            if not path or not isinstance(path, str):
+                continue
+            valid_thumb_hashes.add(mb.sha256_str(os.path.abspath(path)))
+            if item.get("type") == "video":
+                try:
+                    valid_play_keys.add(mb._play_cache_key(path))
+                except OSError:
+                    pass
+                    
+    root = os.path.abspath(mb.CACHE_DIR)
+    removed = 0
+    freed = 0
+    skipped = 0
+    
+    for path, category, st in _inventory(root):
+        if category == 'protected': continue
+            
+        is_orphan = False
+        parts = os.path.relpath(path, root).replace('\\', '/').split('/')
+        
+        if category == 'thumbs':
+            hash_val = parts[1] if len(parts) == 3 else parts[0]
+            if hash_val not in valid_thumb_hashes:
+                is_orphan = True
+        elif category == 'full':
+            hash_val = parts[2].replace('.mp4', '')
+            if hash_val not in valid_play_keys:
+                is_orphan = True
+        elif category == 'segments':
+            hash_val = parts[3] if len(parts) == 5 else parts[2]
+            if hash_val not in valid_play_keys:
+                is_orphan = True
+                
+        if is_orphan:
+            try:
+                if time.time() - st.st_mtime < 60:
+                    skipped += 1; continue
+                os.remove(path)
+                removed += 1
+                freed += st.st_size
+            except OSError:
+                skipped += 1
+                
+    return {'ok': True, 'removed': removed, 'freed': freed, 'skipped': skipped, 'snapshot': snapshot(mb)}
