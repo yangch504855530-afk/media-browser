@@ -60,7 +60,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 

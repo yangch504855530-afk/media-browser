@@ -2287,12 +2287,11 @@ function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderTok
         videoEl.removeAttribute('src');
         videoEl.load();
     } catch (e) {}
-    overlayEl.textContent = reason || 'MP4 直放失败，正在转码...';
+    overlayEl.textContent = reason || '直连失败，启动按需切片...';
     overlayEl.style.display = 'flex';
-    const hideOverlay = () => { overlayEl.style.display = 'none'; };
-    videoEl.addEventListener('playing', hideOverlay, { once: true });
-    videoEl.addEventListener('canplay', hideOverlay, { once: true });
-    prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, true);
+    prepareOnDemandVideo(filePath, videoEl, overlayEl, renderToken, function() {
+        showGalleryVideoError(overlayEl);
+    });
 }
 function watchDirectVideoFrames(item, videoEl, overlayEl, renderToken, onFallback) {
     if (!videoDirectPlayShouldBeWatched(item)) return;
@@ -4021,7 +4020,7 @@ function renderGallery() {
         document.getElementById('modal').classList.remove('image-grid-mode');
         const needsTc = videoItemNeedsTranscodePlay(item);
         const overlayHtml = needsTc
-            ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在读取播放缓存，请稍候…') + '</div>'
+            ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '正在唤醒切片引擎...' : '正在为您切片转码，请稍候...') + '</div>'
             : '<div id="transcodeOverlay" class="transcode-overlay" style="display:none"></div>';
         mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" controls preload="metadata" playsinline webkit-playsinline></video></div>`;
         const v = document.getElementById('galleryVideo');
@@ -4044,11 +4043,7 @@ function renderGallery() {
                 }
             });
             if (needsTc) {
-                if (/\.(ts|mts|m2ts)$/i.test(item.path)) {
-                    prepareOnDemandVideo(item.path, v, ov, videoRenderToken, startFallback);
-                } else {
-                    prepareGalleryVideo(item.path, v, ov, videoRenderToken, true);
-                }
+                prepareOnDemandVideo(item.path, v, ov, videoRenderToken, startFallback);
             } else {
                 v.src = buildVideoPlayUrl(item.path, item);
                 watchDirectVideoFrames(item, v, ov, videoRenderToken, startFallback);
