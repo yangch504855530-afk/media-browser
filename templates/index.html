@@ -1560,6 +1560,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
 </div>
 
 <section id="analysisPanel" class="analysis-panel" aria-live="polite">
+    <div id="aiHealthBanner" style="margin-bottom: 15px; padding: 12px; border-radius: 6px; display: none; font-weight: bold; font-size: 14px; line-height: 1.5;"></div>
     <div class="analysis-card" id="analysisReviewCard">
         <h3>自动分类进度</h3>
         <div class="analysis-note">高置信度且分类完整的视频会自动接受。这里默认只列出需要你处理的少量异常，不再要求逐条填写标签。</div>
@@ -2643,6 +2644,7 @@ function switchTab(tab) {
         if (analysisReviewPollTimer) clearInterval(analysisReviewPollTimer);
         analysisReviewPollTimer = null;
     } else {
+        checkAiHealth();
         loadTaskList();
         loadAnalysisReview();
         if (!analysisReviewPollTimer) {
@@ -5272,6 +5274,35 @@ async function mbApplyCacheDirSwitch() {
     setTimeout(function () { mbRefreshTrashBadge(true); }, 600);
     switchTab('review');
 })();
+
+
+async function checkAiHealth() {
+    try {
+        const r = await fetch('/api/tags', { cache: 'no-store' });
+        const data = await r.json();
+        const banner = document.getElementById('aiHealthBanner');
+        if (!banner) return;
+        banner.style.display = 'block';
+        if (!data.ok) {
+            banner.style.backgroundColor = '#ffe5e5';
+            banner.style.color = '#d32f2f';
+            banner.style.border = '1px solid #d32f2f';
+            banner.innerHTML = '🚨 未检测到 Ollama 服务运行，请确保您已启动本机 Ollama (默认端口 11434)。<br><span style="font-size:12px;font-weight:normal;">详细报错：' + (data.error || '连接拒绝') + '</span>';
+        } else if (!data.tags || (!data.tags.some(t => t.includes('llava')))) {
+            banner.style.backgroundColor = '#fff3e0';
+            banner.style.color = '#e65100';
+            banner.style.border = '1px solid #e65100';
+            banner.innerHTML = '⚠️ Ollama 已连接，但未检测到视觉大模型 (llava)。请打开终端执行命令下载模型：<br><code style="background:#ffe0b2;padding:2px 6px;border-radius:4px;user-select:all;display:inline-block;margin-top:5px;">ollama run llava</code>';
+        } else {
+            banner.style.backgroundColor = '#e8f5e9';
+            banner.style.color = '#2e7d32';
+            banner.style.border = '1px solid #2e7d32';
+            banner.innerHTML = '✅ 本机 AI 算力环境已就绪。视觉模型已加载！请在下方按需创建分析任务。';
+        }
+    } catch (e) {
+        console.error("Health check error", e);
+    }
+}
 
 mbLoadReviewState();
 poll();

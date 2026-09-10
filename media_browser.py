@@ -60,7 +60,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
@@ -4143,7 +4143,9 @@ _ai_resume_roots_active: set[str] = set()
 
 
 def resume_pending_video_analysis(expected_root: str | None = None) -> None:
-    """Create one persistent, serial AI task per unfinished video after scanning."""
+    """Auto AI scan is disabled in V2.5.0 to return control to the user. (Silent queue decoupled)."""
+    return
+    
     if not MB_ENABLE_AI:
         return
     root = os.path.realpath(expected_root or get_scan_root())
