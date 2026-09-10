@@ -56,10 +56,11 @@ from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse, unquote, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
@@ -1200,8 +1201,25 @@ def patch_review_state_work(work_id: str, patch: dict) -> dict:
     return {"ok": True, "work_id": work_id, "work": entry, "global": gl}
 
 
+@lru_cache(maxsize=10000)
+def _cached_video_asset_id(path: str, mtime: float, size: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+        import hashlib
+        h = hashlib.sha256()
+        h.update(f"{size}:".encode("utf-8"))
+        h.update(head)
+        return h.hexdigest()
+    except Exception:
+        return sha256_str(os.path.normcase(os.path.realpath(path)))
+
 def video_asset_id(path: str) -> str:
-    return sha256_str(os.path.normcase(os.path.realpath(path)))
+    try:
+        st = os.stat(path)
+        return _cached_video_asset_id(path, st.st_mtime, st.st_size)
+    except OSError:
+        return sha256_str(os.path.normcase(os.path.realpath(path)))
 
 
 def patch_review_state_video(video_id: str, patch: dict) -> dict:
@@ -2437,8 +2455,14 @@ class MediaScanner:
 
         main_video = max(video_items, key=lambda x: x["size"]) if video_items else None
         main_duration = main_video.get("duration", 0) if main_video else 0
-        id_seed = os.path.abspath(work_path) + ("\n#root_flat" if display_name_override else "")
+        
+        video_ids = sorted(it["asset_id"] for it in video_items if "asset_id" in it)
+        if video_ids:
+            id_seed = "\n".join(video_ids)
+        else:
+            id_seed = os.path.abspath(work_path) + ("\n#root_flat" if display_name_override else "")
         work_id = sha256_str(id_seed)
+        
         total_size = sum(it["size"] for it in items)
         total_duration = sum(it.get("duration", 0) for it in video_items)
         invalid_count = sum(1 for it in video_items if it.get("invalid_reason"))
