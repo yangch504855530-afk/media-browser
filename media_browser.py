@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
 
 
