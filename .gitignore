@@ -23,3 +23,8 @@ package/*.oci
 
 # 本地代理工作记忆（含本机路径/私有笔记，勿提交；仅本地保留）
 .workbuddy/
+# Local Windows runtime and verification output
+/ffmpeg.exe
+/ffprobe.exe
+/runtime/
+/playback-sample-summary.json

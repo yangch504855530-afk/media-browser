@@ -59,7 +59,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def _default_settings_dir() -> str:
@@ -133,10 +133,15 @@ def _int_env(name: str, default: int, lo: int, hi: int) -> int:
 
 def _tool_path(name: str) -> str:
     """打包后与 PATH 中的 ffmpeg/ffprobe：优先使用 PyInstaller 捆绑的可执行文件。"""
+    names = [name + ".exe", name] if sys.platform == "win32" else [name]
+    directories = [os.path.dirname(os.path.abspath(__file__))]
     if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            bundled = os.path.join(meipass, name)
+        directories = [getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable)] + directories
+    for directory in directories:
+        if not directory:
+            continue
+        for filename in names:
+            bundled = os.path.join(directory, filename)
             if os.path.isfile(bundled):
                 return bundled
     import shutil as _sh
@@ -414,10 +419,10 @@ def video_should_use_play_endpoint(path: str, mobile: bool = False, codec=None) 
         return False
     if ext in PLAY_TRANSCODE_EXTS:
         return True
-    if ext in MOBILE_NATIVE_PLAY_EXTS:
-        return False
     if video_codec_needs_transcoded_play(path, codec):
         return True
+    if ext in MOBILE_NATIVE_PLAY_EXTS:
+        return False
     if mobile and ext not in MOBILE_NATIVE_PLAY_EXTS:
         return True
     return False
@@ -861,7 +866,34 @@ def _ffmpeg_run_transcode(cmd: list[str], source: str, *, timeout: int = 7200) -
         raise RuntimeError(err or "ffmpeg failed")
 
 
+def _try_ts_remux(source: str, dest: str) -> bool:
+    """Copy browser-compatible TS video packets; originals are never rewritten."""
+    if os.path.splitext(source)[1].lower() not in {".ts", ".mts", ".m2ts"}:
+        return False
+    try:
+        probe = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,pix_fmt", "-of", "json", source],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45)
+        streams = json.loads(probe.stdout).get("streams", [])
+        if not streams or streams[0].get("codec_name") != "h264" or streams[0].get("pix_fmt") not in {"yuv420p", "yuvj420p"}:
+            return False
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-fflags", "+genpts", "-i", source, "-map", "0:v:0", "-map", "0:a:0?",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+               "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-f", "mp4", dest]
+        _ffmpeg_run_transcode(cmd, source)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 512:
+            logger.info("TS playback cache: video stream copied without re-encoding")
+            return True
+    except Exception as exc:
+        logger.warning("TS remux failed; using compatible encoding: %s", str(exc)[:200])
+    return False
+
+
 def _ffmpeg_transcode_to_mp4(source: str, dest: str) -> None:
+    if _try_ts_remux(source, dest):
+        return
     has_audio = ffprobe_has_audio(source)
     hw = resolve_ffmpeg_hw()
     active = hw.get("active") or "off"
@@ -945,7 +977,7 @@ def play_ready_payload(source: str, force_transcode: bool = False) -> dict:
     ext = os.path.splitext(rp)[1].lower()
     if ext not in VIDEO_EXTS:
         return {"ok": False, "ready": False, "status": "error", "error": "不是支持的视频格式"}
-    if not force_transcode and not video_should_use_play_endpoint(rp, mobile=True):
+    if not force_transcode and not video_should_use_play_endpoint(rp, mobile=True, codec=get_video_info(rp).get("codec")):
         from urllib.parse import quote
 
         return {
@@ -953,14 +985,6 @@ def play_ready_payload(source: str, force_transcode: bool = False) -> dict:
             "ready": True,
             "status": "ready",
             "url": "/file?path=" + quote(rp, safe=""),
-        }
-    fa, fe = _tool_version_ok(FFMPEG_BIN)
-    if not fa:
-        return {
-            "ok": False,
-            "ready": False,
-            "status": "error",
-            "error": f"ffmpeg 不可用: {fe or 'missing'}",
         }
     cached = play_cache_path(rp)
     if os.path.isfile(cached) and os.path.getsize(cached) > 512:
@@ -971,6 +995,14 @@ def play_ready_payload(source: str, force_transcode: bool = False) -> dict:
             "ready": True,
             "status": "ready",
             "url": "/file?path=" + quote(cached, safe=""),
+        }
+    fa, fe = _tool_version_ok(FFMPEG_BIN)
+    if not fa:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "error",
+            "error": f"ffmpeg 不可用: {fe or 'missing'}",
         }
     key = _play_cache_key(rp)
     with _play_transcode_guard:
@@ -4552,6 +4584,25 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
 
+        elif path in ("/api/preview-info", "/api/preview-segment"):
+            import on_demand
+            try:
+                source = qs.get("path", [""])[0]
+                if path == "/api/preview-info":
+                    self._send_json(on_demand.info(sys.modules[__name__], source), no_store=True)
+                else:
+                    target = on_demand.segment(sys.modules[__name__], source, int(qs.get("index", ["-1"])[0]))
+                    self._send_file(target, "video/mp4")
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400, no_store=True)
+            except Exception as exc:
+                logger.warning("On-demand preview failed: %s", exc)
+                self._send_json({"error": "此片段无法预览，请尝试兼容播放"}, 502, no_store=True)
+
+        elif path == "/api/cache-summary":
+            import cache_manager
+            self._send_json(cache_manager.snapshot(sys.modules[__name__]), no_store=True)
+
         elif path == "/api/play-ready":
             fpath = qs.get("path", [""])[0]
             fpath = unquote(fpath)
@@ -4764,6 +4815,17 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": err or "路径不存在或不是文件夹"},
                     400,
                 )
+            return
+        if parsed.path == "/api/cache-clear":
+            import cache_manager
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"error": err}, 400)
+                return
+            try:
+                self._send_json(cache_manager.clear(sys.modules[__name__], data.get("kind"), data.get("token")), no_store=True)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400, no_store=True)
             return
         if parsed.path == "/api/set-cache-dir":
             try:
@@ -6380,9 +6442,21 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <label for="cacheDirInput">缓存目录</label>
             <input type="text" id="cacheDirInput" value="__MB_CACHE_DIR__" spellcheck="false" autocomplete="off" placeholder="D:\MediaBrowserCache" />
             <button type="button" id="applyCacheDir">应用缓存目录</button>
+            <button type="button" onclick="openCacheManager()">缓存管理</button>
             <span id="cacheDirStatus" class="mb-cache-status"></span>
         </div>
     </div>
+    <dialog id="cacheManager" style="background:#202126;color:#eee;border:1px solid #666;border-radius:12px;width:min(560px,90vw);padding:24px">
+        <h2>缓存管理</h2>
+        <p>清理后需要重新生成预览。原视频、审阅标记和分析记录不会删除。</p>
+        <p id="cacheSummaryPath" style="overflow-wrap:anywhere"></p>
+        <div id="cacheSummaryRows"></div>
+        <p id="cacheActionStatus" role="status"></p>
+        <p style="color:#aaa">最近一分钟生成的文件会保留；正在扫描时不能清理缩略图。清理缩略图后，请点击“应用并扫描”重新生成。</p>
+        <button type="button" onclick="openCacheManager()">刷新占用</button>
+        <button type="button" onclick="clearManagedCache('all')">清理全部可再生成缓存</button>
+        <button type="button" onclick="document.getElementById('cacheManager').close()">关闭</button>
+    </dialog>
     <div class="app-tabs" aria-label="一级菜单">
         <button type="button" id="tabReview" class="app-tab active">视频审阅</button>
         <button type="button" id="tabAnalysis" class="app-tab">视频分析任务</button>
@@ -7000,8 +7074,142 @@ function videoCodecNeedsTranscodePlay(filePath, codec) {
 }
 function videoItemNeedsTranscodePlay(item) {
     if (!item) return false;
-    return videoNeedsTranscodePlay(item.path || '');
+    return videoNeedsTranscodePlay(item.path || '') || videoCodecNeedsTranscodePlay(item.path || '', item.codec);
 }
+let cacheManagerSnapshot = null;
+function drawCacheSummary(data) {
+    cacheManagerSnapshot = data;
+    document.getElementById('cacheSummaryPath').textContent = data.root + ' · 总占用 ' + fmtSize(data.total);
+    const rows = document.getElementById('cacheSummaryRows');
+    rows.replaceChildren();
+    for (const row of data.categories) {
+        const line = document.createElement('p');
+        line.textContent = row.label + '：' + fmtSize(row.bytes) + '（' + row.files + ' 个文件） ';
+        if (row.clearable) {
+            const button = document.createElement('button');
+            button.textContent = '清理'; button.disabled = !row.files;
+            button.onclick = () => clearManagedCache(row.id);
+            line.append(button);
+        } else { line.append(' · 保留'); }
+        rows.append(line);
+    }
+}
+async function openCacheManager() {
+    const dialog = document.getElementById('cacheManager');
+    if (!dialog.open) dialog.showModal();
+    const status = document.getElementById('cacheActionStatus');
+    status.textContent = '正在统计…';
+    try {
+        const response = await fetch('/api/cache-summary', {cache:'no-store'});
+        if (!response.ok) throw new Error('统计失败');
+        drawCacheSummary(await response.json()); status.textContent = '';
+    } catch (error) { status.textContent = String(error); }
+}
+async function clearManagedCache(kind) {
+    if (!cacheManagerSnapshot) return;
+    const label = kind === 'all' ? '全部可再生成缓存' : cacheManagerSnapshot.categories.find(row => row.id === kind).label;
+    if (!confirm('清理' + label + '？下次浏览时会重新生成，原视频及审阅记录保留。')) return;
+    const status = document.getElementById('cacheActionStatus');
+    const buttons = document.querySelectorAll('#cacheManager button');
+    buttons.forEach(button => button.disabled = true);
+    try {
+        const response = await fetch('/api/cache-clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({kind,token:cacheManagerSnapshot.token})});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '清理失败');
+        drawCacheSummary(data.snapshot);
+        status.textContent = '已清理 ' + data.removed + ' 个文件，释放 ' + fmtSize(data.freed) + '。保留近期生成或正在使用的文件 ' + data.skipped + ' 个。';
+    } catch (error) { status.textContent = String(error); }
+    finally { buttons.forEach(button => button.disabled = false); }
+}
+async function prepareOnDemandVideo(filePath, video, overlay, token, fallback) {
+    const controller = new AbortController();
+    let objectUrl, timer, buffer, media, busy = false, failed = false;
+    const present = new Set();
+    const active = () => !controller.signal.aborted && token === galleryVideoRenderToken && video.isConnected;
+    const cleanup = () => {
+        controller.abort();
+        clearInterval(timer);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+    video.mbPreviewCleanup = cleanup;
+    try {
+        const response = await fetch('/api/preview-info?path=' + encodeURIComponent(filePath), {signal:controller.signal});
+        const info = await response.json();
+        if (!response.ok) throw new Error(info.error);
+        if (!active()) return;
+        if (info.url) { video.src = info.url; overlay.style.display = 'none'; return; }
+        const mime = 'video/mp4; codecs="avc1.42c01f' + (info.audio ? ', mp4a.40.2' : '') + '"';
+        if (!window.MediaSource || !MediaSource.isTypeSupported(mime)) throw new Error('preview unsupported');
+        media = new MediaSource();
+        objectUrl = URL.createObjectURL(media);
+        video.src = objectUrl;
+        await new Promise(resolve => media.addEventListener('sourceopen', resolve, {once:true}));
+        if (!active()) return;
+        buffer = media.addSourceBuffer(mime);
+        media.duration = info.duration;
+        const update = action => new Promise((resolve, reject) => {
+            const done = () => { buffer.removeEventListener('error', error); resolve(); };
+            const error = () => { buffer.removeEventListener('updateend', done); reject(new Error('preview decode error')); };
+            buffer.addEventListener('updateend', done, {once:true});
+            buffer.addEventListener('error', error, {once:true});
+            action();
+        });
+        async function pump() {
+            if (!active() || busy || failed) return;
+            const currentIndex = Math.floor(video.currentTime / info.seconds);
+            // Keep multiple segments ahead of playback. The previous two-second
+            // threshold started work too late and caused a pause every six seconds.
+            const lookAheadSeconds = video.paused ? 12 : 18;
+            const lastIndex = Math.min(
+                Math.ceil(info.duration / info.seconds) - 1,
+                Math.floor((video.currentTime + lookAheadSeconds) / info.seconds)
+            );
+            let index = -1;
+            for (let candidate = currentIndex; candidate <= lastIndex; candidate++) {
+                if (!present.has(candidate)) {
+                    index = candidate;
+                    break;
+                }
+            }
+            if (index < 0) return;
+            busy = true;
+            try {
+                const response = await fetch('/api/preview-segment?path=' + encodeURIComponent(filePath) + '&index=' + index, {signal:controller.signal});
+                if (!response.ok) throw new Error('preview request failed');
+                const bytes = await response.arrayBuffer();
+                if (!active()) return;
+                buffer.appendWindowEnd = Infinity;
+                buffer.timestampOffset = index * info.seconds;
+                buffer.appendWindowStart = index * info.seconds;
+                buffer.appendWindowEnd = Math.min((index + 1) * info.seconds, info.duration);
+                await update(() => buffer.appendBuffer(bytes));
+                present.add(index);
+                if ((index + 1) * info.seconds >= info.duration && media.readyState === 'open') media.endOfStream();
+                if (video.currentTime > 36) {
+                    const cutoff = Math.floor((video.currentTime - 24) / info.seconds) * info.seconds;
+                    await update(() => buffer.remove(0, cutoff));
+                    for (const n of present) if ((n + 1) * info.seconds <= cutoff) present.delete(n);
+                }
+                if (active()) overlay.style.display = 'none';
+            } catch (error) {
+                if (active()) { console.warn('on-demand preview', String(error)); failed = true; cleanup(); fallback('按需预览失败，正在准备完整兼容播放…'); }
+            } finally {
+                busy = false;
+                // Fill the rest of the look-ahead window immediately instead of
+                // waiting for the next timer tick or the current segment boundary.
+                if (active() && !failed) queueMicrotask(pump);
+            }
+        }
+        video.addEventListener('seeking', pump);
+        video.addEventListener('waiting', pump);
+        timer = setInterval(pump, 250);
+        overlay.textContent = '正在读取当前片段…';
+        pump();
+    } catch (error) {
+        if (active()) { cleanup(); fallback('正在准备兼容播放…'); }
+    }
+}
+
 async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, forceTranscode) {
     if (!videoEl || !overlayEl) return;
     overlayEl.style.display = 'flex';
@@ -7023,7 +7231,7 @@ async function prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, fo
                 return;
             }
             const sec = (data.elapsed != null) ? data.elapsed : Math.floor((Date.now() - t0) / 1000);
-            overlayEl.textContent = (mbMobile ? '手机端转码中' : '正在转码') + '… ' + sec + 's';
+            overlayEl.textContent = '正在准备兼容播放（完成后复用缓存）' + '… ' + sec + 's';
         } catch (e) {
             showGalleryVideoError(overlayEl);
             return;
@@ -7036,7 +7244,7 @@ function videoDirectPlayShouldBeWatched(item) {
     const i = item.path.lastIndexOf('.');
     const ext = i >= 0 ? item.path.slice(i).toLowerCase() : '';
     if (!MOBILE_NATIVE_VIDEO_EXTS.has(ext)) return false;
-    return !item.codec || videoCodecNeedsTranscodePlay(item.path || '', item.codec);
+    return true;
 }
 function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderToken, reason) {
     if (renderToken !== galleryVideoRenderToken || !videoEl || !videoEl.isConnected) return;
@@ -8754,7 +8962,7 @@ function renderGallery() {
         document.getElementById('modal').classList.remove('image-grid-mode');
         const needsTc = videoItemNeedsTranscodePlay(item);
         const overlayHtml = needsTc
-            ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在转码，请稍候…') + '</div>'
+            ? '<div id="transcodeOverlay" class="transcode-overlay">' + (mbMobile ? '手机端转码中，请稍候…' : '正在读取播放缓存，请稍候…') + '</div>'
             : '<div id="transcodeOverlay" class="transcode-overlay" style="display:none"></div>';
         mediaDiv.innerHTML = `<div class="video-wrap" id="galleryVideoWrap">${overlayHtml}<video id="galleryVideo" controls preload="metadata" playsinline webkit-playsinline></video></div>`;
         const v = document.getElementById('galleryVideo');
@@ -8770,14 +8978,18 @@ function renderGallery() {
             v.addEventListener('playing', hideOv, { once: true });
             v.addEventListener('canplay', hideOv, { once: true });
             v.addEventListener('error', () => {
-                if (!needsTc && videoDirectPlayShouldBeWatched(item)) {
+                if (!needsTc && !fallbackStarted) {
                     startFallback('MP4 直放失败，正在转码...');
                 } else {
                     showGalleryVideoError(ov);
                 }
-            }, { once: true });
+            });
             if (needsTc) {
-                prepareGalleryVideo(item.path, v, ov, videoRenderToken);
+                if (/\.(ts|mts|m2ts)$/i.test(item.path)) {
+                    prepareOnDemandVideo(item.path, v, ov, videoRenderToken, startFallback);
+                } else {
+                    prepareGalleryVideo(item.path, v, ov, videoRenderToken, true);
+                }
             } else {
                 v.src = buildVideoPlayUrl(item.path, item);
                 watchDirectVideoFrames(item, v, ov, videoRenderToken, startFallback);
@@ -8798,7 +9010,7 @@ function renderGallery() {
                     v.currentTime = 0;
                 }
                 v.play().catch(() => {});
-            }, { once: true });
+            });
             v.focus();
         }
         setupGalleryVideoPinch();
@@ -9113,6 +9325,8 @@ async function deleteCurrentItem(skipConfirm) {
 }
 
 function releaseGalleryVideoElement() {
+    const previewVideo = document.getElementById('galleryVideo');
+    if (previewVideo && previewVideo.mbPreviewCleanup) previewVideo.mbPreviewCleanup();
     galleryVideoRenderToken++;
     const v = document.getElementById('galleryVideo');
     if (v) {
