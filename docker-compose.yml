@@ -59,6 +59,8 @@ services:
       MB_SCAN_WORKERS: "1"
       MB_THUMB_COUNT: "2"
       MB_SCAN_ROOT_READONLY: "1"
+      # Set to 1 for a read-only NAS bind mount; destructive APIs return 403.
+      MB_MEDIA_READONLY: "${MB_MEDIA_READONLY:-0}"
       # 核显硬转：auto=探测 VAAPI；无 GPU 时自动回退 CPU。宿主机 getent group render → group_add
       MB_FFMPEG_HW: "auto"
       # 可选：MB_LOG_FORMAT=json

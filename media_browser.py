@@ -374,6 +374,22 @@ def scan_root_readonly() -> bool:
     )
 
 
+def media_mutations_readonly() -> bool:
+    """Explicit server-side guard for destructive media mutations.
+
+    This is deliberately separate from ``MB_SCAN_ROOT_READONLY``: the latter
+    controls scan-root selection in the UI, while this switch protects delete
+    and other filesystem mutations when a NAS bind mount is read-only.
+    """
+    return os.environ.get("MB_MEDIA_READONLY", "").strip().lower() in (
+        "1", "yes", "true", "on",
+    )
+
+
+def _mutation_readonly_response() -> dict:
+    return {"ok": False, "error": "media root is read-only", "code": "MEDIA_READONLY"}
+
+
 def get_scan_root() -> str:
     return _scan_root
 
@@ -1242,7 +1258,12 @@ def patch_review_state_video(video_id: str, patch: dict) -> dict:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if "path" in patch:
         path = patch.get("path")
-        if not isinstance(path, str) or video_asset_id(path) != video_id:
+        if (
+            not isinstance(path, str)
+            or not os.path.isfile(path)
+            or not is_path_under_root(path)
+            or video_asset_id(path) != video_id
+        ):
             return {"ok": False, "error": "path does not match video_id"}
         entry["path"] = os.path.realpath(path)
     if "tag" in patch:
@@ -1403,6 +1424,49 @@ def preference_summary_payload() -> dict:
         "categories": category_rows,
         "features": feature_rows,
     }
+
+
+def filter_works_payload(works: list, *, rating: str = "", media_type: str = "", directory: str = "", tag: str = "") -> list:
+    """Apply optional browse filters while preserving the legacy work shape."""
+    wanted_ratings = None
+    if rating:
+        vals = {x.strip() for x in str(rating).split(",") if x.strip()}
+        if "unrated" in vals or "none" in vals:
+            vals.add("0")
+        wanted_ratings = vals
+    media_type = (media_type or "").strip().lower()
+    directory = (directory or "").strip().replace("\\", "/").strip("/")
+    tag = (tag or "").strip().lower()
+    ledger = (load_review_state().get("videos") or {}) if wanted_ratings is not None or tag else {}
+    out = []
+    for work in works or []:
+        copy = dict(work)
+        items = []
+        for item in work.get("items") or []:
+            typ = str(item.get("type") or "").lower()
+            rel = str(item.get("relative_path") or os.path.relpath(item.get("path", ""), get_scan_root())).replace("\\", "/")
+            if media_type in ("video", "image") and typ != media_type:
+                continue
+            if directory and not (rel == directory or rel.startswith(directory + "/")):
+                continue
+            entry = ledger.get(item.get("asset_id"), {}) if ledger else {}
+            if wanted_ratings is not None:
+                current = entry.get("rating")
+                current_key = str(current) if isinstance(current, int) else "0"
+                if current_key not in wanted_ratings:
+                    continue
+            if tag and str(entry.get("tag") or "pending").lower() != tag:
+                continue
+            item_copy = dict(item)
+            item_copy.setdefault("relative_path", rel)
+            items.append(item_copy)
+        if items or (not media_type and not directory and wanted_ratings is None and not tag):
+            if items:
+                copy["items"] = items
+                copy["video_count"] = sum(1 for x in items if x.get("type") == "video")
+                copy["image_count"] = sum(1 for x in items if x.get("type") == "image")
+            out.append(copy)
+    return out
 
 
 ANALYSIS_AUTO_ACCEPT_CONFIDENCE = 0.80
@@ -1980,6 +2044,8 @@ def try_remove_empty_work_folder(work_path: str) -> bool:
 
 def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
     """删除作品目录下指定媒体路径；全部成功后尝试移除已清空的作品文件夹。"""
+    if media_mutations_readonly():
+        return _mutation_readonly_response()
     if not isinstance(work_path, str) or not work_path.strip():
         return {"ok": False, "error": "missing work_path"}
     try:
@@ -2429,6 +2495,7 @@ class MediaScanner:
         for it in items:
             if not os.path.isfile(it["path"]):
                 continue
+            it.setdefault("relative_path", os.path.relpath(it["path"], get_scan_root()))
             try:
                 mtime = max(mtime, os.path.getmtime(it["path"]))
             except Exception:
@@ -2513,6 +2580,7 @@ class MediaScanner:
                         "type": "video",
                         "path": fpath,
                         "name": f,
+                        "relative_path": os.path.relpath(fpath, get_scan_root()),
                         "size": os.path.getsize(fpath),
                     })
                 elif ext in IMAGE_EXTS:
@@ -2520,6 +2588,7 @@ class MediaScanner:
                         "type": "image",
                         "path": fpath,
                         "name": f,
+                        "relative_path": os.path.relpath(fpath, get_scan_root()),
                         "size": os.path.getsize(fpath),
                     })
             return self._build_work_from_items(
@@ -2561,6 +2630,7 @@ class MediaScanner:
                         "type": "video" if ext in VIDEO_EXTS else "image",
                         "path": fpath,
                         "name": f,
+                        "relative_path": os.path.relpath(fpath, scan_root),
                         "size": fsize,
                         "mtime": mtime
                     })
@@ -4506,6 +4576,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         if not self._require_request_security(mutating=True) or self._body_too_large():
             return
+        if media_mutations_readonly():
+            self._send_json(_mutation_readonly_response(), 403)
+            return
         parsed = urlparse(self.path)
         work_match = re.fullmatch(r"/api/review-state/work/([0-9a-fA-F]+)", parsed.path or "")
         video_match = re.fullmatch(r"/api/review-state/video/([0-9a-fA-F]{16,64})", parsed.path or "")
@@ -4575,6 +4648,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/progress":
             since = int(qs.get("since", ["0"])[0])
             prog = scanner.get_progress(since)
+            prog["works"] = filter_works_payload(
+                prog.get("works", []),
+                rating=qs.get("rating", [""])[0],
+                media_type=qs.get("media_type", [""])[0] or qs.get("type", [""])[0],
+                directory=qs.get("directory", [""])[0],
+                tag=qs.get("tag", [""])[0],
+            )
             self._send_json(prog)
         elif path == "/api/tasks":
             self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
@@ -4587,14 +4667,27 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/works":
             with scanner.lock:
+                works = filter_works_payload(
+                    list(scanner.works),
+                    rating=qs.get("rating", [""])[0],
+                    media_type=qs.get("media_type", [""])[0] or qs.get("type", [""])[0],
+                    directory=qs.get("directory", [""])[0],
+                    tag=qs.get("tag", [""])[0],
+                )
+                directories = sorted({
+                    str(item.get("relative_path") or "").replace("\\", "/").rsplit("/", 1)[0]
+                    for work in works for item in (work.get("items") or [])
+                    if "/" in str(item.get("relative_path") or "")
+                })
                 body = {
                     "ok": True,
-                    "works": list(scanner.works),
+                    "works": works,
                     "done": scanner.done,
                     "scanned": scanner.scanned_dirs,
                     "total": scanner.total_dirs,
                     "enum_error": scanner.enum_error,
                     "scan_root": get_scan_root(),
+                    "directories": directories,
                 }
             self._send_json(body, no_store=True)
 
@@ -4954,6 +5047,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(payload, 200 if ok else 400)
             return
         if parsed.path == "/api/delete-trash/remove":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -4972,6 +5068,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "count": n})
             return
         if parsed.path == "/api/delete-trash/delete-selected":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -4989,10 +5088,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(delete_trash_delete_selected(paths))
             return
         if parsed.path == "/api/delete-trash/clear":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
             delete_trash_clear()
             self._send_json({"ok": True, "count": 0})
             return
         if parsed.path == "/api/delete-trash/retry-all":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
             self._send_json(delete_trash_retry_all())
             return
         if parsed.path == "/api/works/delete-all":
@@ -5034,6 +5139,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path != "/delete":
             self.send_error(404)
+            return
+        if media_mutations_readonly():
+            self._send_json(_mutation_readonly_response(), 403)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
