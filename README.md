@@ -95,6 +95,7 @@ docker compose up -d --build
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；默认每个视频生成 8 张，可显式覆盖 | `8` | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
 | `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
+| `MB_MEDIA_READONLY` | 媒体库全局只读保护：设为 `1` / `true` / `yes` / `on` 后，删除、恢复、清空回收站等破坏性 API 返回 `403 MEDIA_READONLY` | 未设置 | 同上 |
 | `MB_SCAN_PRESETS` | 媒体库白名单：`路径\|标签;路径\|标签`；设后页眉为下拉切换，默认不自动扫描 | 未设置 | 同上 |
 | `MB_AUTO_SCAN` | 启动时是否立即扫描（设 `MB_SCAN_PRESETS` 时默认 `0`） | 见说明 | 同上 |
 | `MB_FFMPEG_HW` | 播放转码硬件加速：`off` / `auto` / `vaapi` / `qsv` / `nvenc` / `amf`。Windows 默认自动尝试 Intel 核显 QSV、NVIDIA NVENC、AMD AMF；失败会回退 CPU | `auto` | 同上 |

@@ -26,6 +26,7 @@ RUN groupadd -g 1000 appgroup && \
 
 WORKDIR /app
 COPY media_browser.py .
+COPY templates/ ./templates/
 RUN chown -R appuser:appgroup /app
 
 USER appuser
