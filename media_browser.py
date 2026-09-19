@@ -44,6 +44,7 @@ import time
 import mimetypes
 import signal
 import re
+import errno
 import html as html_mod
 import shutil
 import uuid
@@ -1780,41 +1781,45 @@ def release_media_resources(path: str) -> int:
     return len(procs)
 
 
-def _safe_remove(path: str) -> None:
-    """Release active readers before remove; retry transient Windows locks."""
-    release_media_resources(path)
-    remove_media_play_cache(path)
-    # Windows permits an owner/admin to remove files from a directory whose
-    # write bits were cleared with ``chmod``.  Respect the portable mode bits
-    # explicitly so read-only NAS fixtures have the same stable failure
-    # semantics on Windows and POSIX hosts.
-    parent = os.path.dirname(os.path.abspath(path))
-    try:
-        if os.stat(parent).st_mode & 0o222 == 0:
-            raise PermissionError(f"parent directory is read-only: {parent}")
-    except FileNotFoundError:
-        pass
-    delays = (0.0, 0.3, 0.5) if sys.platform == "win32" else (0.0,)
-    for idx, delay in enumerate(delays):
-        if delay:
-            time.sleep(delay)
-        try:
-            os.remove(path)
-            return
-        except PermissionError:
-            if idx == len(delays) - 1:
-                raise
+class RecycleError(Exception):
+    def __init__(self, message, code="RECYCLE_ERROR", status=400, **details):
+        super().__init__(message)
+        self.code = code
+        self.status = int(status)
+        self.details = details
+
+    def payload(self):
+        out = {"ok": False, "error": str(self), "code": self.code}
+        out.update(self.details)
+        return out
 
 
 _delete_trash_lock = threading.Lock()
+_recycle_id_re = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _delete_trash_store_path() -> str:
-    """按当前扫描根隔离清单，避免换卷后误删。"""
-    return os.path.join(CACHE_DIR, f"delete_trash_{sha256_str(os.path.abspath(get_scan_root()))}.json")
+def _delete_trash_path_norm(p):
+    try:
+        return os.path.normcase(os.path.normpath(p))
+    except Exception:
+        return p
 
 
-def _delete_trash_load_unlocked() -> list:
+def _recycle_base_dir():
+    return os.path.join(CACHE_DIR, "media_recycle")
+
+
+def _recycle_dir_for_root():
+    """Isolate objects and metadata by the resolved scan root."""
+    return os.path.join(_recycle_base_dir(), sha256_str(os.path.abspath(get_scan_root())))
+
+
+def _delete_trash_store_path():
+    """Return the manifest path for the current scan root."""
+    return os.path.join(_recycle_dir_for_root(), "manifest.json")
+
+
+def _delete_trash_load_unlocked():
     p = _delete_trash_store_path()
     if not os.path.isfile(p):
         return []
@@ -1824,15 +1829,16 @@ def _delete_trash_load_unlocked() -> list:
     except Exception:
         return []
     items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
-    return [x for x in items if isinstance(x, dict)]
+    return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
 
 
-def _delete_trash_save_unlocked(items: list) -> None:
+def _delete_trash_save_unlocked(items):
+    recycle_dir = _recycle_dir_for_root()
+    os.makedirs(recycle_dir, mode=0o700, exist_ok=True)
     p = _delete_trash_store_path()
     tmp = p + ".tmp"
     payload = {
+        "version": 2,
         "items": items,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1841,176 +1847,392 @@ def _delete_trash_save_unlocked(items: list) -> None:
     os.replace(tmp, p)
 
 
-def _delete_trash_prune_unlocked(items: list) -> list:
-    out = []
-    for it in items:
-        path = it.get("path")
-        if not isinstance(path, str) or not path.strip():
+def _entry_id(item):
+    value = str(item.get("id") or "").lower()
+    return value if _recycle_id_re.fullmatch(value) else ""
+
+
+def _entry_parts(item):
+    parts = item.get("relative_parts")
+    if isinstance(parts, list):
+        return [str(x) for x in parts]
+    rel = str(item.get("relative_path") or "").replace("\\", "/")
+    return [x for x in rel.split("/") if x and x != "."]
+
+
+def _entry_source_key(item):
+    root = str(item.get("original_root") or "")
+    parts = _entry_parts(item)
+    if root and parts:
+        return _delete_trash_path_norm(os.path.join(root, *parts))
+    return _delete_trash_path_norm(str(item.get("original_path") or item.get("path") or ""))
+
+
+def _entry_active(item):
+    return bool(_entry_id(item)) and item.get("status") == "recycled"
+
+
+def _safe_relative_parts(path, root):
+    """Resolve both paths and return a strictly-contained relative path."""
+    root_real = os.path.realpath(os.path.abspath(root))
+    target_real = os.path.realpath(os.path.abspath(path))
+    if target_real != root_real and not target_real.startswith(root_real + os.sep):
+        raise RecycleError("path is outside media root", "PATH_OUTSIDE_ROOT", 403)
+    rel_norm = str(os.path.relpath(target_real, root_real)).replace("\\", "/")
+    if rel_norm in ("", ".", "..") or rel_norm.startswith("../"):
+        raise RecycleError("path must be below media root", "PATH_OUTSIDE_ROOT", 403)
+    parts = [x for x in rel_norm.split("/") if x and x != "."]
+    if not parts or any(x == ".." or "/" in x or "\\" in x or "\x00" in x for x in parts):
+        raise RecycleError("unsafe relative path", "PATH_OUTSIDE_ROOT", 403)
+    return parts
+
+
+def _safe_object_filename(filename):
+    name = os.path.basename(str(filename or "")).replace("\x00", "")
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise RecycleError("unsafe filename", "UNSAFE_FILENAME", 400)
+    if len(name.encode("utf-8", "ignore")) > 200:
+        stem, ext = os.path.splitext(name)
+        name = ((stem[:80] or "file") + "_" + sha256_str(name)[:16] + ext)[:200]
+    return name
+
+
+def _is_path_under_dir(path, directory):
+    try:
+        p = os.path.realpath(os.path.abspath(path))
+        d = os.path.realpath(os.path.abspath(directory))
+    except OSError:
+        return False
+    return p == d or p.startswith(d + os.sep)
+
+
+def _recycle_object_path(item):
+    rid = _entry_id(item)
+    if not rid:
+        raise RecycleError("invalid recycle id", "INVALID_RECYCLE_ID", 400)
+    object_path = str(item.get("object_path") or os.path.join(
+        _recycle_dir_for_root(), "objects", rid, _safe_object_filename(item.get("filename"))
+    ))
+    expected_parent = os.path.realpath(os.path.join(_recycle_dir_for_root(), "objects", rid))
+    actual_parent = os.path.realpath(os.path.dirname(os.path.abspath(object_path)))
+    if actual_parent != expected_parent:
+        raise RecycleError("unsafe recycle object path", "UNSAFE_RECYCLE_PATH", 403)
+    return object_path
+
+
+def _write_entry_sidecar(item):
+    rid = _entry_id(item)
+    if not rid:
+        raise RecycleError("invalid recycle id", "INVALID_RECYCLE_ID", 400)
+    p = os.path.join(_recycle_dir_for_root(), "objects", rid, "meta.json")
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(item, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def _merge_sidecar_entries_unlocked(items):
+    """Recover an object move if the final manifest write did not complete."""
+    objects_dir = os.path.join(_recycle_dir_for_root(), "objects")
+    try:
+        ids = os.listdir(objects_dir)
+    except OSError:
+        return items
+    known = {_entry_id(x) for x in items if _entry_id(x)}
+    for rid in ids:
+        rid = str(rid)
+        if not _recycle_id_re.fullmatch(rid) or rid in known:
             continue
         try:
-            if not os.path.isfile(path):
-                continue
-            if not is_path_under_root(path):
-                continue
-        except OSError:
+            with open(os.path.join(objects_dir, rid, "meta.json"), "r", encoding="utf-8") as f:
+                item = json.load(f)
+        except Exception:
             continue
-        out.append(it)
+        if isinstance(item, dict) and _entry_id(item) == rid:
+            items.append(item)
+    return items
+
+
+def _active_entries_unlocked():
+    items = _merge_sidecar_entries_unlocked(_delete_trash_load_unlocked())
+    out = []
+    for item in items:
+        if not _entry_active(item):
+            continue
+        try:
+            obj = _recycle_object_path(item)
+            if os.path.isfile(obj) and _is_path_under_dir(obj, _recycle_dir_for_root()):
+                out.append(item)
+        except RecycleError:
+            continue
     return out
 
 
-def delete_trash_list() -> list:
-    """返回当前扫描根下仍存在的待删文件条目（顺带落盘剔除已消失路径）。"""
+def _delete_trash_prune_unlocked(items):
+    wanted = {_entry_id(x) for x in items if _entry_id(x)}
+    return [dict(x) for x in _active_entries_unlocked() if _entry_id(x) in wanted]
+
+
+def delete_trash_list():
+    """Return active, recoverable recycle entries for the current scan root."""
     with _delete_trash_lock:
-        raw = _delete_trash_load_unlocked()
-        pruned = _delete_trash_prune_unlocked(raw)
-        if len(pruned) != len(raw):
-            _delete_trash_save_unlocked(pruned)
-        return [dict(x) for x in pruned]
+        return [dict(x) for x in _active_entries_unlocked()]
 
 
-def delete_trash_add(path: str, error: str) -> int:
-    """删除失败时写入清单；同路径更新 last_error。返回当前清单长度。"""
-    now = datetime.now().isoformat(timespec="seconds")
-    err = (error or "")[:2000]
-    with _delete_trash_lock:
-        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
-        found = False
-        for it in items:
-            if it.get("path") == path:
-                it["last_error"] = err
-                it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                it["last_failed_at"] = now
-                found = True
-                break
-        if not found:
-            items.append(
-                {
-                    "path": path,
-                    "added_at": now,
-                    "last_error": err,
-                    "fail_count": 1,
-                    "last_failed_at": now,
-                }
-            )
-        _delete_trash_save_unlocked(items)
-        return len(items)
-
-
-def _delete_trash_path_norm(p: str) -> str:
+def move_media_to_recycle(path):
+    """Move one media file into the recoverable recycle area; never unlink it."""
+    if media_mutations_readonly():
+        resp = _mutation_readonly_response()
+        raise RecycleError(resp.get("error", "media root is read-only"), "MEDIA_READONLY", 403)
+    raw_path = str(path or "")
+    if not raw_path.strip():
+        raise RecycleError("missing path", "MISSING_PATH", 400)
+    root_real = os.path.realpath(os.path.abspath(get_scan_root()))
     try:
-        return os.path.normcase(os.path.normpath(p))
-    except Exception:
-        return p
+        source = os.path.realpath(os.path.abspath(raw_path))
+    except OSError as exc:
+        raise RecycleError(str(exc), "INVALID_PATH", 400) from exc
+    if not is_path_under_root(source) or source == root_real:
+        raise RecycleError("path is outside media root", "PATH_OUTSIDE_ROOT", 403)
+    recycle_dir = _recycle_dir_for_root()
+    if _is_path_under_dir(source, recycle_dir):
+        raise RecycleError("recycle objects cannot be recycled", "RECYCLE_PATH_FORBIDDEN", 403)
+    try:
+        source_parent = os.path.dirname(source)
+        if os.stat(source_parent).st_mode & 0o222 == 0:
+            raise PermissionError(f"parent directory is read-only: {source_parent}")
+    except FileNotFoundError as exc:
+        raise RecycleError("media file not found", "MEDIA_NOT_FOUND", 404) from exc
+    except PermissionError as exc:
+        raise RecycleError(
+            str(exc), "SOURCE_PARENT_READ_ONLY", 403, errno="EPERM"
+        ) from exc
+    except OSError as exc:
+        raise RecycleError(str(exc), "RECYCLE_MOVE_FAILED", 500) from exc
+    release_media_resources(source)
+    # Cache keys include the source path; clear them before the source path disappears.
+    remove_media_thumb_cache(source)
+    remove_media_play_cache(source)
 
-
-def delete_trash_remove_paths(paths: list) -> int:
-    """从清单移除（不删磁盘文件）。返回剩余条数。"""
-    want = set()
-    for p in paths or []:
-        if isinstance(p, str) and p:
-            want.add(_delete_trash_path_norm(p))
-    if not want:
-        return len(delete_trash_list())
-    with _delete_trash_lock:
-        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
-        items = [it for it in items if _delete_trash_path_norm(it.get("path", "")) not in want]
-        _delete_trash_save_unlocked(items)
-        return len(items)
-
-
-def delete_trash_clear() -> None:
-    with _delete_trash_lock:
-        _delete_trash_save_unlocked([])
-
-
-def delete_trash_retry_all() -> dict:
-    """依次重试删除清单内全部文件；成功则移除并清缩略图缓存。"""
     now = datetime.now().isoformat(timespec="seconds")
-    remaining: list = []
-    deleted = 0
-    errors: list = []
     with _delete_trash_lock:
-        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
-        for it in items:
-            p = it.get("path")
-            if not isinstance(p, str) or not p:
+        items = _merge_sidecar_entries_unlocked(_delete_trash_load_unlocked())
+        source_key = _delete_trash_path_norm(source)
+        for item in items:
+            if item.get("status") == "recycled" and _entry_source_key(item) == source_key:
+                # A repeated delete is intentionally idempotent and performs no move.
+                return dict(item), True
+        if not os.path.isfile(source):
+            raise RecycleError("media file not found", "MEDIA_NOT_FOUND", 404)
+        parts = _safe_relative_parts(source, root_real)
+        filename = _safe_object_filename(os.path.basename(source))
+        rid = uuid.uuid4().hex
+        object_dir = os.path.join(recycle_dir, "objects", rid)
+        object_path = os.path.join(object_dir, filename)
+        pending = {
+            "id": rid,
+            "status": "pending",
+            "original_root": root_real,
+            "relative_path": "/".join(parts),
+            "relative_parts": parts,
+            "filename": os.path.basename(source),
+            "original_path": source,
+            "path": source,
+            "object_path": object_path,
+            "recycled_at": None,
+            "created_at": now,
+        }
+        _write_entry_sidecar(pending)
+        try:
+            os.makedirs(object_dir, mode=0o700, exist_ok=True)
+            shutil.move(source, object_path)
+        except Exception as exc:
+            try:
+                if os.path.isfile(object_path):
+                    os.unlink(object_path)
+                if os.path.isdir(object_dir) and not os.listdir(object_dir):
+                    os.rmdir(object_dir)
+            except OSError:
+                pass
+            errno_value = getattr(exc, "errno", None)
+            errno_name = getattr(errno_value, "name", None) if errno_value is not None else None
+            status = 500
+            if isinstance(exc, PermissionError) or errno_name in ("EACCES", "EPERM", "EROFS"):
+                status = 403
+            elif errno_value == errno.ENOSPC:
+                status = 507
+            raise RecycleError(str(exc), "RECYCLE_MOVE_FAILED", status, errno=errno_name) from exc
+
+        try:
+            size = os.path.getsize(object_path)
+        except OSError:
+            size = None
+        item = dict(pending)
+        item.update({"status": "recycled", "recycled_at": now, "size_bytes": size})
+        try:
+            _write_entry_sidecar(item)
+            items.append(item)
+            _delete_trash_save_unlocked(items)
+        except Exception:
+            # The sidecar lets _active_entries_unlocked recover this object later.
+            items.append(item)
+        return dict(item), False
+
+
+def _unique_restore_destination(directory, filename):
+    candidate = os.path.join(directory, filename)
+    if not os.path.lexists(candidate):
+        return candidate
+    stem, ext = os.path.splitext(filename)
+    for i in range(1, 10000):
+        candidate = os.path.join(directory, "{} ({}){}".format(stem, i, ext))
+        if not os.path.lexists(candidate):
+            return candidate
+    raise RecycleError("restore destination conflict", "RESTORE_CONFLICT", 409)
+
+
+def _validate_restore_target(item):
+    root_real = os.path.realpath(os.path.abspath(get_scan_root()))
+    original_root = os.path.realpath(os.path.abspath(str(item.get("original_root") or "")))
+    if os.path.normcase(original_root) != os.path.normcase(root_real):
+        raise RecycleError("entry belongs to another media root", "ORIGINAL_ROOT_MISMATCH", 409)
+    parts = _entry_parts(item)
+    if not parts or any(
+        not str(x) or str(x) in (".", "..") or "/" in str(x) or "\\" in str(x) or "\x00" in str(x)
+        for x in parts
+    ):
+        raise RecycleError("invalid original relative path", "INVALID_RECYCLE_PATH", 400)
+    original_relative = "/".join(parts)
+    stored_relative = str(item.get("relative_path") or "").replace("\\", "/")
+    if stored_relative and os.path.normpath(original_relative) != os.path.normpath(stored_relative):
+        raise RecycleError("invalid original relative path", "INVALID_RECYCLE_PATH", 400)
+    target = os.path.join(root_real, *parts)
+    target_real = os.path.realpath(os.path.abspath(target))
+    if target_real != root_real and not target_real.startswith(root_real + os.sep):
+        raise RecycleError("restore path is outside media root", "PATH_OUTSIDE_ROOT", 403)
+    if _is_path_under_dir(target_real, _recycle_dir_for_root()):
+        raise RecycleError("restore path is inside recycle area", "RECYCLE_PATH_FORBIDDEN", 403)
+    return target, original_relative
+
+
+def restore_recycle_entries(ids):
+    """Restore selected entries without overwriting an existing destination."""
+    requested = []
+    for value in ids or []:
+        value = str(value or "").lower()
+        if _recycle_id_re.fullmatch(value) and value not in requested:
+            requested.append(value)
+    restored = []
+    skipped = []
+    with _delete_trash_lock:
+        items = _merge_sidecar_entries_unlocked(_delete_trash_load_unlocked())
+        by_id = {_entry_id(x): x for x in items if _entry_id(x)}
+        for rid in requested:
+            item = by_id.get(rid)
+            if not item:
+                skipped.append({"id": rid, "code": "RECYCLE_ENTRY_NOT_FOUND"})
                 continue
-            if not os.path.isfile(p) or not is_path_under_root(p):
+            if item.get("status") == "restored":
+                restored.append({**dict(item), "already_restored": True})
+                continue
+            if item.get("status") != "recycled":
+                skipped.append({"id": rid, "code": "RECYCLE_ENTRY_NOT_ACTIVE"})
                 continue
             try:
-                _safe_remove(p)
-                remove_media_thumb_cache(p)
-                deleted += 1
-            except Exception as e:
-                err = str(e)
-                it["last_error"] = err[:2000]
-                it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                it["last_failed_at"] = now
-                remaining.append(it)
-                errors.append({"path": p, "error": err})
-        _delete_trash_save_unlocked(remaining)
-    return {"ok": True, "deleted": deleted, "remaining": len(remaining), "errors": errors}
-
-
-def delete_trash_delete_selected(paths: list) -> dict:
-    """仅删除「当前废纸篓队列」中出现的路径（子集），用于前端多选批量删。"""
-    raw: list[str] = []
-    for p in paths or []:
-        if isinstance(p, str) and p.strip():
-            raw.append(p.strip())
-    seen: set[str] = set()
-    unique_req: list[str] = []
-    for p in raw:
-        k = _delete_trash_path_norm(p)
-        if k in seen:
-            continue
-        seen.add(k)
-        unique_req.append(p)
-
-    skipped: list = []
-    errors: list = []
-    deleted = 0
-    now = datetime.now().isoformat(timespec="seconds")
-
-    with _delete_trash_lock:
-        items = _delete_trash_prune_unlocked(_delete_trash_load_unlocked())
-        for req_path in unique_req:
-            req_n = _delete_trash_path_norm(req_path)
-            found = False
-            for idx, it in enumerate(items):
-                p = it.get("path")
-                if not isinstance(p, str) or _delete_trash_path_norm(p) != req_n:
-                    continue
-                found = True
-                canon = p
-                if not os.path.isfile(canon) or not is_path_under_root(canon):
-                    skipped.append({"path": req_path, "error": "file_missing"})
-                    items.pop(idx)
-                    break
+                object_path = _recycle_object_path(item)
+                if not os.path.isfile(object_path):
+                    raise RecycleError("recycle object is missing", "RECYCLE_OBJECT_MISSING", 409)
+                target, _rel = _validate_restore_target(item)
+                os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                final_target = _unique_restore_destination(
+                    os.path.dirname(target), _safe_object_filename(item.get("filename"))
+                )
+                shutil.move(object_path, final_target)
                 try:
-                    _safe_remove(canon)
-                    remove_media_thumb_cache(canon)
-                    deleted += 1
-                    items.pop(idx)
-                except Exception as e:
-                    err = str(e)
-                    it["last_error"] = err[:2000]
-                    it["fail_count"] = int(it.get("fail_count") or 0) + 1
-                    it["last_failed_at"] = now
-                    errors.append({"path": canon, "error": err})
-                break
-            if not found:
-                skipped.append({"path": req_path, "error": "not_in_trash_queue"})
+                    object_parent = os.path.dirname(object_path)
+                    if os.path.isdir(object_parent) and not os.listdir(object_parent):
+                        os.rmdir(object_parent)
+                except OSError:
+                    pass
+                item.update({
+                    "status": "restored",
+                    "restored_at": datetime.now().isoformat(timespec="seconds"),
+                    "restored_path": final_target,
+                    "restore_conflict_renamed": os.path.normcase(final_target) != os.path.normcase(target),
+                })
+                restored.append(dict(item))
+            except RecycleError as exc:
+                skipped.append({"id": rid, "code": exc.code, "error": str(exc)})
+            except Exception as exc:
+                skipped.append({"id": rid, "code": "RESTORE_FAILED", "error": str(exc)})
         _delete_trash_save_unlocked(items)
-        remaining = len(items)
-
     return {
         "ok": True,
-        "deleted": deleted,
-        "remaining": remaining,
-        "errors": errors,
+        "restored": restored,
+        "restored_count": len(restored),
         "skipped": skipped,
+        "remaining": len(delete_trash_list()),
     }
+
+
+def delete_trash_remove_paths(paths):
+    """Compatibility helper: metadata-only and never unlinks media."""
+    wanted = {_delete_trash_path_norm(str(p or "")) for p in paths or []}
+    with _delete_trash_lock:
+        items = _merge_sidecar_entries_unlocked(_delete_trash_load_unlocked())
+        kept = [x for x in items if not (_entry_active(x) and _entry_source_key(x) in wanted)]
+        _delete_trash_save_unlocked(kept)
+        return len([x for x in kept if _entry_active(x)])
+
+
+def purge_recycle_entries(ids, confirmation):
+    """Permanently purge already-isolated objects, but only after explicit confirmation."""
+    if str(confirmation or "") != "PURGE":
+        raise RecycleError("explicit PURGE confirmation is required", "PURGE_REQUIRES_CONFIRM", 403)
+    requested = None
+    if ids is not None:
+        requested = []
+        for value in ids or []:
+            value = str(value or "").lower()
+            if _recycle_id_re.fullmatch(value) and value not in requested:
+                requested.append(value)
+    purged = []
+    skipped = []
+    with _delete_trash_lock:
+        items = _merge_sidecar_entries_unlocked(_delete_trash_load_unlocked())
+        for item in items:
+            rid = _entry_id(item)
+            if item.get("status") != "recycled":
+                continue
+            if requested is not None and rid not in requested:
+                continue
+            if requested is not None and rid not in requested:
+                skipped.append({"id": rid, "code": "RECYCLE_ENTRY_NOT_FOUND"})
+                continue
+            try:
+                object_path = _recycle_object_path(item)
+                object_dir = os.path.dirname(object_path)
+                if os.path.isdir(object_dir):
+                    shutil.rmtree(object_dir)
+                item.update({
+                    "status": "purged",
+                    "purged_at": datetime.now().isoformat(timespec="seconds"),
+                    "object_path": object_path,
+                })
+                purged.append({"id": rid})
+            except Exception as exc:
+                skipped.append({"id": rid, "code": "PURGE_FAILED", "error": str(exc)})
+        _delete_trash_save_unlocked(items)
+    return {"ok": True, "purged": purged, "purged_count": len(purged), "skipped": skipped, "remaining": len(delete_trash_list())}
+
+
+def reset_recycle_for_tests():
+    """Test-only helper; production HTTP routes never invoke this function."""
+    with _delete_trash_lock:
+        recycle_dir = _recycle_dir_for_root()
+        shutil.rmtree(recycle_dir, ignore_errors=True)
+        os.makedirs(recycle_dir, mode=0o700, exist_ok=True)
 
 
 def _path_under_work_dir(file_path: str, work_path: str) -> bool:
@@ -2022,45 +2244,6 @@ def _path_under_work_dir(file_path: str, work_path: str) -> bool:
     if fp == wp:
         return os.path.isfile(fp)
     return fp.startswith(wp + os.sep)
-
-
-def _can_remove_work_folder_dir(work_path: str) -> bool:
-    """根目录平铺作品（path=扫描根）不删除文件夹本身。"""
-    try:
-        root = os.path.realpath(get_scan_root())
-        wp = os.path.realpath(work_path)
-    except OSError:
-        return False
-    if wp == root:
-        return False
-    return wp.startswith(root + os.sep) and os.path.isdir(wp)
-
-
-def try_remove_empty_work_folder(work_path: str) -> bool:
-    """媒体删光后，自底向上移除空子目录并尝试删除作品文件夹（A+B 之 B）。"""
-    if not _can_remove_work_folder_dir(work_path):
-        return False
-    wp = os.path.realpath(work_path)
-    removed_top = False
-    try:
-        for dirpath, _dirnames, _filenames in os.walk(wp, topdown=False):
-            try:
-                if not os.listdir(dirpath):
-                    os.rmdir(dirpath)
-                    if os.path.normcase(dirpath) == os.path.normcase(wp):
-                        removed_top = True
-            except OSError:
-                pass
-        if not removed_top and os.path.isdir(wp):
-            try:
-                if not os.listdir(wp):
-                    os.rmdir(wp)
-                    removed_top = True
-            except OSError:
-                pass
-    except OSError:
-        return False
-    return removed_top
 
 
 def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
@@ -2098,23 +2281,22 @@ def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
     deleted = 0
     deleted_paths: list[str] = []
     errors: list[dict] = []
+    recycle_entries: list[dict] = []
     for fp in raw_paths:
         if not os.path.isfile(fp):
             continue
         try:
-            _safe_remove(fp)
-            remove_media_thumb_cache(fp)
+            entry, already = move_media_to_recycle(fp)
             deleted += 1
             deleted_paths.append(fp)
+            recycle_entries.append(entry)
         except Exception as e:
             err = str(e)
-            delete_trash_add(fp, err)
-            errors.append({"path": fp, "error": err})
+            code = getattr(e, "code", "RECYCLE_MOVE_FAILED")
+            errors.append({"path": fp, "error": err, "code": code})
 
+    # The rework intentionally preserves directory structure: only media files move.
     folder_removed = False
-    if not errors and _can_remove_work_folder_dir(wp):
-        folder_removed = try_remove_empty_work_folder(wp)
-
     trash_n = len(delete_trash_list())
     return {
         "ok": True,
@@ -2123,8 +2305,9 @@ def delete_work_all_media_and_folder(work_path: str, paths: list) -> dict:
         "errors": errors,
         "folder_removed": folder_removed,
         "trash_count": trash_n,
+        "recycle_count": trash_n,
+        "recycle_entries": recycle_entries,
     }
-
 
 def get_video_info(path: str) -> dict:
     info = {"duration": 0.0, "width": 0, "height": 0, "codec": "", "bitrate": 0, "fps": 0.0}
@@ -5071,55 +5254,106 @@ class Handler(BaseHTTPRequestHandler):
             if media_mutations_readonly():
                 self._send_json(_mutation_readonly_response(), 403)
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except Exception:
-                self._send_json({"ok": False, "error": "invalid json"}, 400)
-                return
-            paths = data.get("paths")
-            if not isinstance(paths, list):
-                self._send_json({"ok": False, "error": "paths must be array"}, 400)
-                return
-            n = delete_trash_remove_paths(paths)
-            self._send_json({"ok": True, "count": n})
+            self._send_json({
+                "ok": False,
+                "error": "recycle entries may only be restored, not silently removed",
+                "code": "RECYCLE_REMOVE_FORBIDDEN",
+                "restore_endpoint": "/api/recycle/restore",
+            }, 409)
             return
         if parsed.path == "/api/delete-trash/delete-selected":
             if media_mutations_readonly():
                 self._send_json(_mutation_readonly_response(), 403)
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except Exception:
-                self._send_json({"ok": False, "error": "invalid json"}, 400)
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
                 return
-            paths = data.get("paths")
-            if not isinstance(paths, list):
-                self._send_json({"ok": False, "error": "paths must be array"}, 400)
+            if data.get("restore") is True:
+                ids = data.get("ids") if isinstance(data.get("ids"), list) else []
+                if not ids and isinstance(data.get("paths"), list):
+                    wanted = {_delete_trash_path_norm(str(p or "")) for p in data.get("paths")}
+                    ids = [
+                        item.get("id")
+                        for item in delete_trash_list()
+                        if _delete_trash_path_norm(str(item.get("original_path") or item.get("path") or "")) in wanted
+                    ]
+                self._send_json(restore_recycle_entries(ids))
                 return
-            self._send_json(delete_trash_delete_selected(paths))
+            self._send_json({
+                "ok": False,
+                "error": "permanent delete is disabled; use restore=true to restore selected entries",
+                "code": "RECYCLE_DELETE_FORBIDDEN",
+                "restore_endpoint": "/api/recycle/restore",
+            }, 409)
             return
         if parsed.path == "/api/delete-trash/clear":
             if media_mutations_readonly():
                 self._send_json(_mutation_readonly_response(), 403)
                 return
-            delete_trash_clear()
-            self._send_json({"ok": True, "count": 0})
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
+                return
+            confirmation = data.get("confirm")
+            header_confirmation = self.headers.get("X-MB-Recycle-Confirm", "")
+            if confirmation == "PURGE" and header_confirmation == "PURGE":
+                self._send_json(purge_recycle_entries(None, "PURGE"))
+                return
+            self._send_json({
+                "ok": False,
+                "error": "clearing the recycle bin requires explicit authorization",
+                "code": "PURGE_REQUIRES_CONFIRM",
+                "required_confirm": "PURGE",
+                "required_header": "X-MB-Recycle-Confirm: PURGE",
+            }, 403)
             return
         if parsed.path == "/api/delete-trash/retry-all":
             if media_mutations_readonly():
                 self._send_json(_mutation_readonly_response(), 403)
                 return
-            self._send_json(delete_trash_retry_all())
+            self._send_json({
+                "ok": False,
+                "error": "permanent retry delete is disabled; recycle entries are restorable",
+                "code": "RECYCLE_DELETE_FORBIDDEN",
+                "restore_endpoint": "/api/recycle/restore",
+            }, 409)
+            return
+        if parsed.path == "/api/recycle/restore":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
+                return
+            ids = data.get("ids")
+            if not isinstance(ids, list):
+                self._send_json({"ok": False, "error": "ids must be array"}, 400)
+                return
+            self._send_json(restore_recycle_entries(ids))
+            return
+        if parsed.path == "/api/recycle/purge":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
+            data, err = self._read_json_body()
+            if err:
+                self._send_json({"ok": False, "error": err}, 400)
+                return
+            confirmation = data.get("confirm")
+            header_confirmation = self.headers.get("X-MB-Recycle-Confirm", "")
+            ids = data.get("ids") if isinstance(data.get("ids"), list) else None
+            if confirmation == "PURGE" and header_confirmation == "PURGE":
+                self._send_json(purge_recycle_entries(ids, "PURGE"))
+                return
+            self._send_json({
+                "ok": False,
+                "error": "permanent purge requires explicit authorization",
+                "code": "PURGE_REQUIRES_CONFIRM",
+                "required_confirm": "PURGE",
+                "required_header": "X-MB-Recycle-Confirm: PURGE",
+            }, 403)
             return
         if parsed.path == "/api/works/delete-all":
             if media_mutations_readonly():
@@ -5178,48 +5412,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "invalid json"}, 400)
             return
         fpath = data.get("path", "")
-        work_path = data.get("work_path", "")
         if not isinstance(fpath, str) or not fpath:
             self._send_json({"ok": False, "error": "missing path"}, 400)
             return
-        if not os.path.exists(fpath) or not os.path.isfile(fpath):
-            self._send_json({"ok": False, "error": "not found"}, 404)
-            return
-        if not is_path_under_root(fpath):
-            self._send_json({"ok": False, "error": "forbidden"}, 403)
-            return
-        cleanup_work_path = ""
-        if isinstance(work_path, str) and work_path.strip():
-            try:
-                candidate = os.path.realpath(
-                    os.path.abspath(os.path.expanduser(work_path.strip()))
-                )
-                if (
-                    _can_remove_work_folder_dir(candidate)
-                    and _path_under_work_dir(fpath, candidate)
-                ):
-                    cleanup_work_path = candidate
-            except OSError:
-                pass
         try:
-            _safe_remove(fpath)
-            remove_media_thumb_cache(fpath)
-            folder_removed = False
-            if cleanup_work_path:
-                folder_removed = try_remove_empty_work_folder(cleanup_work_path)
-            self._send_json({"ok": True, "folder_removed": folder_removed})
+            entry, already_recycled = move_media_to_recycle(fpath)
+            trash_n = len(delete_trash_list())
+            self._send_json({
+                "ok": True,
+                "folder_removed": False,
+                "already_recycled": already_recycled,
+                "id": entry.get("id"),
+                "original_path": entry.get("original_path"),
+                "recycled_at": entry.get("recycled_at"),
+                "trash_count": trash_n,
+                "recycle_count": trash_n,
+            })
+        except RecycleError as e:
+            self._send_json(e.payload(), e.status)
         except Exception as e:
-            err = str(e)
-            trash_n = 0
-            queued = False
-            try:
-                if os.path.isfile(fpath) and is_path_under_root(fpath):
-                    trash_n = delete_trash_add(fpath, err)
-                    queued = True
-            except Exception:
-                pass
             self._send_json(
-                {"ok": False, "error": err, "queued": queued, "trash_count": trash_n},
+                {"ok": False, "error": str(e), "code": "RECYCLE_MOVE_FAILED"},
                 500,
             )
 

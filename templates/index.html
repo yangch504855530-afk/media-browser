@@ -1486,19 +1486,19 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button data-filter="image">有图片</button>
         <button data-filter="pending" title="尚未标记为保留的作品">待审阅</button>
         <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
-        <button data-filter="deleted" title="已标记、尚未永久删除的作品">待删除</button>
+        <button data-filter="deleted" title="已标记为待删除的作品">待删除</button>
         <button data-filter="invalid" title="包含无法读取或时长过短视频的作品">疑似无效</button>
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
-    <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的视频，不影响同文件夹其它媒体">永久删除待删除视频</button>
-    <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
+    <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一将已标记为待删除的视频移入可恢复回收站，不影响同文件夹其它媒体">移入回收站待删除视频</button>
+    <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除操作只会移动文件，可在此恢复到原位置">回收站 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
     <select id="advRating" onchange="applyAdvancedFilters()" title="按评分筛选"><option value="">所有评分</option><option value="unrated">未评分</option><option value="0">0 星</option><option value="1">1 星</option><option value="2">2 星</option><option value="3">3 星</option><option value="4">4 星</option><option value="5">5 星</option></select>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
         <button type="button" id="mbMobileSearchBtn" title="搜索">搜索</button>
         <button type="button" id="mbMobileFilterBtn">筛选</button>
-        <button type="button" id="mbMobileTrashBtn">废纸篓</button>
+        <button type="button" id="mbMobileTrashBtn">回收站</button>
         <span id="mbMobileStatus" class="mb-mobile-status"></span>
     </div>
 </header>
@@ -1704,18 +1704,18 @@ body.batch-open #backToTop.show { bottom: 118px; }
 <div id="mbTrashOverlay" class="mb-trash-overlay" aria-hidden="true">
     <div class="mb-trash-panel" role="dialog" aria-labelledby="mbTrashTitle">
         <div class="mb-trash-head">
-            <h2 id="mbTrashTitle">废纸篓（待删文件）</h2>
+        <h2 id="mbTrashTitle">回收站（可恢复）</h2>
             <button type="button" id="mbTrashClose" aria-label="关闭">&times;</button>
         </div>
-        <p class="mb-trash-desc">以下路径曾因权限、磁盘只读、文件被占用等原因<strong>删除失败</strong>，已自动记入本队列。你要做的仍是<strong>删除这些指定文件</strong>：可勾选多项后点「删除所选」，或逐条点「删除此文件」，或在本机解除占用后点「全部再次删除」。若你已在访达中手动删掉文件，对应行会在刷新后自动消失；只有当你<strong>不想</strong>再尝试删除某条时，才用该行「移出队列」。</p>
+        <p class="mb-trash-desc">删除操作只会把媒体文件<strong>移动到应用隔离目录</strong>，并登记原始位置。这里不会永久删除文件。勾选后可恢复所选；恢复时如果原位置已有同名文件，会自动保存为「名称 (1).扩展名」。清空回收站默认拒绝，必须显式授权。</p>
         <div class="mb-trash-toolbar">
             <label class="mb-trash-all-lbl"><input type="checkbox" id="mbTrashSelectAll" title="全选当前列表"> 全选</label>
-            <button type="button" id="mbTrashDeleteSelected" disabled>删除所选</button>
+            <button type="button" id="mbTrashDeleteSelected" disabled>恢复所选</button>
             <span id="mbTrashSelectedLabel" class="mb-trash-sel-label" aria-live="polite"></span>
         </div>
         <div id="mbTrashListWrap" class="mb-trash-list-wrap"></div>
         <div class="mb-trash-actions">
-            <button type="button" class="primary" id="mbTrashRetryAll">全部再次删除</button>
+            <button type="button" class="primary" id="mbTrashRetryAll">恢复全部</button>
         </div>
     </div>
 </div>
@@ -1895,7 +1895,7 @@ function mbCloseTrashPanel() {
     mbTrashOverlay.setAttribute('aria-hidden', 'true');
 }
 
-function mbRescanWorksAfterTrashDelete() {
+function mbRescanWorksAfterTrashRestore() {
     pollGen++;
     since = 0;
     scanPollDone = false;
@@ -1909,20 +1909,18 @@ function mbRescanWorksAfterTrashDelete() {
 
 function mbTrashUpdateSelectionUi() {
     const wrap = mbTrashListWrap;
-    const sa = document.getElementById('mbTrashSelectAll');
-    const delBtn = document.getElementById('mbTrashDeleteSelected');
+    const restoreBtn = document.getElementById('mbTrashDeleteSelected');
     const label = document.getElementById('mbTrashSelectedLabel');
-    if (!wrap || !delBtn) return;
+    if (!wrap || !restoreBtn) return;
     const chks = wrap.querySelectorAll('.mb-trash-row-chk');
     let n = 0;
     chks.forEach(function (c) { if (c.checked) n++; });
-    delBtn.disabled = n === 0;
-    if (label) label.textContent = n ? ('已选 ' + n + ' 项') : '';
-    if (sa) {
-        if (!chks.length) {
-            sa.checked = false;
-            sa.indeterminate = false;
-        } else {
+    restoreBtn.disabled = n === 0;
+    if (label) label.textContent = n ? ('?? ' + n + ' ?') : '';
+    if (sa_check()) {
+        const sa = sa_check();
+        if (!chks.length) { sa.checked = false; sa.indeterminate = false; }
+        else {
             let c = 0;
             chks.forEach(function (x) { if (x.checked) c++; });
             sa.checked = c === chks.length;
@@ -1931,108 +1929,74 @@ function mbTrashUpdateSelectionUi() {
     }
 }
 
-async function mbTrashDeleteSelectedAction() {
-    if (!mbTrashListWrap) return;
-    const paths = [];
-    mbTrashListWrap.querySelectorAll('.mb-trash-row-chk:checked').forEach(function (c) {
-        const ix = parseInt(c.getAttribute('data-trash-sel-ix'), 10);
-        const row = mbTrashItemsCache[ix];
-        if (row && row.path) paths.push(row.path);
-    });
-    if (!paths.length) return;
-    if (!confirm('将永久删除已选的 ' + paths.length + ' 个文件，不可恢复。确定？')) return;
+function sa_check() { return document.getElementById('mbTrashSelectAll'); }
+
+async function mbTrashRestore(payload, confirmText) {
+    if (confirmText && !confirm(confirmText)) return null;
     try {
-        const res = await fetch('/api/delete-trash/delete-selected', {
+        const res = await fetch('/api/recycle/restore', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json; charset=utf-8' },
-            body: JSON.stringify({ paths }),
+            body: JSON.stringify(payload),
         });
         const d = await res.json();
-        if (!d.ok) { alert(d.error || '操作失败'); return; }
-        let msg = '已删除 ' + (d.deleted || 0) + ' 个。';
-        if (d.skipped && d.skipped.length) msg += ' 跳过 ' + d.skipped.length + ' 项。';
-        if (d.errors && d.errors.length) msg += ' 仍有失败 ' + d.errors.length + ' 项。';
+        if (!d.ok) { alert(d.error || '????'); return d; }
+        let msg = '??? ' + (d.restored_count || 0) + ' ??';
+        if (d.skipped && d.skipped.length) msg += ' ?? ' + d.skipped.length + ' ??';
         alert(msg);
         await mbOpenTrashPanel();
         mbRefreshTrashBadge(true);
-        if ((d.deleted || 0) > 0) mbRescanWorksAfterTrashDelete();
+        if ((d.restored_count || 0) > 0) mbRescanWorksAfterTrashRestore();
+        return d;
     } catch (e) {
         alert(e.message || String(e));
+        return null;
     }
+}
+
+async function mbTrashRestoreSelectedAction() {
+    if (!mbTrashListWrap) return;
+    const ids = [];
+    mbTrashListWrap.querySelectorAll('.mb-trash-row-chk:checked').forEach(function (c) {
+        const ix = parseInt(c.getAttribute('data-trash-sel-ix'), 10);
+        const row = mbTrashItemsCache[ix];
+        if (row && row.id) ids.push(row.id);
+    });
+    if (!ids.length) return;
+    await mbTrashRestore({ ids }, '??? ' + ids.length + ' ?????????????????????');
 }
 
 function mbRenderTrashList(items) {
     if (!mbTrashListWrap) return;
     mbTrashItemsCache = items || [];
     if (!items || !items.length) {
-        mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">暂无记录。删除失败时会加入此队列，便于对<strong>指定文件</strong>再次执行删除。</div>';
+        mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">??????????????????????????</div>';
         mbTrashUpdateSelectionUi();
         return;
     }
     let html = '';
     for (let i = 0; i < items.length; i++) {
         const it = items[i];
-        const p = it.path || '';
-        const err = it.last_error || '';
+        const original = it.original_path || it.path || '';
+        const recycledAt = it.recycled_at || it.created_at || '';
         html += '<div class="mb-trash-row">';
-        html += '<label class="mb-trash-chk-lbl"><input type="checkbox" class="mb-trash-row-chk" data-trash-sel-ix="' + i + '" aria-label="选中以加入批量删除"></label>';
-        html += '<div><div class="mb-trash-path">' + escapeHtml(p) + '</div>';
-        if (err) html += '<div class="mb-trash-err">' + escapeHtml(err) + '</div>';
+        html += '<label class="mb-trash-chk-lbl"><input type="checkbox" class="mb-trash-row-chk" data-trash-sel-ix="' + i + '" aria-label="???????"></label>';
+        html += '<div><div class="mb-trash-path">' + escapeHtml(original) + '</div>';
+        if (recycledAt) html += '<div class="mb-trash-err">?????' + escapeHtml(recycledAt) + '</div>';
         html += '</div><div class="mb-trash-row-actions">';
-        html += '<button type="button" class="mb-trash-del-one" data-trash-del-idx="' + i + '">删除此文件</button>';
-        html += '<button type="button" class="mb-trash-dropq" data-trash-rm-idx="' + i + '">移出队列</button>';
+        html += '<button type="button" class="mb-trash-del-one" data-trash-restore-idx="' + i + '">?????</button>';
         html += '</div></div>';
     }
     mbTrashListWrap.innerHTML = html;
     mbTrashListWrap.querySelectorAll('.mb-trash-row-chk').forEach(function (c) {
         c.addEventListener('change', mbTrashUpdateSelectionUi);
     });
-    mbTrashListWrap.querySelectorAll('[data-trash-del-idx]').forEach(function (btn) {
+    mbTrashListWrap.querySelectorAll('[data-trash-restore-idx]').forEach(function (btn) {
         btn.onclick = async function () {
-            const ix = parseInt(btn.getAttribute('data-trash-del-idx'), 10);
+            const ix = parseInt(btn.getAttribute('data-trash-restore-idx'), 10);
             const row = mbTrashItemsCache[ix];
-            if (!row || !row.path) return;
-            if (!confirm('确定永久删除该文件？\\n' + row.path)) return;
-            try {
-                const res = await fetch('/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-                    body: JSON.stringify({ path: row.path }),
-                });
-                const d = await res.json();
-                if (!d.ok) {
-                    let msg = '删除失败: ' + (d.error || '未知错误');
-                    if (d.queued) msg += '\\n已更新废纸篓记录。';
-                    alert(msg);
-                    mbRefreshTrashBadge(true);
-                    await mbOpenTrashPanel();
-                    return;
-                }
-                await mbOpenTrashPanel();
-                mbRefreshTrashBadge(true);
-                mbRescanWorksAfterTrashDelete();
-            } catch (e) {
-                alert(e.message || String(e));
-            }
-        };
-    });
-    mbTrashListWrap.querySelectorAll('[data-trash-rm-idx]').forEach(function (btn) {
-        btn.onclick = async function () {
-            const ix = parseInt(btn.getAttribute('data-trash-rm-idx'), 10);
-            const row = mbTrashItemsCache[ix];
-            if (!row || !row.path) return;
-            if (!confirm('从队列中移除此路径？\\n不会删除磁盘上的文件；仅在你确定不再通过本工具删除该项时使用。')) return;
-            try {
-                const res = await fetch('/api/delete-trash/remove', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-                    body: JSON.stringify({ paths: [row.path] }),
-                });
-                const d = await res.json();
-                if (!d.ok) { alert(d.error || '移除失败'); return; }
-                await mbOpenTrashPanel();
-                mbRefreshTrashBadge(true);
-            } catch (e) { alert(e.message || String(e)); }
+            if (!row || !row.id) return;
+            await mbTrashRestore({ ids: [row.id] }, '??????????\n' + (row.original_path || row.path || ''));
         };
     });
     mbTrashUpdateSelectionUi();
@@ -2048,30 +2012,15 @@ async function mbOpenTrashPanel() {
         mbRenderTrashList((d && d.items) ? d.items : []);
         mbRefreshTrashBadge(true);
     } catch (e) {
-        if (mbTrashListWrap) mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">加载失败</div>';
+        if (mbTrashListWrap) mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">????</div>';
         mbTrashUpdateSelectionUi();
     }
 }
 
-async function mbTrashRetryAllAction() {
-    if (!confirm('将依次再次尝试永久删除队列中的全部文件，不可恢复。确定？')) return;
-    try {
-        const res = await fetch('/api/delete-trash/retry-all', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json; charset=utf-8' },
-            body: '{}',
-        });
-        const d = await res.json();
-        if (!d.ok) { alert(d.error || '操作失败'); return; }
-        let msg = '已删除 ' + (d.deleted || 0) + ' 个；剩余 ' + (d.remaining || 0) + ' 个。';
-        if (d.errors && d.errors.length) msg += '\\n仍有失败项，请查看清单。';
-        alert(msg);
-        await mbOpenTrashPanel();
-        mbRefreshTrashBadge(true);
-        if ((d.deleted || 0) > 0) mbRescanWorksAfterTrashDelete();
-    } catch (e) {
-        alert(e.message || String(e));
-    }
+async function mbTrashRestoreAllAction() {
+    const ids = mbTrashItemsCache.map(function (x) { return x.id; }).filter(Boolean);
+    if (!ids.length) return;
+    await mbTrashRestore({ ids }, '?????? ' + ids.length + ' ?????????????????????');
 }
 
 const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob','.flv']);
@@ -3240,7 +3189,7 @@ async function deleteAllMarkedWorks() {
         alert('当前没有标记为待删除的视频。');
         return;
     }
-    if (!confirm('将永久删除 ' + marked.length + ' 个待删除视频，不会删除同文件夹中的其它视频或图片。不可恢复，确定？')) return;
+    if (!confirm('将 ' + marked.length + ' 个待删除视频移入可恢复回收站，不会删除同文件夹中的其它视频或图片。确定？')) return;
     closeModal();
     let deleted = 0, failed = 0;
     for (const row of marked) {
@@ -3255,7 +3204,7 @@ async function deleteAllMarkedWorks() {
         } catch (e) { failed++; }
     }
     sortAndRenderAll();
-    alert('已删除 ' + deleted + ' 个视频' + (failed ? '；' + failed + ' 个删除失败，已加入废纸篓。' : '。'));
+    alert('已移入回收站 ' + deleted + ' 个视频' + (failed ? '；' + failed + ' 个移动失败。' : '。'));
     mbRefreshTrashBadge(true);
 }
 async function batchOpenFinder() {
@@ -3478,7 +3427,7 @@ function deleteCurrentWork(skipConfirm) {
 async function deleteWorkAllFiles(work, skipConfirm) {
     if (!work || !work.items.length) return;
     const folderNote = workCanRemoveEmptyFolder(work) ? '；若文件夹已空将一并移除' : '';
-    if (!skipConfirm && !confirm('将永久删除「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件' + folderNote + '，不可恢复。确定？')) return;
+    if (!skipConfirm && !confirm('将「' + work.name + '」内全部 ' + work.items.length + ' 个媒体文件移入可恢复回收站' + folderNote + '。确定？')) return;
     const paths = work.items.map(function (it) { return it.path; });
     const modal = document.getElementById('modal');
     const inGallery = modal && modal.classList.contains('active') && galleryState.workId === work.id;
@@ -3517,7 +3466,7 @@ async function deleteWorkAllFiles(work, skipConfirm) {
         } else {
             sortAndRenderAll();
             if (data.errors && data.errors.length) {
-                alert('部分文件未能删除（仍剩余 ' + work.items.length + ' 个）。失败项已记入废纸篓，可在页眉「废纸篓」批量重试。');
+                alert('部分文件未能移入回收站（仍剩余 ' + work.items.length + ' 个）。可在页眉「回收站」查看已成功移动项。');
             }
             if (inGallery) {
                 if (galleryState.itemIdx >= work.items.length) {
@@ -3761,7 +3710,7 @@ function sortAndRenderAll() {
     const deleteMarkedBtn = document.getElementById('mbDeleteMarkedBtn');
     if (deleteMarkedBtn) {
         const markedVideos = allWorks.reduce(function (n, w) { return n + w.items.filter(function (it) { return it.type === 'video' && getVideoReviewTag(it) === 'deleted'; }).length; }, 0);
-        deleteMarkedBtn.textContent = '永久删除待删除视频' + (markedVideos ? ' (' + markedVideos + ')' : '');
+        deleteMarkedBtn.textContent = '移入回收站待删除视频' + (markedVideos ? ' (' + markedVideos + ')' : '');
     }
     container.innerHTML = '';
     displayedIds.clear();
@@ -4358,7 +4307,7 @@ async function deleteCurrentItem(skipConfirm) {
         return;
     }
     const nextWork = work.items.length === 1 ? nextGalleryWorkBeforeRemoval(work.id) : null;
-    if (!skipConfirm && !confirm('将永久删除「' + item.name + '」，不可恢复。确定？')) return;
+    if (!skipConfirm && !confirm('将「' + item.name + '」移入可恢复回收站。确定？')) return;
     if (item.type === 'video') releaseGalleryVideoElement();
 
     let deleteOk = false;
@@ -4371,7 +4320,7 @@ async function deleteCurrentItem(skipConfirm) {
         const data = await res.json();
         if (!data.ok) {
             let msg = '删除失败: ' + (data.error || '未知错误');
-            if (data.queued) msg += '\\n已加入废纸篓清单（当前 ' + (data.trash_count || 0) + ' 项），可点页眉「废纸篓」批量重试。';
+            msg += '\\n移动失败：' + (data.code || '未知错误') + '。文件未被永久删除。';
             alert(msg);
             mbRefreshTrashBadge(true);
             advanceGalleryAfterDeleteAttempt(work, false);
@@ -4571,7 +4520,7 @@ async function deleteCurrentImageGridGroup(skipConfirm) {
     const group = currentImageGridPage(work);
     const paths = group.page.map(function (entry) { return entry.item.path; });
     if (!paths.length) return;
-    if (!skipConfirm && !confirm('将永久删除当前可见的 ' + paths.length + ' 张图片，不可恢复。确定？')) return;
+    if (!skipConfirm && !confirm('将当前可见的 ' + paths.length + ' 张图片移入可恢复回收站。确定？')) return;
     const nextWork = paths.length >= work.items.length ? nextGalleryWorkBeforeRemoval(work.id) : null;
     try {
         const res = await fetch('/api/works/delete-all', {
@@ -5273,7 +5222,7 @@ async function mbApplyCacheDirSwitch() {
         if (ev.target === mbTrashOverlay) mbCloseTrashPanel();
     });
     const mbTrashRetryAllBtn = document.getElementById('mbTrashRetryAll');
-    if (mbTrashRetryAllBtn) mbTrashRetryAllBtn.addEventListener('click', mbTrashRetryAllAction);
+    if (mbTrashRetryAllBtn) mbTrashRetryAllBtn.addEventListener('click', mbTrashRestoreAllAction);
     const mbTrashSelectAll = document.getElementById('mbTrashSelectAll');
     if (mbTrashSelectAll && !mbTrashSelectAll.dataset.mbBound) {
         mbTrashSelectAll.dataset.mbBound = '1';
@@ -5287,7 +5236,7 @@ async function mbApplyCacheDirSwitch() {
     const mbTrashDeleteSelectedBtn = document.getElementById('mbTrashDeleteSelected');
     if (mbTrashDeleteSelectedBtn && !mbTrashDeleteSelectedBtn.dataset.mbBound) {
         mbTrashDeleteSelectedBtn.dataset.mbBound = '1';
-        mbTrashDeleteSelectedBtn.addEventListener('click', function () { mbTrashDeleteSelectedAction(); });
+        mbTrashDeleteSelectedBtn.addEventListener('click', function () { mbTrashRestoreSelectedAction(); });
     }
     setTimeout(function () { mbRefreshTrashBadge(true); }, 600);
     switchTab('review');

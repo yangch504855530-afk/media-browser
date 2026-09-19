@@ -131,7 +131,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **列表**：搜索、排序；筛选 **全部 / 有视频 / 有图片 / 待审阅 / 已审阅**（「待审阅」= 尚未标为保留；「已审阅」= 卡片标记为保留）。
 - **懒加载**：滚动追加卡片。
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
-- **删除**：画廊单文件删除与整作品删除均需确认；删除源文件时同步清理缩略图与 play-ready 转码缓存。失败项记入**废纸篓队列**，可在页眉批量重试。
+- **删除**：画廊单文件删除与整作品删除均需确认；删除只把源文件移动到应用隔离的**可恢复回收站**，并登记原始根、相对路径、文件名、时间和唯一 ID。移动成功后同步清理缩略图与 play-ready 缓存；只读目录、权限不足或路径越界会返回稳定错误码，源文件保持不变。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
 - **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
 - **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
@@ -202,13 +202,14 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/tasks/{id}/preview` | POST | 预览批量重命名映射 |
 | `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
 | `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
-| `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存；失败时可能返回 `queued` / `trash_count` 并入废纸篓队列 |
-| `/api/works/delete-all` | POST | JSON `{"work_path":"…","paths":["…"]}`，批量删作品内媒体；全部成功后尝试移除已空 `work_path`（非扫描根） |
-| `/api/delete-trash` | GET | 当前废纸篓队列（仍存在于扫描根下的待删路径） |
-| `/api/delete-trash/delete-selected` | POST | JSON `{"paths":["…"]}`，仅删除队列中出现的路径（子集批量） |
-| `/api/delete-trash/retry-all` | POST | 对队列内全部路径再次尝试删除 |
-| `/api/delete-trash/remove` | POST | JSON `{"paths":["…"]}`，仅从队列移除（不删磁盘） |
-| `/api/delete-trash/clear` | POST | 清空队列（不删磁盘） |
+| `/delete` | POST | JSON `{"path":"…"}`，移动文件到回收站并清对应缩略图/play-ready 缓存；重复请求幂等，返回 `id` / `already_recycled` / `trash_count` |
+| `/api/works/delete-all` | POST | JSON `{"work_path":"…","paths":["…"]}`，批量移动作品内媒体；目录结构保留 |
+| `/api/delete-trash` | GET | 当前可恢复回收站条目 |
+| `/api/recycle/restore` | POST | JSON `{"ids":["…"]}`；恢复到原相对位置，目标同名时自动改名为 `名称 (1).扩展名` |
+| `/api/delete-trash/delete-selected` | POST | 兼容入口：默认拒绝硬删除；`{"restore":true,"paths":[…]}` 转换为恢复 |
+| `/api/delete-trash/retry-all` | POST | 默认拒绝永久重试；返回恢复入口 |
+| `/api/delete-trash/remove` | POST | 默认拒绝静默移出登记；返回恢复入口 |
+| `/api/delete-trash/clear` | POST | 默认拒绝；body/header 同时传 `PURGE` 才清空已隔离对象 |
 
 跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN`。
 
@@ -343,7 +344,7 @@ Actions 会并行构建：
 
 ### 仍可排的 backlog（约定后再做）
 
-**P1 体验与安全**：删除进系统废纸篓、转码更细进度、HTTPS / 反向代理部署等。
+**P1 体验与安全**：回收站保留期与跨根恢复策略、转码更细进度、HTTPS / 反向代理部署等。
 
 **P2 功能**：搜索增强、审阅标签导出/导入、非 macOS 打开目录、窄屏侧栏、macOS 原生浏览文件夹选根目录。
 
@@ -355,6 +356,6 @@ Actions 会并行构建：
 
 ## 注意事项
 
-- 删除仍是永久删除，请确认后操作并提前备份。
+- 普通删除只进入应用回收站；清空回收站是显式授权的永久清理，请提前备份。
 - 转码占 CPU。  
 - 「在文件管理器中打开」已支持 macOS / Windows / Linux。  

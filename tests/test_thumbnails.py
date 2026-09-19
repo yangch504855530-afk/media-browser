@@ -102,7 +102,7 @@ def test_remove_media_thumb_cache(tmp_path, monkeypatch, ffmpeg_available):
     )
     mb.generate_image_thumb(str(src))
     key = mb.sha256_str(os.path.abspath(str(src)))
-    thumb_dir = os.path.join(str(cache), key)
+    thumb_dir = mb._thumb_cache_dir(key)
     assert os.path.isdir(thumb_dir)
     mb.remove_media_thumb_cache(str(src))
     assert not os.path.isdir(thumb_dir)

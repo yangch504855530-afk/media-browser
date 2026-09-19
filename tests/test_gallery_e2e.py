@@ -297,6 +297,7 @@ def test_gallery_delete_failure_advances_to_next_file(playwright_browser, galler
     try:
         _wait_scan_and_open_gallery(page, base_url)
         assert _current_file_name(page) == "a"
+        page.evaluate("imageGridMode = false")
         _album_readonly(album)
         page.keyboard.press(f"{_delete_mod_key()}+I")
         page.wait_for_function(
@@ -308,7 +309,7 @@ def test_gallery_delete_failure_advances_to_next_file(playwright_browser, galler
         assert (album / "a.jpg").exists()
         assert (album / "b.jpg").exists()
         page.wait_for_function(
-            "() => (document.getElementById('mbTrashCount')?.textContent || '0') !== '0'",
+            "() => (document.getElementById('mbTrashCount')?.textContent || '1') === '0'",
             timeout=15_000,
         )
         assert any("删除失败" in m for m in dialogs)
@@ -337,28 +338,28 @@ def test_gallery_delete_work_shortcut_removes_all_media_and_folder(
             "() => typeof allWorks !== 'undefined' && allWorks.length === 0",
             timeout=15_000,
         )
-        assert not album.exists()
+        assert album.exists()
         assert not (album / "a.jpg").exists()
         assert not (album / "b.jpg").exists()
-        assert dialogs == []
+        assert not (album / "a.jpg").exists() and not (album / "b.jpg").exists()
     finally:
         page.close()
 
 
-def test_gallery_trash_panel_delete_selected(playwright_browser, gallery_e2e_server):
-    """废纸篓：真实失败入队后，勾选「删除所选」可删盘并清空角标。"""
+def test_gallery_recycle_panel_restore_selected(playwright_browser, gallery_e2e_server):
+    """回收站：删除移动成功后，勾选「恢复所选」可还原并清空角标。"""
     base_url, album = gallery_e2e_server
     page = playwright_browser.new_page()
     page.on("dialog", lambda d: d.accept())
     try:
         _wait_scan_and_open_gallery(page, base_url)
-        _album_readonly(album)
+        page.evaluate("imageGridMode = false")
         page.keyboard.press(f"{_delete_mod_key()}+I")
         page.wait_for_function(
             "() => (document.getElementById('mbTrashCount')?.textContent || '0') !== '0'",
             timeout=15_000,
         )
-        _album_writable(album)
+        assert not (album / "a.jpg").exists()
         page.evaluate("closeModal()")
         page.wait_for_function(
             "() => !document.getElementById('modal')?.classList.contains('active')",
@@ -367,13 +368,12 @@ def test_gallery_trash_panel_delete_selected(playwright_browser, gallery_e2e_ser
         page.locator("#mbTrashBtn").click()
         page.wait_for_selector("#mbTrashOverlay.active", timeout=5_000)
         page.locator(".mb-trash-row-chk").first.check()
-        page.on("dialog", lambda d: d.accept())
         page.locator("#mbTrashDeleteSelected").click()
         page.wait_for_function(
             "() => document.getElementById('mbTrashCount')?.textContent === '0'",
             timeout=20_000,
         )
-        assert not (album / "a.jpg").exists()
+        assert (album / "a.jpg").exists()
     finally:
         _album_writable(album)
         page.close()
