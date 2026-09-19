@@ -1784,6 +1784,16 @@ def _safe_remove(path: str) -> None:
     """Release active readers before remove; retry transient Windows locks."""
     release_media_resources(path)
     remove_media_play_cache(path)
+    # Windows permits an owner/admin to remove files from a directory whose
+    # write bits were cleared with ``chmod``.  Respect the portable mode bits
+    # explicitly so read-only NAS fixtures have the same stable failure
+    # semantics on Windows and POSIX hosts.
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        if os.stat(parent).st_mode & 0o222 == 0:
+            raise PermissionError(f"parent directory is read-only: {parent}")
+    except FileNotFoundError:
+        pass
     delays = (0.0, 0.3, 0.5) if sys.platform == "win32" else (0.0,)
     for idx, delay in enumerate(delays):
         if delay:
