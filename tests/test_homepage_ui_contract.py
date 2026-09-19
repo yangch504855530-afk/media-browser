@@ -108,6 +108,22 @@ def test_deep_directory_navigation_ui_contract(homepage_html: str):
     assert "rel.startsWith(advDirectory + '/')" in js
 
 
+def test_recycle_bin_ui_contract_requires_restore(homepage_html: str):
+    """The production page exposes restore actions and no permanent-delete entry."""
+    js = _extract_main_script(homepage_html)
+    assert 'id="mbTrashDeleteSelected"' in homepage_html
+    assert ">恢复所选</button>" in homepage_html
+    assert ">恢复全部</button>" in homepage_html
+    assert "fetch('/api/recycle/restore'" in js
+    assert "永久删除待删除视频" not in homepage_html
+    assert "/api/delete-trash/delete-selected" not in js
+    assert "/api/delete-trash/retry-all" not in js
+    assert "/api/recycle/purge" not in js
+    # Regression: non-ASCII UI strings must not be persisted as literal question marks.
+    assert "'??? '" not in js
+    assert "'???'" not in js
+
+
 def test_v2_personal_asset_ui_contract(homepage_html: str):
     js = _extract_main_script(homepage_html)
     assert 'id="preferenceSummary"' in homepage_html

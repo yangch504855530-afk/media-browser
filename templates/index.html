@@ -1942,9 +1942,9 @@ async function mbTrashRestore(payload, confirmText) {
             body: JSON.stringify(payload),
         });
         const d = await res.json();
-        if (!d.ok) { alert(d.error || '????'); return d; }
-        let msg = '??? ' + (d.restored_count || 0) + ' ??';
-        if (d.skipped && d.skipped.length) msg += ' ?? ' + d.skipped.length + ' ??';
+        if (!d.ok) { alert(d.error || '恢复失败'); return d; }
+        let msg = '已恢复 ' + (d.restored_count || 0) + ' 个文件';
+        if (d.skipped && d.skipped.length) msg += '；跳过 ' + d.skipped.length + ' 个文件';
         alert(msg);
         await mbOpenTrashPanel();
         mbRefreshTrashBadge(true);
@@ -1965,14 +1965,14 @@ async function mbTrashRestoreSelectedAction() {
         if (row && row.id) ids.push(row.id);
     });
     if (!ids.length) return;
-    await mbTrashRestore({ ids }, '??? ' + ids.length + ' ?????????????????????');
+    await mbTrashRestore({ ids }, '将所选 ' + ids.length + ' 个文件恢复到登记的原始相对位置，同名文件会自动改名，不覆盖。确定？');
 }
 
 function mbRenderTrashList(items) {
     if (!mbTrashListWrap) return;
     mbTrashItemsCache = items || [];
     if (!items || !items.length) {
-        mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">??????????????????????????</div>';
+        mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">回收站为空。删除操作只会移动媒体文件并登记原始位置，可随时恢复。</div>';
         mbTrashUpdateSelectionUi();
         return;
     }
@@ -1982,11 +1982,11 @@ function mbRenderTrashList(items) {
         const original = it.original_path || it.path || '';
         const recycledAt = it.recycled_at || it.created_at || '';
         html += '<div class="mb-trash-row">';
-        html += '<label class="mb-trash-chk-lbl"><input type="checkbox" class="mb-trash-row-chk" data-trash-sel-ix="' + i + '" aria-label="???????"></label>';
+        html += '<label class="mb-trash-chk-lbl"><input type="checkbox" class="mb-trash-row-chk" data-trash-sel-ix="' + i + '" aria-label="选择待恢复文件"></label>';
         html += '<div><div class="mb-trash-path">' + escapeHtml(original) + '</div>';
-        if (recycledAt) html += '<div class="mb-trash-err">?????' + escapeHtml(recycledAt) + '</div>';
+        if (recycledAt) html += '<div class="mb-trash-err">移入时间：' + escapeHtml(recycledAt) + '</div>';
         html += '</div><div class="mb-trash-row-actions">';
-        html += '<button type="button" class="mb-trash-del-one" data-trash-restore-idx="' + i + '">?????</button>';
+        html += '<button type="button" class="mb-trash-del-one" data-trash-restore-idx="' + i + '">恢复</button>';
         html += '</div></div>';
     }
     mbTrashListWrap.innerHTML = html;
@@ -1998,7 +1998,7 @@ function mbRenderTrashList(items) {
             const ix = parseInt(btn.getAttribute('data-trash-restore-idx'), 10);
             const row = mbTrashItemsCache[ix];
             if (!row || !row.id) return;
-            await mbTrashRestore({ ids: [row.id] }, '??????????\n' + (row.original_path || row.path || ''));
+            await mbTrashRestore({ ids: [row.id] }, '恢复这个文件到原始相对位置？\n' + (row.original_path || row.path || ''));
         };
     });
     mbTrashUpdateSelectionUi();
@@ -2014,7 +2014,7 @@ async function mbOpenTrashPanel() {
         mbRenderTrashList((d && d.items) ? d.items : []);
         mbRefreshTrashBadge(true);
     } catch (e) {
-        if (mbTrashListWrap) mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">????</div>';
+        if (mbTrashListWrap) mbTrashListWrap.innerHTML = '<div class="mb-trash-empty">无法加载回收站</div>';
         mbTrashUpdateSelectionUi();
     }
 }
@@ -2022,7 +2022,7 @@ async function mbOpenTrashPanel() {
 async function mbTrashRestoreAllAction() {
     const ids = mbTrashItemsCache.map(function (x) { return x.id; }).filter(Boolean);
     if (!ids.length) return;
-    await mbTrashRestore({ ids }, '?????? ' + ids.length + ' ?????????????????????');
+    await mbTrashRestore({ ids }, '将回收站全部 ' + ids.length + ' 个文件恢复到登记的原始相对位置，同名文件会自动改名，不覆盖。确定？');
 }
 
 const TRANSCODE_VIDEO_EXTS = new Set(['.avi','.ts','.mts','.m2ts','.wmv','.vob','.flv']);
