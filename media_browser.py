@@ -1443,8 +1443,9 @@ def filter_works_payload(works: list, *, rating: str = "", media_type: str = "",
     wanted_ratings = None
     if rating:
         vals = {x.strip() for x in str(rating).split(",") if x.strip()}
-        if "unrated" in vals or "none" in vals:
-            vals.add("0")
+        if "none" in vals:
+            vals.remove("none")
+            vals.add("unrated")
         wanted_ratings = vals
     media_type = (media_type or "").strip().lower()
     directory = (directory or "").strip().replace("\\", "/").strip("/")
@@ -2046,7 +2047,18 @@ def move_media_to_recycle(path):
         _write_entry_sidecar(pending)
         try:
             os.makedirs(object_dir, mode=0o700, exist_ok=True)
-            shutil.move(source, object_path)
+            # Thumbnail/preview workers can hold a very short-lived input handle
+            # on Windows. A bounded retry keeps the source immutable while the
+            # reader exits; timeout still surfaces as RECYCLE_MOVE_FAILED.
+            for attempt in range(20):
+                try:
+                    shutil.move(source, object_path)
+                    break
+                except PermissionError as exc:
+                    if attempt == 19:
+                        raise
+                    release_media_resources(source)
+                    time.sleep(0.05)
         except Exception as exc:
             try:
                 if os.path.isfile(object_path):

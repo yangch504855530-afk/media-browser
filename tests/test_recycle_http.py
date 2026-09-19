@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -31,6 +32,9 @@ def recycle_server(tmp_path, monkeypatch):
     outsider = tmp_path / "outside.mp4"
     outsider.write_bytes(b"outside")
     assert mb.replace_scan_root(str(root.resolve())) is True
+    deadline = time.monotonic() + 10
+    while not mb.scanner.done and time.monotonic() < deadline:
+        time.sleep(0.02)
     mb.reset_recycle_for_tests()
 
     server = mb.HTTPServer(("127.0.0.1", 0), mb.Handler)

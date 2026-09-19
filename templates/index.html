@@ -1495,6 +1495,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除操作只会移动文件，可在此恢复到原位置">回收站 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
     <select id="advRating" onchange="applyAdvancedFilters()" title="按评分筛选"><option value="">所有评分</option><option value="unrated">未评分</option><option value="0">0 星</option><option value="1">1 星</option><option value="2">2 星</option><option value="3">3 星</option><option value="4">4 星</option><option value="5">5 星</option></select>
+    <select id="advDirectory" onchange="applyAdvancedFilters()" title="按目录层级筛选"><option value="">所有目录</option></select>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
         <button type="button" id="mbMobileSearchBtn" title="搜索">搜索</button>
         <button type="button" id="mbMobileFilterBtn">筛选</button>
@@ -1529,6 +1530,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         </div>
     <div class="filters" style="margin-top: 8px;">
         <select id="mobAdvRating" onchange="applyAdvancedFilters()" title="按评分筛选"><option value="">所有评分</option><option value="unrated">未评分</option><option value="0">0 星</option><option value="1">1 星</option><option value="2">2 星</option><option value="3">3 星</option><option value="4">4 星</option><option value="5">5 星</option></select>
+        <select id="mobAdvDirectory" onchange="applyAdvancedFilters()" title="按目录层级筛选"><option value="">所有目录</option></select>
         <select id="mobAdvRegion" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
             <option value="">所有地区</option>
             <option value="欧美">欧美</option>
@@ -3256,21 +3258,50 @@ let advRegion = '';
 let advPeople = '';
 let advStar = '';
 let advRating = '';
+let advDirectory = '';
+
+function mbSyncDirectoryOptions() {
+    const dirs = new Set();
+    for (const work of allWorks) {
+        for (const item of work.items || []) {
+            const rel = String(item.relative_path || '').replace(/\\/g, '/');
+            if (rel.includes('/')) dirs.add(rel.slice(0, rel.lastIndexOf('/')));
+        }
+    }
+    const values = ['', ...[...dirs].sort((a, b) => a.localeCompare(b))];
+    ['advDirectory', 'mobAdvDirectory'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const current = el.value;
+        el.innerHTML = values.map(function (value) {
+            return '<option value="' + escapeHtml(value) + '">' + (value ? escapeHtml(value) : '所有目录') + '</option>';
+        }).join('');
+        el.value = values.includes(current) ? current : '';
+    });
+}
 
 function applyAdvancedFilters() {
     advRegion = document.getElementById('advRegion') ? document.getElementById('advRegion').value : '';
     advPeople = document.getElementById('advPeople') ? document.getElementById('advPeople').value : '';
     advStar = document.getElementById('advStar') ? document.getElementById('advStar').value : '';
     advRating = (document.getElementById('advRating') || document.getElementById('mobAdvRating'))?.value || '';
+    advDirectory = (document.getElementById('advDirectory') || document.getElementById('mobAdvDirectory'))?.value || '';
     ['advRating', 'mobAdvRating'].forEach(function (id) {
         const el = document.getElementById(id); if (el && el.value !== advRating) el.value = advRating;
+    });
+    ['advDirectory', 'mobAdvDirectory'].forEach(function (id) {
+        const el = document.getElementById(id); if (el && el.value !== advDirectory) el.value = advDirectory;
     });
     sortAndRenderAll();
 }
 
 function workMatchesAdvancedFilter(w) {
-    if (!advRegion && !advPeople && !advStar && !advRating) return true;
+    if (!advRegion && !advPeople && !advStar && !advRating && !advDirectory) return true;
     return w.items.some(function(it) {
+        if (advDirectory) {
+            const rel = String(it.relative_path || '').replace(/\\/g, '/');
+            if (rel !== advDirectory && !rel.startsWith(advDirectory + '/')) return false;
+        }
         if (it.type !== 'video') return false;
         const entry = mbGetVideoReviewEntry(it) || {};
         if (advRating) {
@@ -3706,6 +3737,7 @@ function resetFilters() {
 }
 
 function sortAndRenderAll() {
+    mbSyncDirectoryOptions();
     const list = getFilteredSortedWorks();
     const deleteMarkedBtn = document.getElementById('mbDeleteMarkedBtn');
     if (deleteMarkedBtn) {

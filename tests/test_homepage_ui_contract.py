@@ -94,6 +94,20 @@ def test_review_filter_kept_and_pending_labels(homepage_html: str):
     assert ">保留</button>" in homepage_html
 
 
+def test_deep_directory_navigation_ui_contract(homepage_html: str):
+    js = _extract_main_script(homepage_html)
+    for marker in (
+        'id="advDirectory"',
+        'id="mobAdvDirectory"',
+        "function mbSyncDirectoryOptions()",
+        "item.relative_path",
+        "advDirectory",
+    ):
+        assert marker in homepage_html or marker in js, marker
+    assert "onchange=\"applyAdvancedFilters()\"" in homepage_html
+    assert "rel.startsWith(advDirectory + '/')" in js
+
+
 def test_v2_personal_asset_ui_contract(homepage_html: str):
     js = _extract_main_script(homepage_html)
     assert 'id="preferenceSummary"' in homepage_html

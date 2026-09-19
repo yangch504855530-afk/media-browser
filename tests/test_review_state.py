@@ -204,6 +204,47 @@ def test_rating_is_the_video_retention_decision(tmp_path, monkeypatch):
     assert "rating" not in pending
 
 
+def test_rating_filter_separates_zero_and_unrated(tmp_path, monkeypatch):
+    monkeypatch.setattr(mb, "CACHE_DIR", str(tmp_path / "cache"))
+    (tmp_path / "cache").mkdir()
+    assert mb.replace_scan_root(str(tmp_path.resolve())) is True
+    paths = [tmp_path / "zero.mp4", tmp_path / "five.mp4", tmp_path / "pending.mp4"]
+    for path in paths:
+        path.write_bytes(path.stem.encode("ascii"))
+    ratings = [0, 5, None]
+    for path, rating in zip(paths, ratings):
+        assert mb.patch_review_state_video(
+            mb.video_asset_id(str(path)),
+            {"path": str(path), "rating": rating},
+        )["ok"] is True
+
+    works = [
+        {
+            "id": mb.sha256_str(str(path)),
+            "name": path.stem,
+            "items": [{
+                "asset_id": mb.video_asset_id(str(path)),
+                "path": str(path),
+                "relative_path": path.name,
+                "type": "video",
+            }],
+        }
+        for path in paths
+    ]
+
+    def ids(rating: str) -> set[str]:
+        return {
+            work["id"]
+            for work in mb.filter_works_payload(works, rating=rating)
+        }
+
+    zero_ids = ids("0")
+    unrated_ids = ids("unrated")
+    assert zero_ids == {mb.sha256_str(str(paths[0]))}
+    assert unrated_ids == {mb.sha256_str(str(paths[2]))}
+    assert zero_ids.isdisjoint(unrated_ids)
+
+
 def test_ollama_falls_back_to_installed_vision_model(monkeypatch):
     monkeypatch.setattr(
         mb,
