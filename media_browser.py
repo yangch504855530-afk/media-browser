@@ -386,6 +386,17 @@ def media_mutations_readonly() -> bool:
     )
 
 
+def safe_relative_path(path: str, start: str | None = None) -> str:
+    """Return a portable relative path without failing across drives/mounts."""
+    raw_path = str(path or "")
+    root = str(start or get_scan_root() or "")
+    try:
+        rel = os.path.relpath(raw_path, root)
+    except (OSError, ValueError):
+        rel = os.path.basename(os.path.normpath(raw_path)) or raw_path
+    return str(rel).replace("\\", "/")
+
+
 def _mutation_readonly_response() -> dict:
     return {"ok": False, "error": "media root is read-only", "code": "MEDIA_READONLY"}
 
@@ -1444,7 +1455,7 @@ def filter_works_payload(works: list, *, rating: str = "", media_type: str = "",
         items = []
         for item in work.get("items") or []:
             typ = str(item.get("type") or "").lower()
-            rel = str(item.get("relative_path") or os.path.relpath(item.get("path", ""), get_scan_root())).replace("\\", "/")
+            rel = str(item.get("relative_path") or safe_relative_path(item.get("path", ""), get_scan_root()))
             if media_type in ("video", "image") and typ != media_type:
                 continue
             if directory and not (rel == directory or rel.startswith(directory + "/")):
@@ -1452,7 +1463,7 @@ def filter_works_payload(works: list, *, rating: str = "", media_type: str = "",
             entry = ledger.get(item.get("asset_id"), {}) if ledger else {}
             if wanted_ratings is not None:
                 current = entry.get("rating")
-                current_key = str(current) if isinstance(current, int) else "0"
+                current_key = str(current) if isinstance(current, int) else "unrated"
                 if current_key not in wanted_ratings:
                     continue
             if tag and str(entry.get("tag") or "pending").lower() != tag:
@@ -2402,8 +2413,8 @@ class MediaScanner:
                     fp = os.path.join(wroot, f)
                     if not is_path_under_root(fp):
                         continue
-                    rel = os.path.relpath(fp, scan_root)
-                    parts = rel.split(os.sep)
+                    rel = safe_relative_path(fp, scan_root)
+                    parts = rel.replace("\\", "/").split("/")
                     if len(parts) == 1:
                         root_flat.append(fp)
                     else:
@@ -2495,7 +2506,7 @@ class MediaScanner:
         for it in items:
             if not os.path.isfile(it["path"]):
                 continue
-            it.setdefault("relative_path", os.path.relpath(it["path"], get_scan_root()))
+            it.setdefault("relative_path", safe_relative_path(it["path"], get_scan_root()))
             try:
                 mtime = max(mtime, os.path.getmtime(it["path"]))
             except Exception:
@@ -2580,7 +2591,7 @@ class MediaScanner:
                         "type": "video",
                         "path": fpath,
                         "name": f,
-                        "relative_path": os.path.relpath(fpath, get_scan_root()),
+                        "relative_path": safe_relative_path(fpath, get_scan_root()),
                         "size": os.path.getsize(fpath),
                     })
                 elif ext in IMAGE_EXTS:
@@ -2588,7 +2599,7 @@ class MediaScanner:
                         "type": "image",
                         "path": fpath,
                         "name": f,
-                        "relative_path": os.path.relpath(fpath, get_scan_root()),
+                        "relative_path": safe_relative_path(fpath, get_scan_root()),
                         "size": os.path.getsize(fpath),
                     })
             return self._build_work_from_items(
@@ -2630,7 +2641,7 @@ class MediaScanner:
                         "type": "video" if ext in VIDEO_EXTS else "image",
                         "path": fpath,
                         "name": f,
-                        "relative_path": os.path.relpath(fpath, scan_root),
+                        "relative_path": safe_relative_path(fpath, scan_root),
                         "size": fsize,
                         "mtime": mtime
                     })
@@ -5101,6 +5112,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(delete_trash_retry_all())
             return
         if parsed.path == "/api/works/delete-all":
+            if media_mutations_readonly():
+                self._send_json(_mutation_readonly_response(), 403)
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:

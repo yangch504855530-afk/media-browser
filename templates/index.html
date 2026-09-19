@@ -1494,6 +1494,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的视频，不影响同文件夹其它媒体">永久删除待删除视频</button>
     <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
+    <select id="advRating" onchange="applyAdvancedFilters()" title="按评分筛选"><option value="">所有评分</option><option value="unrated">未评分</option><option value="0">0 星</option><option value="1">1 星</option><option value="2">2 星</option><option value="3">3 星</option><option value="4">4 星</option><option value="5">5 星</option></select>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
         <button type="button" id="mbMobileSearchBtn" title="搜索">搜索</button>
         <button type="button" id="mbMobileFilterBtn">筛选</button>
@@ -1527,6 +1528,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button data-filter="invalid">疑似无效</button>
         </div>
     <div class="filters" style="margin-top: 8px;">
+        <select id="mobAdvRating" onchange="applyAdvancedFilters()" title="按评分筛选"><option value="">所有评分</option><option value="unrated">未评分</option><option value="0">0 星</option><option value="1">1 星</option><option value="2">2 星</option><option value="3">3 星</option><option value="4">4 星</option><option value="5">5 星</option></select>
         <select id="mobAdvRegion" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
             <option value="">所有地区</option>
             <option value="欧美">欧美</option>
@@ -3304,19 +3306,28 @@ function mbBuildWorksStatusText(listLen, narrowed) {
 let advRegion = '';
 let advPeople = '';
 let advStar = '';
+let advRating = '';
 
 function applyAdvancedFilters() {
     advRegion = document.getElementById('advRegion') ? document.getElementById('advRegion').value : '';
     advPeople = document.getElementById('advPeople') ? document.getElementById('advPeople').value : '';
     advStar = document.getElementById('advStar') ? document.getElementById('advStar').value : '';
+    advRating = (document.getElementById('advRating') || document.getElementById('mobAdvRating'))?.value || '';
+    ['advRating', 'mobAdvRating'].forEach(function (id) {
+        const el = document.getElementById(id); if (el && el.value !== advRating) el.value = advRating;
+    });
     sortAndRenderAll();
 }
 
 function workMatchesAdvancedFilter(w) {
-    if (!advRegion && !advPeople && !advStar) return true;
+    if (!advRegion && !advPeople && !advStar && !advRating) return true;
     return w.items.some(function(it) {
         if (it.type !== 'video') return false;
         const entry = mbGetVideoReviewEntry(it) || {};
+        if (advRating) {
+            const ratingKey = Number.isInteger(entry.rating) ? String(entry.rating) : 'unrated';
+            if (ratingKey !== advRating) return false;
+        }
         const feats = entry.features || {};
         if (advRegion && feats['地区'] !== advRegion) return false;
         if (advPeople && feats['人数'] !== advPeople && feats['出场人数'] !== advPeople) return false;
@@ -4200,9 +4211,7 @@ function galleryWorkNavListAndIndex() {
     const filtered = getFilteredSortedWorks();
     let wi = filtered.findIndex((w) => w.id === galleryState.workId);
     if (wi >= 0) return { list: filtered, wi };
-    const sortedAll = sortWorks([...allWorks]);
-    wi = sortedAll.findIndex((w) => w.id === galleryState.workId);
-    return { list: sortedAll, wi };
+    return { list: filtered, wi: -1 };
 }
 
 /** 画廊内：切换到上一/下一作品；dir=+1 打开下一作品首个文件，dir=-1 打开上一作品最后一个文件 */
