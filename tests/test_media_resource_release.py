@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import media_browser as mb
 
 
@@ -29,28 +31,26 @@ def test_release_media_resources_stops_registered_transcode(tmp_path):
     assert mb.release_media_resources(str(media)) == 0
 
 
-def test_safe_remove_retries_windows_permission_error(tmp_path, monkeypatch):
+def test_media_move_to_recycle_releases_registered_transcode(tmp_path, monkeypatch):
     media = tmp_path / "playing.mp4"
     media.write_bytes(b"x")
-    real_remove = mb.os.remove
-    attempts = []
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(mb, "CACHE_DIR", str(cache))
+    monkeypatch.setattr(mb, "_scan_root", str(tmp_path.resolve()))
+    proc = _FakeProc()
+    mb._register_ffmpeg_proc(str(media), proc)
 
-    def locked_twice(path):
-        attempts.append(path)
-        if len(attempts) < 3:
-            raise PermissionError("file in use")
-        real_remove(path)
+    entry, already = mb.move_media_to_recycle(str(media))
 
-    monkeypatch.setattr(mb.sys, "platform", "win32")
-    monkeypatch.setattr(mb.os, "remove", locked_twice)
-    monkeypatch.setattr(mb.time, "sleep", lambda _delay: None)
-
-    mb._safe_remove(str(media))
-    assert len(attempts) == 3
+    assert already is False
+    assert proc.killed == 1
+    assert proc.waited == 1
     assert not media.exists()
+    assert Path(entry["object_path"]).is_file()
 
 
-def test_safe_remove_deletes_play_ready_cache(tmp_path, monkeypatch):
+def test_media_move_to_recycle_removes_play_ready_cache(tmp_path, monkeypatch):
     cache = tmp_path / "cache"
     cache.mkdir()
     media = tmp_path / "playing.avi"
@@ -61,7 +61,8 @@ def test_safe_remove_deletes_play_ready_cache(tmp_path, monkeypatch):
     with open(cached, "wb") as f:
         f.write(b"cached")
 
-    mb._safe_remove(str(media))
+    monkeypatch.setattr(mb, "_scan_root", str(tmp_path.resolve()))
+    mb.move_media_to_recycle(str(media))
     assert not media.exists()
     assert not mb.os.path.exists(cached)
 

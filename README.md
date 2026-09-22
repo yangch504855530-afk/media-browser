@@ -53,12 +53,12 @@ docker compose up -d --build
 ```
 
 容器默认以 `uid=1000` 运行。若宿主机 UID 不同，请修改 `docker-compose.yml` 中的 `user` 行（见文件内注释）。
-局域网部署必须先设置访问令牌，例如 `export MB_ACCESS_TOKEN="$(openssl rand -hex 24)"`；首次打开使用 `http://<NAS-IP>:8765/?token=<令牌>`，浏览器会保存受限 Cookie。
+局域网部署必须配置访问令牌或账号密码其中一组。令牌方式示例：`export MB_ACCESS_TOKEN="$(openssl rand -hex 24)"`；首次打开使用 `http://<NAS-IP>:8765/?token=<令牌>`，浏览器会保存受限 Cookie。若要保留 NAS 现有账号/密码登录习惯，设置 `MB_AUTH_USERNAME` 和 `MB_AUTH_PASSWORD` 后，浏览器会使用 HTTP Basic 登录。
 
 ### 手机访问（局域网 WiFi）
 
 1. 确保手机与 NAS **同一 WiFi**。
-2. 首次浏览器打开 **`http://<NAS局域网IP>:8765/?token=<MB_ACCESS_TOKEN>`**；验证后会跳转到不含令牌的首页。
+2. 令牌方式首次浏览器打开 **`http://<NAS局域网IP>:8765/?token=<MB_ACCESS_TOKEN>`**；验证后会跳转到不含令牌的首页。账号密码方式直接打开 **`http://<NAS局域网IP>:8765/`**，在浏览器提示中输入账号和密码。
 3. **v1.3.0+** 手机播放：mp4/mov 等走 **/file 直出**（手机硬解）；avi/mkv 等走 **/api/play-ready** 异步转码缓存后再播；画廊打开时隐藏底栏、支持「关闭」按钮。
 4. **v1.3.0+ Docker NAS**：页眉 **媒体库下拉**（`MB_SCAN_PRESETS`）切换扫描根；Intel 核显 **VAAPI 硬转**（`MB_FFMPEG_HW=auto`，需 compose 挂载 `/dev/dri` + `group_add render`）。
 5. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
@@ -86,8 +86,9 @@ docker compose up -d --build
 | `MB_ANALYZE_FRAME_COUNT` | AI 分析时每视频抽帧数（2–12） | `5` | 同上 |
 | `MB_WHISPER_MODEL` | 本地音频语言识别模型；需已缓存的 faster-whisper 模型 | `tiny` | 同上 |
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
-| `MB_HOST` | 监听地址；非本机地址必须同时设置 `MB_ACCESS_TOKEN` | `127.0.0.1` | 同上 |
+| `MB_HOST` | 监听地址；非本机地址必须同时配置令牌或账号密码 | `127.0.0.1` | 同上 |
 | `MB_ACCESS_TOKEN` | 局域网访问令牌；首次浏览器访问用 `/?token=...`，API 可用 Bearer Token | 未设置 | 同上 |
+| `MB_AUTH_USERNAME` / `MB_AUTH_PASSWORD` | HTTP Basic 账号密码；与访问令牌二选一，用于兼容 NAS 现有登录习惯。`MB_AUTH_USER` 与 `MB_BASIC_AUTH_USERNAME` / `MB_BASIC_AUTH_PASSWORD` 是兼容别名 | 未设置 | 同上 |
 | `MB_MAX_BODY_BYTES` | JSON 请求体大小上限 | `1048576` | 同上 |
 | `MB_PLAY_CACHE_MAX_BYTES` | play-ready 转码缓存上限，超限淘汰最旧文件 | `21474836480`（20 GiB） | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |
@@ -95,6 +96,7 @@ docker compose up -d --build
 | `MB_THUMB_COUNT` | 每个视频**条带**缩略图帧数；默认每个视频生成 8 张，可显式覆盖 | `8` | 同上 |
 | `MB_DISK_PROFILE` | 设为 `slow` / `nas` / `hdd` / `mechanical` 时自动收紧并发与条带帧数、略延长 `ffprobe` 超时 | 未设置 | 同上 |
 | `MB_SCAN_ROOT_READONLY` | 页眉扫描根只读（Docker 推荐 `1`） | 未设置 | 同上 |
+| `MB_MEDIA_READONLY` | 媒体库全局只读保护：设为 `1` / `true` / `yes` / `on` 后，删除、恢复、清空回收站等破坏性 API 返回 `403 MEDIA_READONLY` | 未设置 | 同上 |
 | `MB_SCAN_PRESETS` | 媒体库白名单：`路径\|标签;路径\|标签`；设后页眉为下拉切换，默认不自动扫描 | 未设置 | 同上 |
 | `MB_AUTO_SCAN` | 启动时是否立即扫描（设 `MB_SCAN_PRESETS` 时默认 `0`） | 见说明 | 同上 |
 | `MB_FFMPEG_HW` | 播放转码硬件加速：`off` / `auto` / `vaapi` / `qsv` / `nvenc` / `amf`。Windows 默认自动尝试 Intel 核显 QSV、NVIDIA NVENC、AMD AMF；失败会回退 CPU | `auto` | 同上 |
@@ -131,7 +133,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 - **列表**：搜索、排序；筛选 **全部 / 有视频 / 有图片 / 待审阅 / 已审阅**（「待审阅」= 尚未标为保留；「已审阅」= 卡片标记为保留）。
 - **懒加载**：滚动追加卡片。
 - **画廊**：播放、侧栏文件列表与视频帧条带；支持**全屏**、**图片缩放/拖拽/双击还原**、**视频技术元数据**（分辨率/编码/码率/帧率）显示；丰富的**键盘快捷键**（见下表）。
-- **删除**：画廊单文件删除与整作品删除均需确认；删除源文件时同步清理缩略图与 play-ready 转码缓存。失败项记入**废纸篓队列**，可在页眉批量重试。
+- **删除**：画廊单文件删除与整作品删除均需确认；删除只把源文件移动到应用隔离的**可恢复回收站**，并登记原始根、相对路径、文件名、时间和唯一 ID。移动成功后同步清理缩略图与 play-ready 缓存；只读目录、权限不足或路径越界会返回稳定错误码，源文件保持不变。
 - **待审 / 保留**：打开画廊后记「保留」；画廊内可直接点击按钮**切换保留/待审**；卡片列表可「标为待审」；页眉「标记全重置」（需确认）。
 - **AI 视频分析**（可选）：本机运行 Ollama + 视觉模型（如 `llava`），自动分析视频帧并生成时间/地点/事件/标签建议，支持批量重命名。需先 `ollama pull` 视觉模型。
 - **批量**：复选 + 批量保留/待审，或在文件管理器中打开所在文件夹（macOS Finder / Windows 资源管理器 / Linux xdg-open）。
@@ -202,15 +204,16 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/tasks/{id}/preview` | POST | 预览批量重命名映射 |
 | `/api/tasks/{id}/execute` | POST | 执行批量重命名 |
 | `/api/tasks/{id}/rollback` | POST | 回滚重命名 |
-| `/delete` | POST | JSON `{"path":"…"}`，删文件并清对应缩略图缓存；失败时可能返回 `queued` / `trash_count` 并入废纸篓队列 |
-| `/api/works/delete-all` | POST | JSON `{"work_path":"…","paths":["…"]}`，批量删作品内媒体；全部成功后尝试移除已空 `work_path`（非扫描根） |
-| `/api/delete-trash` | GET | 当前废纸篓队列（仍存在于扫描根下的待删路径） |
-| `/api/delete-trash/delete-selected` | POST | JSON `{"paths":["…"]}`，仅删除队列中出现的路径（子集批量） |
-| `/api/delete-trash/retry-all` | POST | 对队列内全部路径再次尝试删除 |
-| `/api/delete-trash/remove` | POST | JSON `{"paths":["…"]}`，仅从队列移除（不删磁盘） |
-| `/api/delete-trash/clear` | POST | 清空队列（不删磁盘） |
+| `/delete` | POST | JSON `{"path":"…"}`，移动文件到回收站并清对应缩略图/play-ready 缓存；重复请求幂等，返回 `id` / `already_recycled` / `trash_count` |
+| `/api/works/delete-all` | POST | JSON `{"work_path":"…","paths":["…"]}`，批量移动作品内媒体；目录结构保留 |
+| `/api/delete-trash` | GET | 当前可恢复回收站条目 |
+| `/api/recycle/restore` | POST | JSON `{"ids":["…"]}`；恢复到原相对位置，目标同名时自动改名为 `名称 (1).扩展名` |
+| `/api/delete-trash/delete-selected` | POST | 兼容入口：默认拒绝硬删除；`{"restore":true,"paths":[…]}` 转换为恢复 |
+| `/api/delete-trash/retry-all` | POST | 默认拒绝永久重试；返回恢复入口 |
+| `/api/delete-trash/remove` | POST | 默认拒绝静默移出登记；返回恢复入口 |
+| `/api/delete-trash/clear` | POST | 默认拒绝；body/header 同时传 `PURGE` 才清空已隔离对象 |
 
-跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN`。
+跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN` 或 `MB_AUTH_USERNAME` + `MB_AUTH_PASSWORD`；两者都为空时应用拒绝启动。
 
 ---
 
@@ -343,7 +346,7 @@ Actions 会并行构建：
 
 ### 仍可排的 backlog（约定后再做）
 
-**P1 体验与安全**：删除进系统废纸篓、转码更细进度、HTTPS / 反向代理部署等。
+**P1 体验与安全**：回收站保留期与跨根恢复策略、转码更细进度、HTTPS / 反向代理部署等。
 
 **P2 功能**：搜索增强、审阅标签导出/导入、非 macOS 打开目录、窄屏侧栏、macOS 原生浏览文件夹选根目录。
 
@@ -355,6 +358,6 @@ Actions 会并行构建：
 
 ## 注意事项
 
-- 删除仍是永久删除，请确认后操作并提前备份。
+- 普通删除只进入应用回收站；清空回收站是显式授权的永久清理，请提前备份。
 - 转码占 CPU。  
 - 「在文件管理器中打开」已支持 macOS / Windows / Linux。  

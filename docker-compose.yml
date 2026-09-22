@@ -14,6 +14,8 @@
 #     MB_TORRENT_HOST_DIR=/your/torrent \
 #     MB_RENDER_GID=103 \
 #     MB_ACCESS_TOKEN='...' \
+#     # 或保留 NAS 现有登录习惯：
+#     MB_AUTH_USERNAME='...' MB_AUTH_PASSWORD='...' \
 #     docker compose up -d --build
 #
 # 首次建议先创建宿主机缓存目录：
@@ -51,14 +53,21 @@ services:
       # 缩略图缓存：宿主机 …/media-browser/cache → 容器 /cache
       MB_CACHE_DIR: /cache
       MB_HOST: "0.0.0.0"
-      # 非本机监听必须设置访问令牌：先执行 export MB_ACCESS_TOKEN='足够长的随机字符串'
-      MB_ACCESS_TOKEN: "${MB_ACCESS_TOKEN:?Set MB_ACCESS_TOKEN before docker compose up}"
+      # 非本机监听必须配置“访问令牌”或“账号密码”其中一组；两者都为空时容器启动会失败。
+      # 兼容 NAS 现有账号/密码登录时，设置下面两项，不再要求 MB_ACCESS_TOKEN。
+      MB_ACCESS_TOKEN: "${MB_ACCESS_TOKEN:-}"
+      MB_AUTH_USERNAME: "${MB_AUTH_USERNAME:-}"
+      # MB_AUTH_USER 是既有 NAS 部署的兼容变量名；新配置推荐 MB_AUTH_USERNAME。
+      MB_AUTH_USER: "${MB_AUTH_USER:-}"
+      MB_AUTH_PASSWORD: "${MB_AUTH_PASSWORD:-}"
       MB_PORT: "8765"
       # 机械盘 / 大库：保守并发与条带帧数（可按观察再调大）
       MB_DISK_PROFILE: nas
       MB_SCAN_WORKERS: "1"
       MB_THUMB_COUNT: "2"
       MB_SCAN_ROOT_READONLY: "1"
+      # Set to 1 for a read-only NAS bind mount; destructive APIs return 403.
+      MB_MEDIA_READONLY: "${MB_MEDIA_READONLY:-0}"
       # 核显硬转：auto=探测 VAAPI；无 GPU 时自动回退 CPU。宿主机 getent group render → group_add
       MB_FFMPEG_HW: "auto"
       # 可选：MB_LOG_FORMAT=json
