@@ -53,12 +53,12 @@ docker compose up -d --build
 ```
 
 容器默认以 `uid=1000` 运行。若宿主机 UID 不同，请修改 `docker-compose.yml` 中的 `user` 行（见文件内注释）。
-局域网部署必须先设置访问令牌，例如 `export MB_ACCESS_TOKEN="$(openssl rand -hex 24)"`；首次打开使用 `http://<NAS-IP>:8765/?token=<令牌>`，浏览器会保存受限 Cookie。
+局域网部署必须配置访问令牌或账号密码其中一组。令牌方式示例：`export MB_ACCESS_TOKEN="$(openssl rand -hex 24)"`；首次打开使用 `http://<NAS-IP>:8765/?token=<令牌>`，浏览器会保存受限 Cookie。若要保留 NAS 现有账号/密码登录习惯，设置 `MB_AUTH_USERNAME` 和 `MB_AUTH_PASSWORD` 后，浏览器会使用 HTTP Basic 登录。
 
 ### 手机访问（局域网 WiFi）
 
 1. 确保手机与 NAS **同一 WiFi**。
-2. 首次浏览器打开 **`http://<NAS局域网IP>:8765/?token=<MB_ACCESS_TOKEN>`**；验证后会跳转到不含令牌的首页。
+2. 令牌方式首次浏览器打开 **`http://<NAS局域网IP>:8765/?token=<MB_ACCESS_TOKEN>`**；验证后会跳转到不含令牌的首页。账号密码方式直接打开 **`http://<NAS局域网IP>:8765/`**，在浏览器提示中输入账号和密码。
 3. **v1.3.0+** 手机播放：mp4/mov 等走 **/file 直出**（手机硬解）；avi/mkv 等走 **/api/play-ready** 异步转码缓存后再播；画廊打开时隐藏底栏、支持「关闭」按钮。
 4. **v1.3.0+ Docker NAS**：页眉 **媒体库下拉**（`MB_SCAN_PRESETS`）切换扫描根；Intel 核显 **VAAPI 硬转**（`MB_FFMPEG_HW=auto`，需 compose 挂载 `/dev/dri` + `group_add render`）。
 5. Docker 部署时扫描根由 **compose 挂载** 决定，页眉不再编辑路径（`MB_SCAN_ROOT_READONLY=1`）。
@@ -86,8 +86,9 @@ docker compose up -d --build
 | `MB_ANALYZE_FRAME_COUNT` | AI 分析时每视频抽帧数（2–12） | `5` | 同上 |
 | `MB_WHISPER_MODEL` | 本地音频语言识别模型；需已缓存的 faster-whisper 模型 | `tiny` | 同上 |
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
-| `MB_HOST` | 监听地址；非本机地址必须同时设置 `MB_ACCESS_TOKEN` | `127.0.0.1` | 同上 |
+| `MB_HOST` | 监听地址；非本机地址必须同时配置令牌或账号密码 | `127.0.0.1` | 同上 |
 | `MB_ACCESS_TOKEN` | 局域网访问令牌；首次浏览器访问用 `/?token=...`，API 可用 Bearer Token | 未设置 | 同上 |
+| `MB_AUTH_USERNAME` / `MB_AUTH_PASSWORD` | HTTP Basic 账号密码；与访问令牌二选一，用于兼容 NAS 现有登录习惯。`MB_BASIC_AUTH_USERNAME` / `MB_BASIC_AUTH_PASSWORD` 是兼容别名 | 未设置 | 同上 |
 | `MB_MAX_BODY_BYTES` | JSON 请求体大小上限 | `1048576` | 同上 |
 | `MB_PLAY_CACHE_MAX_BYTES` | play-ready 转码缓存上限，超限淘汰最旧文件 | `21474836480`（20 GiB） | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |
@@ -212,7 +213,7 @@ MB_DISK_PROFILE=nas MB_SCAN_WORKERS=1 MB_THUMB_COUNT=2 python3 media_browser.py
 | `/api/delete-trash/remove` | POST | 默认拒绝静默移出登记；返回恢复入口 |
 | `/api/delete-trash/clear` | POST | 默认拒绝；body/header 同时传 `PURGE` 才清空已隔离对象 |
 
-跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN`。
+跨域请求默认禁用。绑定非本机地址时必须配置 `MB_ACCESS_TOKEN` 或 `MB_AUTH_USERNAME` + `MB_AUTH_PASSWORD`；两者都为空时应用拒绝启动。
 
 ---
 

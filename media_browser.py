@@ -12,8 +12,9 @@ Media Browser - 本地外置硬盘视频/图片流式扫描浏览器
   MB_ROOT_DIR  扫描根目录（脚本默认 /Volumes/Untitled/pri；打包 app 默认 ~/Documents/MediaBrowser）。页眉可改路径并点「应用并扫描」
   MB_CACHE_DIR 缩略图/播放转码/审阅账本等缓存目录
   MB_PORT      端口（默认 8765）
-  MB_HOST      监听地址（默认 127.0.0.1；局域网访问可设 0.0.0.0，并须设置 MB_ACCESS_TOKEN）
-  MB_ACCESS_TOKEN 局域网访问令牌；绑定非本机地址时必填
+  MB_HOST      监听地址（默认 127.0.0.1；局域网访问可设 0.0.0.0，并须配置访问令牌或账号密码）
+  MB_ACCESS_TOKEN 局域网访问令牌；绑定非本机地址时须与账号密码二选一
+  MB_AUTH_USERNAME / MB_AUTH_PASSWORD HTTP Basic 账号密码；兼容 NAS 现有登录习惯
   MB_MAX_BODY_BYTES JSON 请求体上限字节数（默认 1048576）
   MB_AUTO_OPEN 是否启动后自动打开浏览器（打包默认为是；脚本默认为否，设为 1 可开启）
   MB_SCAN_WORKERS   同时处理「作品」任务的线程数（默认 2；机械盘/NAS 建议 1～2）
@@ -38,6 +39,7 @@ import sys
 import json
 import hashlib
 import logging
+import base64
 import threading
 import subprocess
 import time
@@ -183,6 +185,14 @@ if not (os.environ.get("MB_ROOT_DIR") or "").strip():
 HOST = os.environ.get("MB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MB_PORT", "8765"))
 ACCESS_TOKEN = (os.environ.get("MB_ACCESS_TOKEN") or "").strip()
+AUTH_USERNAME = (
+    os.environ.get("MB_AUTH_USERNAME")
+    or os.environ.get("MB_BASIC_AUTH_USERNAME")
+    or ""
+).strip()
+AUTH_PASSWORD = os.environ.get("MB_AUTH_PASSWORD") or os.environ.get(
+    "MB_BASIC_AUTH_PASSWORD"
+)
 MAX_BODY_BYTES = _int_env("MB_MAX_BODY_BYTES", 1024 * 1024, 1024, 16 * 1024 * 1024)
 PLAY_CACHE_MAX_BYTES = _int_env(
     "MB_PLAY_CACHE_MAX_BYTES",
@@ -484,8 +494,31 @@ def _host_requires_access_token(host: str | None = None) -> bool:
     return value not in ("127.0.0.1", "localhost", "::1")
 
 
+def _basic_auth_configured() -> bool:
+    return bool(AUTH_USERNAME) and bool(AUTH_PASSWORD)
+
+
 def _access_token_required() -> bool:
     return bool(ACCESS_TOKEN) or _host_requires_access_token()
+
+
+def _auth_startup_error(
+    *,
+    host: str | None = None,
+    token: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> str | None:
+    current_token = ACCESS_TOKEN if token is None else token
+    current_username = AUTH_USERNAME if username is None else username
+    current_password = AUTH_PASSWORD if password is None else password
+    has_basic = bool(current_username) and bool(current_password)
+    if _host_requires_access_token(host) and not current_token and not has_basic:
+        return (
+            "MB_ACCESS_TOKEN or MB_AUTH_USERNAME/MB_AUTH_PASSWORD is required "
+            "when MB_HOST is not localhost/127.0.0.1/::1"
+        )
+    return None
 
 
 def _prune_walk_dirs(dirs: list[str], current_root: str, scan_root: str, seen: set[str]) -> None:
@@ -4563,9 +4596,20 @@ class Handler(BaseHTTPRequestHandler):
     def _is_authorized(self) -> bool:
         if not _access_token_required():
             return True
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic ") and _basic_auth_configured():
+            try:
+                decoded = base64.b64decode(auth[6:].strip(), validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return False
+            username, separator, password = decoded.partition(":")
+            if not separator:
+                return False
+            return secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(
+                password, AUTH_PASSWORD or ""
+            )
         if not ACCESS_TOKEN:
             return False
-        auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], ACCESS_TOKEN):
             return True
         cookie = self.headers.get("Cookie", "")
@@ -4582,7 +4626,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def _host_header_allowed(self) -> bool:
-        if _access_token_required() and ACCESS_TOKEN:
+        if _access_token_required() and (ACCESS_TOKEN or _basic_auth_configured()):
             return True
         try:
             hostname = urlparse("//" + self.headers.get("Host", "")).hostname or ""
@@ -4607,7 +4651,16 @@ class Handler(BaseHTTPRequestHandler):
     def _require_authorized(self) -> bool:
         if self._is_authorized():
             return True
-        self._send_json({"ok": False, "error": "access token required"}, 401)
+        extra_headers = None
+        if _basic_auth_configured():
+            extra_headers = {
+                "WWW-Authenticate": 'Basic realm="Media Browser", charset="UTF-8"'
+            }
+        self._send_json(
+            {"ok": False, "error": "access token required"},
+            401,
+            extra_headers=extra_headers,
+        )
         return False
 
     def _body_too_large(self) -> bool:
@@ -4711,9 +4764,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _send_json(self, data, code=200, no_store=False):
+    def _send_json(self, data, code=200, no_store=False, extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if extra_headers:
+            for name, value in extra_headers.items():
+                self.send_header(name, value)
         if no_store:
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Pragma", "no-cache")
@@ -5457,10 +5513,9 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     global _http_server
-    if _host_requires_access_token() and not ACCESS_TOKEN:
-        raise SystemExit(
-            "MB_ACCESS_TOKEN is required when MB_HOST is not localhost/127.0.0.1/::1"
-        )
+    auth_error = _auth_startup_error()
+    if auth_error:
+        raise SystemExit(auth_error)
     _apply_perf_profile_for_scan_root(get_scan_root())
     auto_open = os.environ.get(
         "MB_AUTO_OPEN",
@@ -5488,7 +5543,10 @@ def main():
         )
     logger.info("监听 %s:%s（本机访问 http://localhost:%s）", HOST, PORT, PORT)
     if _access_token_required():
-        logger.info("访问令牌已启用；首次访问使用 /?token=<MB_ACCESS_TOKEN>")
+        if ACCESS_TOKEN:
+            logger.info("访问令牌已启用；首次访问使用 /?token=<MB_ACCESS_TOKEN>")
+        else:
+            logger.info("账号密码认证已启用；浏览器会使用 HTTP Basic 登录")
     logger.info("浏览器页眉可点「退出应用」停止服务")
     _oh, _om, _of, _ot = _ollama_config()
     logger.info(
