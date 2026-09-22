@@ -88,7 +88,7 @@ docker compose up -d --build
 | `MB_PORT` | HTTP 端口 | `8765` | 同上 |
 | `MB_HOST` | 监听地址；非本机地址必须同时配置令牌或账号密码 | `127.0.0.1` | 同上 |
 | `MB_ACCESS_TOKEN` | 局域网访问令牌；首次浏览器访问用 `/?token=...`，API 可用 Bearer Token | 未设置 | 同上 |
-| `MB_AUTH_USERNAME` / `MB_AUTH_PASSWORD` | HTTP Basic 账号密码；与访问令牌二选一，用于兼容 NAS 现有登录习惯。`MB_BASIC_AUTH_USERNAME` / `MB_BASIC_AUTH_PASSWORD` 是兼容别名 | 未设置 | 同上 |
+| `MB_AUTH_USERNAME` / `MB_AUTH_PASSWORD` | HTTP Basic 账号密码；与访问令牌二选一，用于兼容 NAS 现有登录习惯。`MB_AUTH_USER` 与 `MB_BASIC_AUTH_USERNAME` / `MB_BASIC_AUTH_PASSWORD` 是兼容别名 | 未设置 | 同上 |
 | `MB_MAX_BODY_BYTES` | JSON 请求体大小上限 | `1048576` | 同上 |
 | `MB_PLAY_CACHE_MAX_BYTES` | play-ready 转码缓存上限，超限淘汰最旧文件 | `21474836480`（20 GiB） | 同上 |
 | `MB_AUTO_OPEN` | 启动后是否自动打开浏览器 | `0`（否） | `1`（是）；脚本也可设为 `1` |

@@ -10,6 +10,9 @@ import urllib.request
 import http.cookiejar
 import base64
 import time
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -92,6 +95,66 @@ def test_non_local_host_accepts_original_basic_account(monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_basic_auth_accepts_mobile_browser_homepage(monkeypatch):
+    monkeypatch.setattr(mb, "HOST", "0.0.0.0")
+    monkeypatch.setattr(mb, "ACCESS_TOKEN", "")
+    monkeypatch.setattr(mb, "AUTH_USERNAME", "nas-user")
+    monkeypatch.setattr(mb, "AUTH_PASSWORD", "original-password")
+    srv = _serve()
+    try:
+        base_url = f"http://127.0.0.1:{srv.server_address[1]}/"
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(base_url, timeout=10)
+        assert missing.value.code == 401
+        assert missing.value.headers.get("WWW-Authenticate", "").startswith("Basic ")
+
+        req = urllib.request.Request(
+            base_url,
+            headers={
+                "Authorization": _basic_header("nas-user", "original-password"),
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+                ),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+            body = resp.read().decode("utf-8")
+        assert "<title>Media Browser v" in body
+        assert 'name="viewport"' in body
+        assert "matchMedia('(max-width: 767px)')" in body
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_legacy_nas_auth_environment_aliases_are_supported():
+    env = os.environ.copy()
+    env.update(
+        {
+            "MB_AUTH_USERNAME": "",
+            "MB_BASIC_AUTH_USERNAME": "",
+            "MB_AUTH_USER": "legacy-nas-user",
+            "MB_AUTH_PASSWORD": "legacy-original-password",
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import media_browser as mb; print(mb.AUTH_USERNAME); print(mb.AUTH_PASSWORD)",
+        ],
+        env=env,
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.stdout.splitlines() == ["legacy-nas-user", "legacy-original-password"]
 
 
 def test_non_local_startup_requires_token_or_complete_basic_auth(monkeypatch):

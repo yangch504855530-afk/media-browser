@@ -57,6 +57,8 @@ services:
       # 兼容 NAS 现有账号/密码登录时，设置下面两项，不再要求 MB_ACCESS_TOKEN。
       MB_ACCESS_TOKEN: "${MB_ACCESS_TOKEN:-}"
       MB_AUTH_USERNAME: "${MB_AUTH_USERNAME:-}"
+      # MB_AUTH_USER 是既有 NAS 部署的兼容变量名；新配置推荐 MB_AUTH_USERNAME。
+      MB_AUTH_USER: "${MB_AUTH_USER:-}"
       MB_AUTH_PASSWORD: "${MB_AUTH_PASSWORD:-}"
       MB_PORT: "8765"
       # 机械盘 / 大库：保守并发与条带帧数（可按观察再调大）

@@ -187,6 +187,7 @@ PORT = int(os.environ.get("MB_PORT", "8765"))
 ACCESS_TOKEN = (os.environ.get("MB_ACCESS_TOKEN") or "").strip()
 AUTH_USERNAME = (
     os.environ.get("MB_AUTH_USERNAME")
+    or os.environ.get("MB_AUTH_USER")
     or os.environ.get("MB_BASIC_AUTH_USERNAME")
     or ""
 ).strip()
