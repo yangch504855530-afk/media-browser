@@ -76,13 +76,24 @@ def clear(mb, kind, token):
     return {'ok':True,'removed':removed,'freed':freed,'skipped':skipped,'snapshot':snapshot(mb)}
 
 def clear_orphans(mb):
-    if not getattr(mb.scanner, 'done', True):
+    if hasattr(mb, 'scanner') and mb.scanner and not getattr(mb.scanner, 'done', True):
         raise ValueError('正在扫描，请等待完成后再清理孤儿缓存')
-    
+
+    lm = getattr(mb, '_library_manager', None)
+    if lm and hasattr(lm, 'get_active_background_scans') and lm.get_active_background_scans():
+        raise ValueError('后台正在扫描其他媒体库，请等待完成后再清理孤儿缓存')
+
     valid_thumb_hashes = set()
     valid_play_keys = set()
-    
-    for work in mb.get_all_works():
+
+    works = mb.get_all_works() if hasattr(mb, 'get_all_works') else []
+    if not works and hasattr(mb, 'scanner') and mb.scanner and getattr(mb.scanner, 'works', None):
+        works = list(mb.scanner.works)
+
+    if not works:
+        return {'ok': True, 'removed': 0, 'freed': 0, 'skipped': 0, 'snapshot': snapshot(mb), 'message': '未检测到媒体库作品，跳过清理以保护缓存'}
+
+    for work in works:
         for item in work.get("items", []):
             path = item.get("path")
             if not path or not isinstance(path, str):
@@ -91,7 +102,7 @@ def clear_orphans(mb):
             if item.get("type") == "video":
                 try:
                     valid_play_keys.add(mb._play_cache_key(path))
-                except OSError:
+                except (OSError, Exception):
                     pass
                     
     root = os.path.abspath(mb.CACHE_DIR)

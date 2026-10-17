@@ -108,6 +108,17 @@ header .mb-cache-status {
     font-size: 11px;
     min-width: 90px;
 }
+header #logoutBtn {
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(134, 134, 139, 0.45);
+    background: rgba(134, 134, 139, 0.12);
+    color: #a1a1a6;
+    cursor: pointer;
+    white-space: nowrap;
+}
+header #logoutBtn:hover { background: rgba(134, 134, 139, 0.22); color: #fff; }
 header #exitApp {
     font-size: 12px;
     padding: 6px 12px;
@@ -618,6 +629,14 @@ header select:focus { outline: none; border-color: #0a84ff; }
     background: #0a0a0a;
     border-radius: 4px;
     overflow: hidden;
+    transition: opacity 0.2s ease;
+}
+.video-row-dim, .image-row.video-row-dim {
+    opacity: 0.35;
+    filter: grayscale(0.4);
+}
+.file-item.not-filter-match {
+    opacity: 0.4;
 }
 .video-row .video-info {
     width: 120px;
@@ -1364,6 +1383,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
     header #sortSelect,
     header .filters,
     header #resetAllReviewTags,
+    header #logoutBtn,
     header #exitApp { display: none !important; }
     header #mbTrashBtn { margin-left: auto; font-size: 12px; padding: 6px 10px; }
     .mb-mobile-bar {
@@ -1488,16 +1508,22 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
         <button data-filter="deleted" title="已标记、尚未永久删除的作品">待删除</button>
         <button data-filter="invalid" title="包含无法读取或时长过短视频的作品">疑似无效</button>
+        <button data-filter="star5" title="包含 5 星评价视频的作品">5星 ★5</button>
+        <button data-filter="star4" title="包含 4 星评价视频的作品">4星 ★4</button>
+        <button data-filter="star3" title="包含 3 星评价视频的作品">3星 ★3</button>
+        <button data-filter="star2" title="包含 2 星评价视频的作品">2星 ★2</button>
+        <button data-filter="star1" title="包含 1 星评价视频的作品">1星 ★1</button>
     </div>
     <span class="folder-nav-hint" title="「视频审阅」页、焦点不在输入框内；画廊打开时切作品；Windows 为 Ctrl+← / Ctrl+→">作品：<kbd>⌘←</kbd> 上一个 · <kbd>⌘→</kbd> 下一个（画廊内切作品；列表内滚卡片）</span>
     <button type="button" id="resetAllReviewTags" class="review-reset-all" title="将所有作品的待审/保留标记清空为「待审」">标记全重置</button>
     <button type="button" id="mbDeleteMarkedBtn" class="mb-trash-btn" title="统一永久删除已标记为待删除的视频，不影响同文件夹其它媒体">永久删除待删除视频</button>
-    <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="删除失败时暂存于此，便于对指定文件再次删除">废纸篓 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
+    <button type="button" id="mbTrashBtn" class="mb-trash-btn" data-empty="1" title="仅记录因权限、磁盘只读或文件占用导致删除失败的异常文件，可在此重试">删除失败重试 <span id="mbTrashCount" class="mb-trash-badge">0</span></button>
+    <button type="button" id="logoutBtn" title="退出当前登录账号并返回登录页">退出登录</button>
     <button type="button" id="exitApp" title="停止本地服务并退出 Media Browser（终端模式将返回提示符）">退出应用</button>
     <div id="mbMobileBar" class="mb-mobile-bar" aria-hidden="true">
         <button type="button" id="mbMobileSearchBtn" title="搜索">搜索</button>
         <button type="button" id="mbMobileFilterBtn">筛选</button>
-        <button type="button" id="mbMobileTrashBtn">废纸篓</button>
+        <button type="button" id="mbMobileTrashBtn" title="删除失败重试队列">失败重试</button>
         <span id="mbMobileStatus" class="mb-mobile-status"></span>
     </div>
 </header>
@@ -1525,6 +1551,11 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <button data-filter="kept" title="即卡片上标记为「保留」的作品">已审阅</button>
             <button data-filter="deleted">待删除</button>
             <button data-filter="invalid">疑似无效</button>
+            <button data-filter="star5">5星</button>
+            <button data-filter="star4">4星</button>
+            <button data-filter="star3">3星</button>
+            <button data-filter="star2">2星</button>
+            <button data-filter="star1">1星</button>
         </div>
     <div class="filters" style="margin-top: 8px;">
         <select id="mobAdvRegion" onchange="applyAdvancedFilters()" style="background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 4px 8px;">
@@ -1554,6 +1585,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         </div>
         <div class="mb-mobile-drawer-actions">
             <button type="button" id="mbDrawerResetReview">标记全重置</button>
+            <button type="button" id="mbDrawerLogout">退出登录</button>
             <button type="button" id="mbDrawerExit">退出应用</button>
         </div>
     </div>
@@ -1696,16 +1728,17 @@ body.batch-open #backToTop.show { bottom: 118px; }
     <button class="primary" onclick="batchMarkReview('kept')">标为保留</button>
     <button onclick="batchMarkReview('pending')">标为待审</button>
     <button onclick="batchMarkReview('deleted')">标为待删除</button>
+    <button class="danger" style="background:#5a2020;border-color:#7a2828;color:#ff8888;" onclick="batchDeleteSelectedWorks()">批量删除所选作品</button>
     <button onclick="batchOpenFinder()">在 Finder 中打开</button>
 </div>
 
 <div id="mbTrashOverlay" class="mb-trash-overlay" aria-hidden="true">
     <div class="mb-trash-panel" role="dialog" aria-labelledby="mbTrashTitle">
         <div class="mb-trash-head">
-            <h2 id="mbTrashTitle">废纸篓（待删文件）</h2>
+            <h2 id="mbTrashTitle">删除失败重试队列</h2>
             <button type="button" id="mbTrashClose" aria-label="关闭">&times;</button>
         </div>
-        <p class="mb-trash-desc">以下路径曾因权限、磁盘只读、文件被占用等原因<strong>删除失败</strong>，已自动记入本队列。你要做的仍是<strong>删除这些指定文件</strong>：可勾选多项后点「删除所选」，或逐条点「删除此文件」，或在本机解除占用后点「全部再次删除」。若你已在访达中手动删掉文件，对应行会在刷新后自动消失；只有当你<strong>不想</strong>再尝试删除某条时，才用该行「移出队列」。</p>
+        <p class="mb-trash-desc">此处<strong>不是回收站</strong>，仅记录执行删除操作时因权限、磁盘只读、文件被占用等原因<strong>删除失败</strong>的异常文件。正常标记删除的视频请使用页面上方「永久删除待删除视频」。本队列用于排查失败原因并对指定文件重新执行删除。</p>
         <div class="mb-trash-toolbar">
             <label class="mb-trash-all-lbl"><input type="checkbox" id="mbTrashSelectAll" title="全选当前列表"> 全选</label>
             <button type="button" id="mbTrashDeleteSelected" disabled>删除所选</button>
@@ -1728,7 +1761,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
             <div class="modal-nav next" onclick="navigate(1)">&#10095;</div>
             <div id="modalMedia"></div>
             <div class="file-info" id="modalFileInfo"></div>
-            <div class="shortcut-hint" id="shortcutHint">数字键 0 待删除、1–5 保留评分 · ← → 翻页 · ESC 关闭 · 空格 播放/暂停 · Ctrl+I 删当前</div>
+            <div class="shortcut-hint" id="shortcutHint">数字键 0 待删除、1–5 保留评分 · ← → 翻页 · ESC 关闭 · 空格 播放/暂停 · Ctrl+I / Delete 删当前</div>
         </div>
         <div class="modal-sidebar" id="modalSidebar">
             <div class="modal-sidebar-top">
@@ -1745,7 +1778,7 @@ body.batch-open #backToTop.show { bottom: 118px; }
         <button type="button" id="mbGalPrev" title="上一个">◀</button>
         <button type="button" id="mbGalReview" class="mb-primary" title="保留并进入下一视频">保留</button>
         <button type="button" id="mbGalPending" title="待定并进入下一作品（2）">待定</button>
-        <button type="button" id="mbGalQueueDelete" class="mb-danger" title="加入待删除并进入下一作品（3）">待删除</button>
+        <button type="button" id="mbGalQueueDelete" class="mb-danger" title="加入待删除并进入下一视频（0）">待删除</button>
         <button type="button" id="mbGalDelete" class="mb-danger">删当前文件</button>
         <button type="button" id="mbGalDeleteWork" class="mb-danger">删作品</button>
         <button type="button" id="mbGalNext" title="下一个">▶</button>
@@ -1832,6 +1865,7 @@ let renderOffset = 0;
 
 let galleryState = { workId: null, itemIdx: 0 };
 let galleryVideoRenderToken = 0;
+let modalMediaClearTimer = null;
 let imageGridMode = false;
 let imageGridSize = Number(localStorage.getItem('mb_image_grid_size') || 4) === 6 ? 6 : 4;
 let sidebarOffset = 0;
@@ -2287,11 +2321,9 @@ function fallbackGalleryVideoToTranscode(filePath, videoEl, overlayEl, renderTok
         videoEl.removeAttribute('src');
         videoEl.load();
     } catch (e) {}
-    overlayEl.textContent = reason || '直连失败，启动按需切片...';
+    overlayEl.textContent = reason || '直连失败，启动转码播放...';
     overlayEl.style.display = 'flex';
-    prepareOnDemandVideo(filePath, videoEl, overlayEl, renderToken, function() {
-        showGalleryVideoError(overlayEl);
-    });
+    prepareGalleryVideo(filePath, videoEl, overlayEl, renderToken, true);
 }
 function watchDirectVideoFrames(item, videoEl, overlayEl, renderToken, onFallback) {
     if (!videoDirectPlayShouldBeWatched(item)) return;
@@ -2342,6 +2374,10 @@ window.insightRowThumbError = function(ev) {
     );
 };
 function getWorkReviewTag(workId) {
+    const workEntry = mbGetWorkReviewEntry(workId);
+    if (workEntry && ['kept', 'pending', 'deleted'].includes(workEntry.tag)) {
+        return workEntry.tag;
+    }
     const work = allWorks.find(function (w) { return w.id === workId; });
     const videos = work ? work.items.filter(function (it) { return it.type === 'video'; }) : [];
     if (!videos.length) return 'pending';
@@ -2357,6 +2393,22 @@ function mbGetVideoReviewEntry(item) {
 function getVideoReviewTag(item) {
     const entry = mbGetVideoReviewEntry(item) || {};
     return ['kept','pending','deleted'].includes(entry.tag) ? entry.tag : 'pending';
+}
+function itemMatchesFilter(it, ft) {
+    if (!ft || ft === 'all') return true;
+    if (ft === 'video') return it && it.type === 'video';
+    if (ft === 'image') return it && it.type === 'image';
+    if (!it || it.type !== 'video') return false;
+    if (ft === 'pending') return getVideoReviewTag(it) === 'pending';
+    if (ft === 'kept') return getVideoReviewTag(it) === 'kept';
+    if (ft === 'deleted') return getVideoReviewTag(it) === 'deleted';
+    if (ft === 'invalid') return Boolean(it.invalid_reason);
+    if (ft.startsWith('star')) {
+        const star = parseInt(ft.slice(4), 10);
+        const entry = mbGetVideoReviewEntry(it);
+        return entry && Number(entry.rating) === star;
+    }
+    return true;
 }
 async function mbPatchReviewVideo(item, patch) {
     if (!item || item.type !== 'video' || !item.asset_id) return false;
@@ -2402,8 +2454,15 @@ async function setCurrentVideoRating(rating) {
 function advanceToNextVideoAfterDecision() {
     const work = allWorks.find(function (w) { return w.id === galleryState.workId; });
     if (!work) return false;
+    const matchFilter = (it) => {
+        if (!it || it.type !== 'video') return false;
+        if (filterType !== 'all' && filterType !== 'video' && filterType !== 'image') {
+            return itemMatchesFilter(it, filterType);
+        }
+        return true;
+    };
     const nextVideoIdx = work.items.findIndex(function (it, idx) {
-        return idx > galleryState.itemIdx && it.type === 'video';
+        return idx > galleryState.itemIdx && matchFilter(it);
     });
     if (nextVideoIdx >= 0) {
         galleryState.itemIdx = nextVideoIdx;
@@ -2414,7 +2473,7 @@ function advanceToNextVideoAfterDecision() {
     const nav = galleryWorkNavListAndIndex();
     for (let wi = nav.wi + 1; wi >= 0 && wi < nav.list.length; wi++) {
         const nextWork = nav.list[wi];
-        const firstVideoIdx = nextWork.items.findIndex(function (it) { return it.type === 'video'; });
+        const firstVideoIdx = nextWork.items.findIndex(function (it) { return matchFilter(it); });
         if (firstVideoIdx >= 0) {
             openGallery(nextWork.id, firstVideoIdx, -1, { forceItemIdx: true });
             ensureWorkCardInDomAndScroll(nextWork.id);
@@ -3225,6 +3284,14 @@ async function batchMarkReview(state) {
     if (list.length === 0) return;
     for (const id of list) {
         await mbPatchReviewWork(id, { tag: state, update_global: false }, false);
+        const w = allWorks.find(x => x.id === id);
+        if (w && w.items) {
+            for (const it of w.items) {
+                if (it.type === 'video' && it.asset_id) {
+                    await mbPatchReviewVideo(it, { tag: state, update_global: false });
+                }
+            }
+        }
     }
     clearSelection();
     sortAndRenderAll();
@@ -3267,6 +3334,46 @@ async function batchOpenFinder() {
     }
 }
 
+async function batchDeleteSelectedWorks() {
+    const list = Array.from(selectedIds);
+    if (!list.length) {
+        alert('请先勾选需要删除的作品。');
+        return;
+    }
+    const worksToDelete = allWorks.filter(function (w) { return selectedIds.has(w.id); });
+    const totalFiles = worksToDelete.reduce(function (n, w) { return n + (w.items ? w.items.length : 0); }, 0);
+    if (!confirm('将永久删除已勾选的 ' + list.length + ' 个作品（共 ' + totalFiles + ' 个文件），不可恢复。确定？')) {
+        return;
+    }
+    closeModal();
+    let deletedWorks = 0;
+    let failedWorks = 0;
+    for (const w of worksToDelete) {
+        try {
+            const paths = (w.items || []).map(function (it) { return it.path; });
+            const res = await fetch('/api/works/delete-all', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                body: JSON.stringify({ work_path: w.path, paths: paths })
+            });
+            const data = await res.json();
+            if (data.ok) {
+                deletedWorks++;
+                const idx = allWorks.findIndex(function (x) { return x.id === w.id; });
+                if (idx >= 0) allWorks.splice(idx, 1);
+            } else {
+                failedWorks++;
+            }
+        } catch (e) {
+            failedWorks++;
+        }
+    }
+    clearSelection();
+    sortAndRenderAll();
+    alert('已删除 ' + deletedWorks + ' 个作品' + (failedWorks ? '；' + failedWorks + ' 个删除失败。' : '。'));
+    mbRefreshTrashBadge(true);
+}
+
 function workMatchesFilter(w, ft) {
     if (ft === 'all') return true;
     if (ft === 'video') return w.video_count > 0;
@@ -3281,6 +3388,14 @@ function workMatchesFilter(w, ft) {
     if (ft === 'kept') return getWorkReviewTag(w.id) === 'kept';
     if (ft === 'deleted') return getWorkReviewTag(w.id) === 'deleted';
     if (ft === 'invalid') return Number(w.invalid_count || 0) > 0;
+    if (ft && ft.startsWith('star')) {
+        const star = parseInt(ft.slice(4), 10);
+        return (w && w.items || []).some(function (it) {
+            if (it.type !== 'video') return false;
+            const entry = mbGetVideoReviewEntry(it);
+            return entry && Number(entry.rating) === star;
+        });
+    }
     return true;
 }
 function mbFilterReviewLabel() {
@@ -3288,6 +3403,11 @@ function mbFilterReviewLabel() {
     if (filterType === 'kept') return ' · 已审阅';
     if (filterType === 'deleted') return ' · 待删除';
     if (filterType === 'invalid') return ' · 疑似无效';
+    if (filterType === 'star5') return ' · 5星';
+    if (filterType === 'star4') return ' · 4星';
+    if (filterType === 'star3') return ' · 3星';
+    if (filterType === 'star2') return ' · 2星';
+    if (filterType === 'star1') return ' · 1星';
     return '';
 }
 function mbBuildWorksStatusText(listLen, narrowed) {
@@ -3306,9 +3426,21 @@ let advPeople = '';
 let advStar = '';
 
 function applyAdvancedFilters() {
-    advRegion = document.getElementById('advRegion') ? document.getElementById('advRegion').value : '';
-    advPeople = document.getElementById('advPeople') ? document.getElementById('advPeople').value : '';
-    advStar = document.getElementById('advStar') ? document.getElementById('advStar').value : '';
+    const regEl = document.getElementById('advRegion') || document.getElementById('mobAdvRegion');
+    const pplEl = document.getElementById('advPeople') || document.getElementById('mobAdvPeople');
+    const starEl = document.getElementById('advStar') || document.getElementById('mobAdvStar');
+    advRegion = regEl ? regEl.value : '';
+    advPeople = pplEl ? pplEl.value : '';
+    advStar = starEl ? starEl.value : '';
+    const dReg = document.getElementById('advRegion');
+    const mReg = document.getElementById('mobAdvRegion');
+    if (dReg && mReg) { if (dReg !== regEl) dReg.value = advRegion; if (mReg !== regEl) mReg.value = advRegion; }
+    const dPpl = document.getElementById('advPeople');
+    const mPpl = document.getElementById('mobAdvPeople');
+    if (dPpl && mPpl) { if (dPpl !== pplEl) dPpl.value = advPeople; if (mPpl !== pplEl) mPpl.value = advPeople; }
+    const dStar = document.getElementById('advStar');
+    const mStar = document.getElementById('mobAdvStar');
+    if (dStar && mStar) { if (dStar !== starEl) dStar.value = advStar; if (mStar !== starEl) mStar.value = advStar; }
     sortAndRenderAll();
 }
 
@@ -3591,11 +3723,17 @@ function createWorkCard(work, virtualIndex) {
     div.appendChild(chk);
 
     let contentHtml = '<div class="work-content">';
+    const isSpecialFilter = filterType !== 'all' && filterType !== 'video' && filterType !== 'image';
+    const firstMatchIdx = isSpecialFilter ? work.items.findIndex(it => itemMatchesFilter(it, filterType)) : -1;
+    const defaultOpenIdx = firstMatchIdx >= 0 ? firstMatchIdx : 0;
+
     for (let i = 0; i < work.items.length; i++) {
         const it = work.items[i];
+        const isMatch = itemMatchesFilter(it, filterType);
+        const dimClass = (!isMatch && isSpecialFilter) ? ' video-row-dim' : '';
         if (it.type === 'video') {
             const dur = it.duration ? fmtDuration(it.duration) : '';
-            contentHtml += `<div class="video-row">`;
+            contentHtml += `<div class="video-row${dimClass}">`;
             contentHtml += `<div class="video-info">
                 <div class="vname">${escapeHtml(it.name)}</div>
                 <div class="vdur">▶ ${dur} · ${fmtSize(it.size)}</div>
@@ -3620,7 +3758,7 @@ function createWorkCard(work, virtualIndex) {
             const lazyAttr = url
                 ? ` class="mb-lazy" data-src="${url.replace(/"/g, '&quot;')}" src="${MB_LAZY_PLACEHOLDER}"`
                 : ` src=""`;
-            contentHtml += `<div class="image-row" data-item-idx="${i}">
+            contentHtml += `<div class="image-row${dimClass}" data-item-idx="${i}">
                 <img${lazyAttr} alt="" draggable="false" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.opacity='0.3';">
             </div>`;
         }
@@ -3636,7 +3774,7 @@ function createWorkCard(work, virtualIndex) {
     info.className = 'info';
     const reviewTop = buildReviewStripHtml(work.id, work);
     info.innerHTML = reviewTop + `<div class="title-row">
-        <div class="title" title="${title}" onclick="event.stopPropagation(); openGallery(${JSON.stringify(work.id)}, 0, -1)">${title}</div>
+        <div class="title" title="${title}" onclick="event.stopPropagation(); openGallery(${JSON.stringify(work.id)}, ${defaultOpenIdx}, -1)">${title}</div>
     </div>
     <div class="meta">${meta}</div>`;
 
@@ -3665,7 +3803,7 @@ function createWorkCard(work, virtualIndex) {
 
     div.addEventListener('click', (e) => {
         if (e.target.closest('.chk') || e.target.closest('.title') || e.target.closest('.thumb') || e.target.closest('.image-row') || e.target.closest('.review-strip')) return;
-        openGallery(work.id, 0, -1);
+        openGallery(work.id, defaultOpenIdx, -1);
     });
 
     attachCardLongPress(div, work);
@@ -3981,23 +4119,46 @@ async function poll() {
                 statusEl.textContent = '扫描中… ' + data.scanned + '/' + data.total;
             }
         }
+        if (data.background_scan) {
+            const bg = data.background_scan;
+            const bgText = ' ｜ 后台更新中: ' + (bg.label || bg.path) + ' (' + bg.scanned + '/' + bg.total + ')';
+            statusEl.textContent += bgText;
+        }
+        mbSyncMobileStatusText();
     } catch (e) {
         if (myGen === pollGen) statusEl.textContent = '连接中断，重试中...';
     }
-    if (!scanPollDone && myGen === pollGen) {
-        setTimeout(poll, 1500);
+    const keepPolling = !scanPollDone || !!(data && data.background_scan);
+    if (keepPolling && myGen === pollGen) {
+        setTimeout(poll, scanPollDone ? 3000 : 1500);
     }
 }
 
 function openGallery(workId, itemIdx, thumbIdx, opts) {
+    if (modalMediaClearTimer) {
+        clearTimeout(modalMediaClearTimer);
+        modalMediaClearTimer = null;
+    }
     const work = allWorks.find(w => w.id === workId);
     if (!work || !work.items.length) return;
     mbLastGalleryWorkId = workId;
     let resolvedIdx = itemIdx;
     if (!(opts && opts.forceItemIdx) && itemIdx === 0 && (thumbIdx === -1 || thumbIdx === undefined)) {
-        const ent = mbGetWorkReviewEntry(workId);
-        if (ent && (ent.last_item_path || ent.last_item_idx != null)) {
-            resolvedIdx = mbResolveItemIndex(work, ent.last_item_path, ent.last_item_idx);
+        if (filterType !== 'all' && filterType !== 'video' && filterType !== 'image') {
+            const firstMatch = work.items.findIndex(it => itemMatchesFilter(it, filterType));
+            if (firstMatch >= 0) {
+                resolvedIdx = firstMatch;
+            } else {
+                const ent = mbGetWorkReviewEntry(workId);
+                if (ent && (ent.last_item_path || ent.last_item_idx != null)) {
+                    resolvedIdx = mbResolveItemIndex(work, ent.last_item_path, ent.last_item_idx);
+                }
+            }
+        } else {
+            const ent = mbGetWorkReviewEntry(workId);
+            if (ent && (ent.last_item_path || ent.last_item_idx != null)) {
+                resolvedIdx = mbResolveItemIndex(work, ent.last_item_path, ent.last_item_idx);
+            }
         }
     }
     galleryState = {
@@ -4151,10 +4312,12 @@ function renderSidebar(fileList, work, currentItem) {
         const globalIdx = sidebarOffset + i;
         const it = slice[i];
         const active = globalIdx === galleryState.itemIdx ? 'active' : '';
+        const isMatch = itemMatchesFilter(it, filterType);
+        const matchClass = (!isMatch && filterType !== 'all' && filterType !== 'video' && filterType !== 'image') ? ' not-filter-match' : '';
         const thumbUrl = it.thumb ? buildThumbUrl(it.thumb) : '';
         const dur2 = it.duration ? fmtDuration(it.duration) : (it.type === 'video' ? '' : '图片');
         const onclk = `jumpToItem(${globalIdx})`;
-        html += `<div class="file-item ${active}" onclick="${onclk}">
+        html += `<div class="file-item ${active}${matchClass}" onclick="${onclk}">
             <div class="thumb-wrap">
                 <img src="${thumbUrl}" onload="this.classList.add('loaded')" onerror="this.classList.add('loaded'); this.style.display='none'; this.nextElementSibling.style.display='flex';">
                 <div class="ph">${it.type==='video'?'▶':'🖼'}</div>
@@ -4411,7 +4574,16 @@ function closeModal() {
         document.exitFullscreen().catch(() => {});
     }
     modal.classList.remove('active');
-    setTimeout(() => { document.getElementById('modalMedia').innerHTML = ''; }, 250);
+    if (modalMediaClearTimer) {
+        clearTimeout(modalMediaClearTimer);
+    }
+    modalMediaClearTimer = setTimeout(() => {
+        const m = document.getElementById('modal');
+        if (!m || !m.classList.contains('active')) {
+            document.getElementById('modalMedia').innerHTML = '';
+        }
+        modalMediaClearTimer = null;
+    }, 250);
     document.body.style.overflow = '';
     document.body.classList.remove('mb-gallery-open');
     if (mbMobile && mobileTabbar) {
@@ -4741,6 +4913,16 @@ document.addEventListener('keydown', (e) => {
         deleteCurrentItem(true);
         return;
     }
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        deleteCurrentItem(true);
+        return;
+    }
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        deleteCurrentWork(true);
+        return;
+    }
     // ⌘/Ctrl + 左右：切换作品（不进视频快进/图片翻张）
     if ((e.metaKey || e.ctrlKey) && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
         e.preventDefault();
@@ -4751,12 +4933,12 @@ document.addEventListener('keydown', (e) => {
 
     // 视频播放控制
     if (v) {
-        if (e.key === ' ' || e.key === 'k' || e.key === 'K') {
+        if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === ' ' || e.key === 'k' || e.key === 'K')) {
             e.preventDefault();
             v.paused ? v.play() : v.pause();
             return;
         }
-        if (e.key === 'f' || e.key === 'F') {
+        if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'f' || e.key === 'F')) {
             e.preventDefault();
             if (document.fullscreenElement) {
                 document.exitFullscreen();
@@ -4765,7 +4947,7 @@ document.addEventListener('keydown', (e) => {
             }
             return;
         }
-        if (e.key === 'm' || e.key === 'M') {
+        if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'm' || e.key === 'M')) {
             e.preventDefault();
             v.muted = !v.muted;
             return;
@@ -4791,12 +4973,12 @@ document.addEventListener('keydown', (e) => {
             else { e.preventDefault(); v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 5); }
             return;
         }
-        if (e.key === 'j' || e.key === 'J') {
+        if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'j' || e.key === 'J')) {
             e.preventDefault();
             v.currentTime = Math.max(0, v.currentTime - 10);
             return;
         }
-        if (e.key === 'l' || e.key === 'L') {
+        if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'l' || e.key === 'L')) {
             e.preventDefault();
             v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 10);
             return;
@@ -5175,7 +5357,7 @@ async function mbApplyCacheDirSwitch() {
     const exitAppBtn = document.getElementById('exitApp');
     if (exitAppBtn) {
         exitAppBtn.addEventListener('click', async () => {
-            if (!confirm('确定退出 Media Browser？\\n将停止扫描并关闭本地服务（打包版会退出整个应用）。')) return;
+            if (!confirm('确定退出 Media Browser？\n将停止扫描并关闭本地服务（打包版会退出整个应用）。')) return;
             try {
                 await fetch('/api/shutdown', {
                     method: 'POST',
@@ -5184,6 +5366,22 @@ async function mbApplyCacheDirSwitch() {
                 });
             } catch (e) {}
             alert('已退出。可关闭此标签页；若从终端启动，终端应已返回提示符。');
+        });
+    }
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', async () => {
+            if (!confirm('确定退出当前登录账号？')) return;
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+            } catch (e) {}
+            window.location.href = '/';
+        });
+    }
+    const mbDrawerLogout = document.getElementById('mbDrawerLogout');
+    if (mbDrawerLogout) {
+        mbDrawerLogout.addEventListener('click', () => {
+            document.getElementById('logoutBtn')?.click();
         });
     }
     if (applyScanRoot && scanRootInput) {

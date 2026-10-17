@@ -50,7 +50,7 @@ import uuid
 import base64
 import secrets
 import ipaddress
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse, unquote, quote
@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== 配置 =====================
 APP_VERSION = "2.5.3"
-MB_ENABLE_AI = int(os.environ.get("MB_ENABLE_AI", "1"))
+MB_ENABLE_AI = 1 if os.environ.get("MB_ENABLE_AI", "1").strip().lower() in ("1", "true", "yes", "on") else 0
 
 
 def _load_homepage_template() -> str:
@@ -71,6 +71,17 @@ def _load_homepage_template() -> str:
 
 
 HTML_PAGE = _load_homepage_template()
+
+
+def _load_login_page_template() -> str:
+    path = os.path.join(os.path.dirname(__file__), "templates", "login.html")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<html><body><h1>Media Browser Login</h1><form method='POST' action='/api/login'><input name='username'/><input type='password' name='password'/><button type='submit'>Login</button></form></body></html>"
+
+
+LOGIN_HTML_PAGE = _load_login_page_template()
 
 
 def _default_settings_dir() -> str:
@@ -182,6 +193,17 @@ if not (os.environ.get("MB_ROOT_DIR") or "").strip():
 HOST = os.environ.get("MB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MB_PORT", "8765"))
 ACCESS_TOKEN = (os.environ.get("MB_ACCESS_TOKEN") or "").strip()
+AUTH_USER = (os.environ.get("MB_AUTH_USER") or "").strip()
+AUTH_PASSWORD = (os.environ.get("MB_AUTH_PASSWORD") or "").strip()
+
+
+def _user_auth_configured() -> bool:
+    return bool(AUTH_USER and AUTH_PASSWORD)
+
+
+def _compute_auth_session_token(user: str, password: str) -> str:
+    return hashlib.sha256(f"mb_session:{user}:{password}".encode("utf-8")).hexdigest()
+
 MAX_BODY_BYTES = _int_env("MB_MAX_BODY_BYTES", 1024 * 1024, 1024, 16 * 1024 * 1024)
 PLAY_CACHE_MAX_BYTES = _int_env(
     "MB_PLAY_CACHE_MAX_BYTES",
@@ -439,16 +461,32 @@ def video_should_use_play_endpoint(path: str, mobile: bool = False, codec=None) 
     return False
 
 
-def is_path_under_root(path: str) -> bool:
-    """解析后的路径必须位于当前扫描根目录之下（含根目录本身），用于限制 /file、/open、删除。"""
+def is_path_under_root(path: str, scan_root: str | None = None) -> bool:
+    """解析后的路径必须位于扫描根目录之下（含根目录本身），用于限制 /file、/open、删除。"""
     try:
-        root = os.path.realpath(get_scan_root())
         target = os.path.realpath(path)
     except OSError:
         return False
-    if target == root:
+
+    def _matches(base: str) -> bool:
+        try:
+            b = os.path.realpath(base)
+        except OSError:
+            return False
+        if target == b:
+            return True
+        base_sep = b if b.endswith(os.sep) else b + os.sep
+        return target.startswith(base_sep)
+
+    if scan_root:
+        return _matches(scan_root)
+    if _matches(get_scan_root()):
         return True
-    return target.startswith(root + os.sep)
+    if "get_scan_presets" in globals() and scan_presets_enabled():
+        for item in get_scan_presets():
+            if _matches(item.get("path", "")):
+                return True
+    return False
 
 
 def _host_requires_access_token(host: str | None = None) -> bool:
@@ -457,7 +495,7 @@ def _host_requires_access_token(host: str | None = None) -> bool:
 
 
 def _access_token_required() -> bool:
-    return bool(ACCESS_TOKEN) or _host_requires_access_token()
+    return bool(ACCESS_TOKEN) or _user_auth_configured() or _host_requires_access_token()
 
 
 def _prune_walk_dirs(dirs: list[str], current_root: str, scan_root: str, seen: set[str]) -> None:
@@ -1059,7 +1097,7 @@ def _review_state_store_path(scan_root: str | None = None) -> str:
 
 
 
-_library_index_cache = {}
+_library_indices: dict[str, dict] = {}
 _library_index_lock = threading.Lock()
 
 def _library_index_store_path(scan_root: str | None = None) -> str:
@@ -1070,31 +1108,57 @@ def _library_index_store_path(scan_root: str | None = None) -> str:
     return os.path.join(library_dir, f"library_index_{key}.json")
 
 def load_library_index(scan_root: str | None = None) -> dict:
-    global _library_index_cache
-    path = _library_index_store_path(scan_root)
+    root = os.path.realpath(scan_root or get_scan_root())
+    path = _library_index_store_path(root)
     with _library_index_lock:
         if not os.path.isfile(path):
-            _library_index_cache = {}
-            return _library_index_cache
+            _library_indices[root] = {}
+            return _library_indices[root]
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-                _library_index_cache = data if isinstance(data, dict) else {}
+                _library_indices[root] = data if isinstance(data, dict) else {}
         except Exception:
-            _library_index_cache = {}
-        return _library_index_cache
+            _library_indices[root] = {}
+        return _library_indices[root]
+
+def get_library_index(scan_root: str | None = None) -> dict:
+    root = os.path.realpath(scan_root or get_scan_root())
+    with _library_index_lock:
+        if root in _library_indices:
+            return _library_indices[root]
+    return load_library_index(root)
 
 def save_library_index(scan_root: str | None = None) -> None:
-    global _library_index_cache
-    path = _library_index_store_path(scan_root)
+    root = os.path.realpath(scan_root or get_scan_root())
+    path = _library_index_store_path(root)
     with _library_index_lock:
+        data = _library_indices.get(root, {})
         part = path + ".part"
         try:
             with open(part, "w", encoding="utf-8") as f:
-                json.dump(_library_index_cache, f, ensure_ascii=False)
+                json.dump(data, f, ensure_ascii=False)
             os.replace(part, path)
         except Exception as e:
-            logger.warning("Failed to save library index: %s", e)
+            logger.warning("Failed to save library index for %s: %s", root, e)
+
+
+def get_all_works() -> list:
+    """Return all works cached across all known libraries/scan roots."""
+    with _library_index_lock:
+        works = []
+        seen = set()
+        for root, index in _library_indices.items():
+            for wid, w in index.items():
+                wp = w.get("path") or wid
+                if wp not in seen:
+                    seen.add(wp)
+                    works.append(w)
+        if not works:
+            s = globals().get("scanner")
+            if s and getattr(s, "works", None):
+                return list(s.works)
+        return works
 
 
 def empty_review_state(scan_root: str | None = None) -> dict:
@@ -1764,10 +1828,13 @@ def _delete_trash_prune_unlocked(items: list) -> list:
             continue
         try:
             if not os.path.isfile(path):
-                continue
+                parent = os.path.dirname(path)
+                if os.path.isdir(parent):
+                    continue
             if not is_path_under_root(path):
                 continue
         except OSError:
+            out.append(it)
             continue
         out.append(it)
     return out
@@ -2055,9 +2122,15 @@ def get_video_info(path: str) -> dict:
         if "format" in data:
             fmt = data["format"]
             if "duration" in fmt:
-                info["duration"] = float(fmt["duration"])
+                try:
+                    info["duration"] = float(fmt["duration"])
+                except (ValueError, TypeError):
+                    pass
             if "bit_rate" in fmt:
-                info["bitrate"] = int(fmt["bit_rate"])
+                try:
+                    info["bitrate"] = int(fmt["bit_rate"])
+                except (ValueError, TypeError):
+                    pass
         if "streams" in data and len(data["streams"]) > 0:
             s = data["streams"][0]
             info["width"] = s.get("width", 0)
@@ -2166,9 +2239,13 @@ def generate_video_thumb_single(video_path: str, video_info: dict = None) -> str
     info = video_info if video_info is not None else get_video_info(video_path)
     if not os.path.isfile(video_path):
         return ""
-    ss = "00:00:01"
-    if info["duration"] > 3:
-        ss = str(info["duration"] / 3)
+    dur = float(info.get("duration") or 0.0)
+    if dur > 3:
+        ss = str(round(dur / 3, 3))
+    elif dur > 0:
+        ss = str(round(max(0.0, min(1.0, dur * 0.5)), 3))
+    else:
+        ss = "0"
     hwaccel = _ffmpeg_thumb_hwaccel_args()
     cmd = [
         FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
@@ -2206,7 +2283,7 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
         return expected
 
     info = video_info if video_info is not None else get_video_info(video_path)
-    duration = info["duration"]
+    duration = float(info.get("duration") or 0.0)
 
     for i in range(count):
         if not os.path.isfile(video_path):
@@ -2216,9 +2293,11 @@ def generate_video_thumbs(video_path: str, count: int = None, video_info: dict =
             continue
 
         if duration and duration > 1:
-            ss = duration * (i + 1) / (count + 1)
+            ss = round(duration * (i + 1) / (count + 1), 3)
+        elif duration and duration > 0:
+            ss = round(max(0.0, min(duration - 0.05, duration * (i + 1) / (count + 1))), 3)
         else:
-            ss = 1
+            ss = 0.0
 
         hwaccel = _ffmpeg_thumb_hwaccel_args()
         cmd = [
@@ -2283,7 +2362,8 @@ def generate_image_thumb(image_path: str) -> str:
 
 # ===================== 扫描器 =====================
 class MediaScanner:
-    def __init__(self):
+    def __init__(self, root_dir: str | None = None):
+        self.root = os.path.realpath(os.path.abspath(root_dir)) if root_dir else os.path.realpath(get_scan_root())
         self.lock = threading.Lock()
         self.works = []
         self.pending_works = []
@@ -2314,14 +2394,17 @@ class MediaScanner:
         self.idle = False
         self.started = True
         self.done = False
-        load_library_index()
-        self._enumerate()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        load_library_index(self.root)
+        self.thread = threading.Thread(target=self._run_scan, daemon=True)
         self.thread.start()
+
+    def _run_scan(self):
+        self._enumerate()
+        self._run()
 
     def _enumerate_deep_fallback(self, candidates: list, root_flat: list) -> None:
         """一级目录未发现媒体时沿整棵树查找，安全跟随根内符号链接。"""
-        scan_root = os.path.realpath(get_scan_root())
+        scan_root = os.path.realpath(self.root)
         tops_found = set()
         seen = {os.path.normcase(scan_root)}
         try:
@@ -2334,7 +2417,7 @@ class MediaScanner:
                     if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
                         continue
                     fp = os.path.join(wroot, f)
-                    if not is_path_under_root(fp):
+                    if not is_path_under_root(fp, self.root):
                         continue
                     rel = os.path.relpath(fp, scan_root)
                     parts = rel.split(os.sep)
@@ -2356,9 +2439,9 @@ class MediaScanner:
         root_flat = []
         self.enum_error = None
         try:
-            for entry in os.scandir(get_scan_root()):
+            for entry in os.scandir(self.root):
                 if entry.is_file():
-                    if not is_path_under_root(entry.path):
+                    if not is_path_under_root(entry.path, self.root):
                         continue
                     ext = os.path.splitext(entry.name)[1].lower()
                     if ext in VIDEO_EXTS or ext in IMAGE_EXTS:
@@ -2368,7 +2451,7 @@ class MediaScanner:
                     continue
                 if entry.name in _SKIP_SCAN_SUBDIR_NAMES:
                     continue
-                if not is_path_under_root(entry.path):
+                if not is_path_under_root(entry.path, self.root):
                     continue
                 candidates.append(entry.path)
         except Exception as e:
@@ -2376,20 +2459,17 @@ class MediaScanner:
             self.enum_error = str(e)
         if not candidates and not root_flat:
             self._enumerate_deep_fallback(candidates, root_flat)
-            if candidates or root_flat:
-                logger.info(
-                    "深层兜底: 子文件夹 %s 个，根目录媒体文件 %s 个",
-                    len(candidates),
-                    len(root_flat),
-                )
+        if candidates or root_flat:
+            logger.info(
+                "[%s] 枚举完成: 子文件夹 %s 个，根目录媒体文件 %s 个",
+                self.root,
+                len(candidates),
+                len(root_flat),
+            )
         self._pending_root_files = sorted(root_flat)
         self.pending_works = sorted(candidates)
         extra = 1 if root_flat else 0
         self.total_dirs = len(self.pending_works) + extra
-        msg = f"[枚举完成] 子文件夹作品 {len(candidates)} 个"
-        if root_flat:
-            msg += f"，根目录平铺媒体 {len(root_flat)} 个（将单独显示为一个作品）"
-        logger.info(msg)
 
     def _run(self):
         futures = {}
@@ -2400,23 +2480,48 @@ class MediaScanner:
             fut = self._executor.submit(self._process_work, work_path)
             futures[fut] = work_path
 
+        scanned_works = []
+        last_index_save = 0.0
         for future in as_completed(futures):
             label = futures[future]
             try:
                 work = future.result(timeout=600)
                 if work:
                     with self.lock:
-                        self.works.append(work)
+                        scanned_works.append(work)
+                        self.works = list(scanned_works)
                 self.scanned_dirs += 1
-                save_library_index()
+                now = time.time()
+                if now - last_index_save >= 5.0:
+                    save_library_index(self.root)
+                    last_index_save = now
             except Exception as e:
-                logger.error("扫描错误 %s: %s", label, e)
+                logger.error("[%s] 扫描错误 %s: %s", self.root, label, e)
                 self.scanned_dirs += 1
-                save_library_index()
+                now = time.time()
+                if now - last_index_save >= 5.0:
+                    save_library_index(self.root)
+                    last_index_save = now
 
-        self.done = True
-        save_library_index()
-        logger.info("扫描完成")
+        with self.lock:
+            self.works = scanned_works
+            self.done = True
+
+        valid_keys = set()
+        for w in scanned_works:
+            if "id" in w:
+                valid_keys.add(w["id"])
+            wp = w.get("path")
+            if wp:
+                valid_keys.add(sha256_str(os.path.abspath(wp)))
+                valid_keys.add(sha256_str(os.path.abspath(wp) + "\n#root_flat"))
+        with _library_index_lock:
+            idx = _library_indices.get(self.root, {})
+            to_remove = [k for k in list(idx.keys()) if k not in valid_keys]
+            for k in to_remove:
+                del idx[k]
+        save_library_index(self.root)
+        logger.info("[%s] 扫描完成，共 %s 个有效作品（自动清理已失效条目 %s 个）", self.root, len(scanned_works), len(to_remove))
 
     def _build_work_from_items(self, items, work_path: str, display_name_override: str = None):
         if not items:
@@ -2446,11 +2551,14 @@ class MediaScanner:
                     it["invalid_reason"] = "无法读取视频信息"
                 elif info["duration"] < 3:
                     it["invalid_reason"] = "视频时长不足 3 秒"
-                # 只 ffprobe 一次；此前每条视频会 probe 最多 3 次，NAS/机械盘上极慢且重复读头
-                it["thumb"] = generate_video_thumb_single(it["path"], info)
-                it["thumbs"] = generate_video_thumbs(
-                    it["path"], count=THUMB_COUNT, video_info=info
-                )
+                if it.get("invalid_reason") == "无法读取视频信息":
+                    it["thumb"] = ""
+                    it["thumbs"] = []
+                else:
+                    it["thumb"] = generate_video_thumb_single(it["path"], info)
+                    it["thumbs"] = generate_video_thumbs(
+                        it["path"], count=THUMB_COUNT, video_info=info
+                    )
                 video_items.append(it)
             else:
                 it["thumb"] = generate_image_thumb(it["path"])
@@ -2501,43 +2609,65 @@ class MediaScanner:
             if not paths:
                 return None
             items = []
+            items_for_hash = []
             for fpath in paths:
-                if not is_path_under_root(fpath):
+                if not is_path_under_root(fpath, self.root):
                     continue
                 f = os.path.basename(fpath)
                 if f.startswith("._"):
                     continue
                 ext = os.path.splitext(f)[1].lower()
-                if ext in VIDEO_EXTS:
-                    items.append({
-                        "type": "video",
-                        "path": fpath,
-                        "name": f,
-                        "size": os.path.getsize(fpath),
-                    })
-                elif ext in IMAGE_EXTS:
-                    items.append({
-                        "type": "image",
-                        "path": fpath,
-                        "name": f,
-                        "size": os.path.getsize(fpath),
-                    })
-            return self._build_work_from_items(
+                if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
+                    continue
+                try:
+                    st = os.stat(fpath)
+                    fsize = st.st_size
+                    mtime = st.st_mtime
+                except OSError:
+                    continue
+                items.append({
+                    "type": "video" if ext in VIDEO_EXTS else "image",
+                    "path": fpath,
+                    "name": f,
+                    "size": fsize,
+                    "mtime": mtime,
+                })
+                items_for_hash.append(f"{fpath}|{fsize}|{mtime}")
+            if not items:
+                return None
+            items_for_hash.sort()
+            sig = sha256_str("\n".join(items_for_hash))
+            work_id_seed = os.path.abspath(self.root) + "\n#root_flat"
+            work_id = sha256_str(work_id_seed)
+
+            cache = get_library_index(self.root)
+            cached_work = cache.get(work_id)
+            if cached_work and cached_work.get("_signature") == sig:
+                return cached_work
+
+            work = self._build_work_from_items(
                 items,
-                get_scan_root(),
+                self.root,
                 "根目录内的媒体（未放入子文件夹）",
             )
+            if work:
+                work["_signature"] = sig
+                with _library_index_lock:
+                    if self.root not in _library_indices:
+                        _library_indices[self.root] = {}
+                    _library_indices[self.root][work_id] = work
+            return work
         except Exception as e:
             logger.warning("process root_flat error: %s", e)
             return None
 
     def _process_work(self, work_path: str):
         try:
-            if not is_path_under_root(work_path):
+            if not is_path_under_root(work_path, self.root):
                 return None
             items = []
             items_for_hash = []
-            scan_root = os.path.realpath(get_scan_root())
+            scan_root = os.path.realpath(self.root)
             seen = {os.path.normcase(os.path.realpath(work_path))}
             for root, dirs, files in os.walk(work_path, followlinks=True):
                 _prune_walk_dirs(dirs, root, scan_root, seen)
@@ -2548,7 +2678,7 @@ class MediaScanner:
                     if ext not in VIDEO_EXTS and ext not in IMAGE_EXTS:
                         continue
                     fpath = os.path.join(root, f)
-                    if not is_path_under_root(fpath):
+                    if not is_path_under_root(fpath, self.root):
                         continue
                     try:
                         st = os.stat(fpath)
@@ -2574,7 +2704,8 @@ class MediaScanner:
             work_id_seed = os.path.abspath(work_path)
             work_id = sha256_str(work_id_seed)
             
-            cached_work = _library_index_cache.get(work_id)
+            cache = get_library_index(self.root)
+            cached_work = cache.get(work_id)
             if cached_work and cached_work.get("_signature") == sig:
                 return cached_work
                 
@@ -2582,7 +2713,9 @@ class MediaScanner:
             if work:
                 work["_signature"] = sig
                 with _library_index_lock:
-                    _library_index_cache[work_id] = work
+                    if self.root not in _library_indices:
+                        _library_indices[self.root] = {}
+                    _library_indices[self.root][work_id] = work
             return work
         except Exception as e:
             logger.warning("process error %s: %s", work_path, e)
@@ -2598,8 +2731,8 @@ class MediaScanner:
                     "idle": True,
                     "works": [],
                     "next_since": 0,
-                    "enum_error": None,
-                    "scan_root": get_scan_root(),
+                    "enum_error": self.enum_error,
+                    "scan_root": self.root,
                 }
             else:
                 body = {
@@ -2610,11 +2743,190 @@ class MediaScanner:
                     "works": self.works[since:],
                     "next_since": len(self.works),
                     "enum_error": self.enum_error,
-                    "scan_root": get_scan_root(),
+                    "scan_root": self.root,
                 }
             if scan_presets_enabled():
                 body["scan_presets"] = get_scan_presets()
             return body
+
+
+class LibraryManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._scanners: dict[str, MediaScanner] = {}
+
+    def get_scanner(self, root: str, auto_init: bool = True) -> MediaScanner:
+        real_root = os.path.realpath(root)
+        with self._lock:
+            if real_root in self._scanners:
+                return self._scanners[real_root]
+            if not auto_init:
+                return None
+            sc = MediaScanner(real_root)
+            cached = load_library_index(real_root)
+            if cached:
+                with sc.lock:
+                    sc.works = list(cached.values())
+                    sc.scanned_dirs = len(sc.works)
+                    sc.total_dirs = len(sc.works)
+                    sc.done = True
+                    sc.started = True
+                    sc.idle = False
+            else:
+                sc.mark_idle()
+            self._scanners[real_root] = sc
+            return sc
+
+    def start_scan(self, root: str, force_restart: bool = False) -> MediaScanner:
+        real_root = os.path.realpath(root)
+        with self._lock:
+            existing = self._scanners.get(real_root)
+            if existing and existing.started and not existing.done and not force_restart:
+                return existing
+            sc = MediaScanner(real_root)
+            cached = load_library_index(real_root)
+            if cached:
+                with sc.lock:
+                    sc.works = list(cached.values())
+                    sc.scanned_dirs = 0
+                    sc.total_dirs = len(cached)
+            self._scanners[real_root] = sc
+        sc.start()
+        return sc
+
+    def get_active_background_scans(self, exclude_root: str | None = None) -> list[dict]:
+        exclude_real = os.path.realpath(exclude_root) if exclude_root else None
+        active = []
+        with self._lock:
+            for r, sc in self._scanners.items():
+                if exclude_real and r == exclude_real:
+                    continue
+                if sc.started and not sc.done:
+                    label = os.path.basename(r)
+                    if "get_scan_presets" in globals():
+                        for p in get_scan_presets():
+                            if os.path.realpath(p["path"]) == r:
+                                label = p["label"]
+                                break
+                    active.append({
+                        "path": r,
+                        "label": label,
+                        "scanned": sc.scanned_dirs,
+                        "total": sc.total_dirs,
+                    })
+        return active
+
+    def shutdown_all(self):
+        with self._lock:
+            for sc in self._scanners.values():
+                try:
+                    sc._executor.shutdown(wait=False)
+                except Exception:
+                    pass
+
+
+_library_manager = LibraryManager()
+
+
+class _ScannerProxy:
+    @property
+    def _target(self) -> MediaScanner:
+        return _library_manager.get_scanner(get_scan_root())
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            super().__setattr__(name, value)
+        else:
+            setattr(self._target, name, value)
+
+
+class DailyScanScheduler:
+    def __init__(self):
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._trigger_event = threading.Event()
+        self.running_root = None
+        self.last_run_time = None
+
+    def start(self):
+        enabled = os.environ.get("MB_DAILY_SCAN", "0").strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            logger.info("每日自动增量更新未启用 (MB_DAILY_SCAN=0)")
+            return
+
+        try:
+            target_hour = int(os.environ.get("MB_DAILY_SCAN_HOUR", "4").strip())
+            if target_hour < 0 or target_hour > 23:
+                target_hour = 4
+        except ValueError:
+            target_hour = 4
+
+        logger.info("每日自动增量更新已启用，计划于每日 %02d:00 自动执行", target_hour)
+        self._thread = threading.Thread(target=self._scheduler_loop, args=(target_hour,), daemon=True)
+        self._thread.start()
+
+    def trigger_now(self):
+        """立即触发一次自动增量扫描任务。"""
+        self._trigger_event.set()
+
+    def stop(self):
+        self._stop_event.set()
+        self._trigger_event.set()
+
+    def _scheduler_loop(self, target_hour: int):
+        while not self._stop_event.is_set():
+            now = datetime.now()
+            target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            logger.info("距离下一次每日增量扫描还有约 %.1f 小时 (%s)", wait_seconds / 3600.0, target.strftime("%Y-%m-%d %H:%M:%S"))
+
+            triggered = self._trigger_event.wait(timeout=wait_seconds)
+            if self._stop_event.is_set():
+                break
+            if triggered:
+                self._trigger_event.clear()
+                logger.info("[每日自动增量扫描] 收到即时触发更新请求")
+            else:
+                logger.info("[每日自动增量扫描] 到达设定时间 %02d:00，开始执行定时增量更新", target_hour)
+
+            self._run_daily_scan()
+
+    def _run_daily_scan(self):
+        if scan_presets_enabled():
+            paths = [p["path"] for p in get_scan_presets()]
+        else:
+            paths = [get_scan_root()]
+
+        logger.info("[每日自动增量扫描] 待更新媒体库清单: %s", paths)
+        for path in paths:
+            if self._stop_event.is_set():
+                break
+            p, _ = resolve_scan_root_path(path)
+            if not p:
+                continue
+            self.running_root = p
+            logger.info("[每日自动增量扫描] >>> 开始扫描媒体库: %s", p)
+            try:
+                sc = _library_manager.start_scan(p)
+                if sc.thread and sc.thread.is_alive():
+                    sc.thread.join()
+                logger.info("[每日自动增量扫描] <<< 媒体库 %s 扫描完毕 (共 %s 个作品)", p, len(sc.works))
+            except Exception as e:
+                logger.error("[每日自动增量扫描] 媒体库 %s 扫描异常: %s", p, e)
+            finally:
+                self.running_root = None
+            time.sleep(3.0)
+
+        self.last_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("[每日自动增量扫描] 本轮所有媒体库增量更新已全部完成 (完成时间: %s)", self.last_run_time)
+
+
+daily_scheduler = DailyScanScheduler()
 
 
 def _normalize_scan_path_input(s: str) -> str:
@@ -2779,24 +3091,21 @@ def replace_cache_dir(new_dir: str) -> tuple[bool, dict]:
         _ensure_cache_dir_ready()
         return False, {"ok": False, "error": f"保存设置失败: {e}"}
     logger.info("缓存目录切换为: %s", CACHE_DIR)
-    old = scanner
-    scanner = MediaScanner()
-    scanner.start()
+    _library_manager.shutdown_all()
+    _library_indices.clear()
+    _library_manager._scanners.clear()
+    _library_manager.start_scan(_scan_root)
     if "resume_pending_video_analysis" in globals():
         threading.Thread(
             target=resume_pending_video_analysis,
             args=(_scan_root,),
             daemon=True,
         ).start()
-    try:
-        old._executor.shutdown(wait=False)
-    except Exception:
-        pass
     return True, cache_settings_payload()
 
 
-def replace_scan_root(new_root: str, persist: bool = False) -> bool:
-    """切换扫描根目录并启动新扫描任务。返回是否成功。"""
+def replace_scan_root(new_root: str, persist: bool = False, trigger_scan: bool = True) -> bool:
+    """切换扫描根目录（不中断后台正在进行的其它库扫描任务）。返回是否成功。"""
     global _scan_root, scanner
     p, err = resolve_scan_root_path(new_root)
     if not p:
@@ -2815,25 +3124,28 @@ def replace_scan_root(new_root: str, persist: bool = False) -> bool:
             logger.warning("保存扫描目录设置失败: %s", e)
     prof = _apply_perf_profile_for_scan_root(_scan_root)
     logger.info(
-        "扫描目录切换为: %s | 自动性能档位: %s，扫描并发=%s，每视频条带缩略图=%s",
+        "当前查看媒体库切换为: %s | 自动性能档位: %s，扫描并发=%s，每视频条带缩略图=%s",
         _scan_root,
         prof,
         MAX_WORKERS,
         THUMB_COUNT,
     )
-    old = scanner
-    scanner = MediaScanner()
-    scanner.start()
+    sc = _library_manager.get_scanner(_scan_root)
+    if sc.started and not sc.done:
+        logger.info("媒体库 %s 后台扫描正在进行中，接入并显示其实时进度", _scan_root)
+    elif trigger_scan:
+        logger.info("启动媒体库 %s 增量扫描任务", _scan_root)
+        _library_manager.start_scan(_scan_root)
+
+    if not isinstance(scanner, _ScannerProxy):
+        scanner = _library_manager.get_scanner(_scan_root)
+
     if persist and "resume_pending_video_analysis" in globals():
         threading.Thread(
             target=resume_pending_video_analysis,
             args=(_scan_root,),
             daemon=True,
         ).start()
-    try:
-        old._executor.shutdown(wait=False)
-    except Exception:
-        pass
     return True
 
 
@@ -2951,7 +3263,7 @@ def bootstrap_scan_configuration() -> None:
 bootstrap_scan_configuration()
 
 
-scanner = MediaScanner()
+scanner = _ScannerProxy()
 
 
 def _tool_version_ok(bin_path: str) -> tuple[bool, str | None]:
@@ -3015,7 +3327,8 @@ def build_health_payload() -> tuple[dict, int]:
         disk["error"] = str(e)[:500]
 
     prog = scanner.get_progress(0)
-    if prog.get("enum_error"):
+    enum_err = prog.get("enum_error") or getattr(scanner, "enum_error", None)
+    if enum_err:
         scan_state = "error"
     elif prog.get("idle"):
         scan_state = "awaiting_scan"
@@ -3025,7 +3338,7 @@ def build_health_payload() -> tuple[dict, int]:
         scan_state = "idle"
     scan = {
         "state": scan_state,
-        "enum_error": prog.get("enum_error"),
+        "enum_error": enum_err,
         "scanned": prog.get("scanned"),
         "total": prog.get("total"),
         "works_ready": len(scanner.works),
@@ -3079,7 +3392,7 @@ _http_server = None
 def _safe_name_token(text: str, fallback: str = "untitled") -> str:
     s = (text or "").strip()
     s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-_]+", "-", s)
+    s = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\-_]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-_")
     return s or fallback
 
@@ -4271,22 +4584,49 @@ class Handler(BaseHTTPRequestHandler):
         with open(template_path, 'r', encoding='utf-8') as f:
             return f.read()
 
+    def _load_login_template(self) -> str:
+        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates', 'login.html')
+        if os.path.isfile(template_path):
+            with open(template_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return LOGIN_HTML_PAGE
+
     def log_message(self, format, *args):
         pass
 
     def _is_authorized(self) -> bool:
         if not _access_token_required():
             return True
-        if not ACCESS_TOKEN:
-            return False
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], ACCESS_TOKEN):
-            return True
-        cookie = self.headers.get("Cookie", "")
-        for part in cookie.split(";"):
-            name, sep, value = part.strip().partition("=")
-            if sep and name == "mb_access_token":
-                return secrets.compare_digest(unquote(value), ACCESS_TOKEN)
+
+        if _user_auth_configured():
+            expected_token = _compute_auth_session_token(AUTH_USER, AUTH_PASSWORD)
+            cookie = self.headers.get("Cookie", "")
+            for part in cookie.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name == "mb_auth_token":
+                    if secrets.compare_digest(unquote(value), expected_token):
+                        return True
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(auth[6:].strip()).decode("utf-8", errors="replace")
+                    u, _, p = decoded.partition(":")
+                    if secrets.compare_digest(u, AUTH_USER) and secrets.compare_digest(p, AUTH_PASSWORD):
+                        return True
+                except Exception:
+                    pass
+
+        if ACCESS_TOKEN:
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], ACCESS_TOKEN):
+                return True
+            cookie = self.headers.get("Cookie", "")
+            for part in cookie.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name == "mb_access_token":
+                    if secrets.compare_digest(unquote(value), ACCESS_TOKEN):
+                        return True
+
         return False
 
     def _client_is_loopback(self) -> bool:
@@ -4296,7 +4636,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def _host_header_allowed(self) -> bool:
-        if _access_token_required() and ACCESS_TOKEN:
+        if (_access_token_required() and ACCESS_TOKEN) or _user_auth_configured():
             return True
         try:
             hostname = urlparse("//" + self.headers.get("Host", "")).hostname or ""
@@ -4426,13 +4766,16 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _send_json(self, data, code=200, no_store=False):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        if no_store:
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            if no_store:
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_file(self, path: str, content_type: str = None):
         if not os.path.exists(path) or not os.path.isfile(path):
@@ -4449,12 +4792,17 @@ class Handler(BaseHTTPRequestHandler):
         status = 200
         if range_hdr.startswith("bytes="):
             try:
-                rng = range_hdr[6:].strip().split("-")
+                spec = range_hdr[6:].strip()
+                rng = spec.split("-", 1)
                 if rng[0]:
                     start = int(rng[0])
-                if len(rng) > 1 and rng[1]:
-                    end = int(rng[1])
-                else:
+                    if len(rng) > 1 and rng[1]:
+                        end = int(rng[1])
+                    else:
+                        end = size - 1
+                elif len(rng) > 1 and rng[1]:
+                    suffix = int(rng[1])
+                    start = max(0, size - suffix)
                     end = size - 1
                 if start > end or start >= size:
                     raise ValueError("invalid range")
@@ -4541,12 +4889,49 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Location", "/")
                 self.end_headers()
                 return
+
+        if path == "/api/logout":
+            self.send_response(303)
+            self.send_header("Set-Cookie", "mb_auth_token=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+            self.send_header("Set-Cookie", "mb_access_token=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
         if path == "/health" and (
             not _access_token_required() or self._client_is_loopback() or self._is_authorized()
         ):
             payload, code = build_health_payload()
             self._send_json(payload, code=code, no_store=True)
             return
+
+        if path == "/login":
+            if self._is_authorized():
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            try:
+                login_page = self._load_login_template()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(login_page.encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        if path == "/" and not self._is_authorized():
+            try:
+                login_page = self._load_login_template()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(login_page.encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         if not self._require_authorized():
             return
         if path == "/":
@@ -4567,14 +4952,19 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 .replace("__MB_SCAN_PRESETS_JSON__", presets_json)
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(page.encode("utf-8"))
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(page.encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         elif path == "/api/progress":
             since = int(qs.get("since", ["0"])[0])
             prog = scanner.get_progress(since)
+            bg = _library_manager.get_active_background_scans(exclude_root=get_scan_root())
+            prog["background_scan"] = bg[0] if bg else None
             self._send_json(prog)
         elif path == "/api/tasks":
             self._send_json({"ok": True, "tasks": analysis_tasks.list_tasks()}, no_store=True)
@@ -4586,14 +4976,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(cache_settings_payload(), no_store=True)
 
         elif path == "/api/works":
-            with scanner.lock:
+            target_sc = scanner if not isinstance(scanner, _ScannerProxy) else _library_manager.get_scanner(get_scan_root())
+            with target_sc.lock:
                 body = {
                     "ok": True,
-                    "works": list(scanner.works),
-                    "done": scanner.done,
-                    "scanned": scanner.scanned_dirs,
-                    "total": scanner.total_dirs,
-                    "enum_error": scanner.enum_error,
+                    "works": list(target_sc.works),
+                    "done": target_sc.done,
+                    "scanned": target_sc.scanned_dirs,
+                    "total": target_sc.total_dirs,
+                    "enum_error": target_sc.enum_error,
                     "scan_root": get_scan_root(),
                 }
             self._send_json(body, no_store=True)
@@ -4638,7 +5029,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/preview-thumb":
             fpath = qs.get("path", [""])[0]
-            fpath = unquote(fpath)
             if not fpath or not os.path.isfile(fpath):
                 self.send_error(404)
                 return
@@ -4703,7 +5093,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/play-ready":
             fpath = qs.get("path", [""])[0]
-            fpath = unquote(fpath)
             force_transcode = (qs.get("force", [""])[0] or "").strip().lower() in (
                 "1",
                 "true",
@@ -4720,7 +5109,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/file":
             fpath = qs.get("path", [""])[0]
-            fpath = unquote(fpath)
             if (
                 os.path.exists(fpath)
                 and os.path.isfile(fpath)
@@ -4732,7 +5120,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/play":
             fpath = qs.get("path", [""])[0]
-            fpath = unquote(fpath)
             if not (os.path.isfile(fpath) and is_path_under_root(fpath)):
                 self.send_error(404)
                 return
@@ -4752,7 +5139,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/open":
             fpath = qs.get("path", [""])[0]
-            fpath = unquote(fpath)
             if os.path.exists(fpath) and is_path_under_root(fpath):
                 try:
                     target = fpath if os.path.isdir(fpath) else os.path.dirname(fpath)
@@ -4773,9 +5159,82 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if not self._require_request_security(mutating=True) or self._body_too_large():
+        if not self._host_header_allowed() or self._body_too_large():
             return
         parsed = urlparse(self.path)
+
+        if parsed.path == "/api/login":
+            if not _user_auth_configured():
+                self._send_json({"ok": False, "error": "服务端未启用账号密码认证"}, 400)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            content_type = self.headers.get("Content-Type", "")
+            username = ""
+            password = ""
+            remember = True
+
+            if "application/json" in content_type:
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                    username = str(data.get("username", "")).strip()
+                    password = str(data.get("password", ""))
+                    remember = bool(data.get("remember", True))
+                except Exception:
+                    self._send_json({"ok": False, "error": "invalid json"}, 400)
+                    return
+            else:
+                try:
+                    form_data = parse_qs(raw.decode("utf-8"))
+                    username = form_data.get("username", [""])[0].strip()
+                    password = form_data.get("password", [""])[0]
+                    remember = form_data.get("remember", ["1"])[0] in ("1", "true", "on", "yes")
+                except Exception:
+                    self._send_json({"ok": False, "error": "invalid form"}, 400)
+                    return
+
+            if secrets.compare_digest(username, AUTH_USER) and secrets.compare_digest(password, AUTH_PASSWORD):
+                session_token = _compute_auth_session_token(AUTH_USER, AUTH_PASSWORD)
+                max_age_part = "; Max-Age=31536000" if remember else ""
+                cookie_header = f"mb_auth_token={quote(session_token, safe='')}{max_age_part}; Path=/; HttpOnly; SameSite=Lax"
+
+                if "application/json" in content_type:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Set-Cookie", cookie_header)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                else:
+                    self.send_response(303)
+                    self.send_header("Set-Cookie", cookie_header)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                return
+            else:
+                if "application/json" in content_type:
+                    self._send_json({"ok": False, "error": "账号或密码错误"}, 401)
+                else:
+                    self.send_response(303)
+                    self.send_header("Location", "/login?error=1")
+                    self.end_headers()
+                return
+
+        if parsed.path == "/api/logout":
+            cookie_clear_1 = "mb_auth_token=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+            cookie_clear_2 = "mb_access_token=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie", cookie_clear_1)
+            self.send_header("Set-Cookie", cookie_clear_2)
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+            return
+
+        if not self._require_request_security(mutating=True):
+            return
         if parsed.path == "/api/shutdown":
             self._send_json({"ok": True})
             trigger_exit()
@@ -4919,6 +5378,16 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": err or "路径不存在或不是文件夹"},
                     400,
                 )
+            return
+        if parsed.path == "/api/scan-now":
+            data, _ = self._read_json_body()
+            scan_all = bool(data.get("all", False)) if isinstance(data, dict) else False
+            if scan_all:
+                daily_scheduler.trigger_now()
+                self._send_json({"ok": True, "message": "已触发全库自动增量更新任务"})
+            else:
+                _library_manager.start_scan(get_scan_root(), force_restart=True)
+                self._send_json({"ok": True, "message": "已触发当前媒体库增量更新任务"})
             return
         if parsed.path == "/api/cache-clear":
             import cache_manager
@@ -5100,9 +5569,9 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     global _http_server
-    if _host_requires_access_token() and not ACCESS_TOKEN:
+    if _host_requires_access_token() and not (ACCESS_TOKEN or _user_auth_configured()):
         raise SystemExit(
-            "MB_ACCESS_TOKEN is required when MB_HOST is not localhost/127.0.0.1/::1"
+            "MB_ACCESS_TOKEN or (MB_AUTH_USER and MB_AUTH_PASSWORD) is required when MB_HOST is not localhost/127.0.0.1/::1"
         )
     _apply_perf_profile_for_scan_root(get_scan_root())
     auto_open = os.environ.get(
@@ -5130,7 +5599,9 @@ def main():
             DISK_PROFILE,
         )
     logger.info("监听 %s:%s（本机访问 http://localhost:%s）", HOST, PORT, PORT)
-    if _access_token_required():
+    if _user_auth_configured():
+        logger.info("账号密码认证已启用（账号: %s）", AUTH_USER)
+    elif _access_token_required():
         logger.info("访问令牌已启用；首次访问使用 /?token=<MB_ACCESS_TOKEN>")
     logger.info("浏览器页眉可点「退出应用」停止服务")
     _oh, _om, _of, _ot = _ollama_config()
@@ -5148,24 +5619,35 @@ def main():
             import webbrowser
 
             time.sleep(1.0)
-            suffix = f"?token={quote(ACCESS_TOKEN, safe='')}" if _access_token_required() else ""
+            if _user_auth_configured():
+                suffix = ""
+            elif _access_token_required():
+                suffix = f"?token={quote(ACCESS_TOKEN, safe='')}"
+            else:
+                suffix = ""
             webbrowser.open(f"http://127.0.0.1:{PORT}/{suffix}")
 
         threading.Thread(target=_open_browser, daemon=True).start()
 
     logger.info("按 Ctrl+C 停止")
     if should_auto_scan_on_startup():
-        scanner.start()
+        _library_manager.start_scan(get_scan_root())
         threading.Thread(
             target=resume_pending_video_analysis,
             args=(get_scan_root(),),
             daemon=True,
         ).start()
     else:
-        scanner.mark_idle()
-        logger.info(
-            "已配置 MB_SCAN_PRESETS，启动时不自动扫描；请在页内选择媒体库后点「切换并扫描」（MB_AUTO_SCAN=1 可恢复启动即扫）"
-        )
+        sc = _library_manager.get_scanner(get_scan_root())
+        if sc.works:
+            logger.info("已加载媒体库 %s 缓存作品（共 %s 个），启动时不重复全量扫描", get_scan_root(), len(sc.works))
+        else:
+            sc.mark_idle()
+            logger.info(
+                "已配置 MB_SCAN_PRESETS，启动时不自动扫描；请在页内选择媒体库后点「切换并扫描」（MB_AUTO_SCAN=1 可恢复启动即扫）"
+            )
+
+    daily_scheduler.start()
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     _http_server = server
 
@@ -5182,10 +5664,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("退出中…")
     finally:
-        try:
-            scanner._executor.shutdown(wait=False)
-        except Exception:
-            pass
+        daily_scheduler.stop()
+        _library_manager.shutdown_all()
         try:
             server.server_close()
         except Exception:

@@ -30,7 +30,12 @@ def http_delete_port(tmp_path, monkeypatch):
     assert mb.replace_scan_root(str(tmp_path.resolve())) is True
     mb.delete_trash_clear()
 
-    album.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
+    import sys
+    fh = None
+    if sys.platform == "win32":
+        fh = open(str(locked), "rb")
+    else:
+        album.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
 
     srv = mb.HTTPServer(("127.0.0.1", 0), mb.Handler)
     port = srv.server_address[1]
@@ -39,6 +44,8 @@ def http_delete_port(tmp_path, monkeypatch):
     try:
         yield port, str(locked), str(normal), album
     finally:
+        if fh:
+            fh.close()
         album.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
         srv.shutdown()
         srv.server_close()

@@ -283,6 +283,7 @@ def _album_writable(album) -> None:
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Directory chmod does not prevent deletion on Windows NTFS")
 def test_gallery_delete_failure_advances_to_next_file(playwright_browser, gallery_e2e_server):
     """删除 API 失败（真实权限错误）时：alert 后仍切到下一文件，且废纸篓角标更新。"""
     base_url, album = gallery_e2e_server
@@ -345,6 +346,7 @@ def test_gallery_delete_work_shortcut_removes_all_media_and_folder(
         page.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Directory chmod does not prevent deletion on Windows NTFS")
 def test_gallery_trash_panel_delete_selected(playwright_browser, gallery_e2e_server):
     """废纸篓：真实失败入队后，勾选「删除所选」可删盘并清空角标。"""
     base_url, album = gallery_e2e_server

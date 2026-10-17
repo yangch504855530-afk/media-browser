@@ -21,8 +21,10 @@ def test_replace_cache_dir_persists_and_restarts_scan(tmp_path, monkeypatch):
         _executor = DummyExecutor()
 
     class NewScanner:
-        def __init__(self):
+        def __init__(self, *args, **kwargs):
             self._executor = DummyExecutor()
+            self.started = False
+            self.done = False
 
         def start(self):
             started.append(True)
@@ -32,7 +34,9 @@ def test_replace_cache_dir_persists_and_restarts_scan(tmp_path, monkeypatch):
     monkeypatch.setattr(mb, "_PERSISTENT_SETTINGS", {})
     monkeypatch.setattr(mb, "CACHE_DIR", str(tmp_path / "old-cache"))
     monkeypatch.setattr(mb, "PLACEHOLDER", os.path.join(str(tmp_path / "old-cache"), "_placeholder.jpg"))
-    monkeypatch.setattr(mb, "scanner", OldScanner())
+    old_s = OldScanner()
+    monkeypatch.setattr(mb, "scanner", old_s)
+    monkeypatch.setattr(mb._library_manager, "_scanners", {"mock": old_s})
     monkeypatch.setattr(mb, "MediaScanner", NewScanner)
 
     ok, payload = mb.replace_cache_dir(str(cache_dir))

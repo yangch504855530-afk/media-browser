@@ -259,3 +259,16 @@ def test_preset_mode_template_vars_when_presets_configured(
     assert "true" in text or "false" in text
     assert "function mbInitScanPresetUi" in text
     assert 'id="scanRootPreset"' in text
+
+
+def test_star_filters_and_delete_shortcuts_contract(homepage_html: str):
+    """验证 1~5 星过滤按钮、过滤匹配逻辑、快捷键删除与批量删除按钮存在。"""
+    for star in (1, 2, 3, 4, 5):
+        assert f'data-filter="star{star}"' in homepage_html
+    js = _extract_main_script(homepage_html)
+    assert "ft && ft.startsWith('star')" in js
+    assert "Number(entry.rating) === star" in js
+    assert "filterType === 'star1'" in js
+    assert "function batchDeleteSelectedWorks()" in js
+    assert "e.key === 'Delete' || e.key === 'Backspace'" in js
+    assert "deleteCurrentItem(true);" in js

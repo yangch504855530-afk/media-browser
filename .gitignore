@@ -28,3 +28,4 @@ package/*.oci
 /ffprobe.exe
 /runtime/
 /playback-sample-summary.json
+patch.txt

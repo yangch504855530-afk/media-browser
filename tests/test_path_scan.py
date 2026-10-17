@@ -1,5 +1,6 @@
 """MediaScanner 一级枚举：子文件夹作品与根目录平铺媒体（不跑完整扫描线程）。"""
 import os
+import pytest
 
 import media_browser as mb
 
@@ -43,13 +44,20 @@ def test_enumerate_skips_trash_name(tmp_path, monkeypatch):
     assert _norm(str(good.resolve())) in {_norm(p) for p in s.pending_works}
 
 
+def _safe_symlink(link_path, target, target_is_directory=False):
+    try:
+        link_path.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as e:
+        pytest.skip(f"Symlinks not supported in current environment: {e}")
+
+
 def test_enumerate_does_not_follow_symlink_outside_root(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.jpg").write_bytes(b"x")
-    (root / "outside-link").symlink_to(outside, target_is_directory=True)
+    _safe_symlink(root / "outside-link", outside, target_is_directory=True)
     monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
 
     s = mb.MediaScanner()
@@ -63,7 +71,7 @@ def test_enumerate_does_not_follow_file_symlink_outside_root(tmp_path, monkeypat
     root.mkdir()
     outside = tmp_path / "secret.jpg"
     outside.write_bytes(b"x")
-    (root / "secret-link.jpg").symlink_to(outside)
+    _safe_symlink(root / "secret-link.jpg", outside)
     monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
 
     s = mb.MediaScanner()
@@ -76,7 +84,7 @@ def test_enumerate_symlink_loop_finishes(tmp_path, monkeypatch):
     work = root / "album"
     work.mkdir(parents=True)
     (work / "pic.jpg").write_bytes(b"x")
-    (work / "loop").symlink_to(work, target_is_directory=True)
+    _safe_symlink(work / "loop", work, target_is_directory=True)
     monkeypatch.setattr(mb, "get_scan_root", lambda: str(root.resolve()))
 
     s = mb.MediaScanner()

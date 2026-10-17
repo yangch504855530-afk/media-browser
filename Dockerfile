@@ -25,7 +25,8 @@ RUN groupadd -g 1000 appgroup && \
     useradd -u 1000 -g appgroup -m -s /bin/bash appuser
 
 WORKDIR /app
-COPY media_browser.py .
+COPY media_browser.py on_demand.py cache_manager.py ./
+COPY templates ./templates
 RUN chown -R appuser:appgroup /app
 
 USER appuser
